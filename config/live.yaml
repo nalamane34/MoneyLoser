@@ -1,0 +1,20 @@
+# Live trading overrides — real money
+exchange:
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  demo_mode: false
+
+execution:
+  min_edge_threshold: 0.03
+  max_edge_sanity: 0.20
+  prefer_maker: true
+
+risk:
+  kelly_fraction: 0.15
+  max_position_per_market: 50
+  max_position_per_category_pct: 0.15
+  max_total_exposure_pct: 0.40
+  daily_loss_limit_pct: 0.03
+  max_drawdown_pct: 0.10
+
+log_level: "INFO"

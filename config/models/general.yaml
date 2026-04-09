@@ -1,0 +1,16 @@
+model_type: "logistic"
+features:
+  - time_to_expiry
+  - orderbook_imbalance
+  - bid_ask_spread
+  - mid_price
+  - trade_flow_imbalance
+  - volume_profile
+  - price_velocity
+  - price_momentum
+hyperparams:
+  C: 1.0
+  max_iter: 1000
+calibration:
+  method: "isotonic"
+  cv_folds: 5

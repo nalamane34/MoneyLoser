@@ -1,0 +1,15 @@
+{
+  "ticker": "KXWEATHER-NYC-T90-2026JUN01",
+  "yes_levels": [
+    {"price": "0.62", "contracts": "150"},
+    {"price": "0.60", "contracts": "200"},
+    {"price": "0.58", "contracts": "100"}
+  ],
+  "no_levels": [
+    {"price": "0.40", "contracts": "120"},
+    {"price": "0.42", "contracts": "180"},
+    {"price": "0.44", "contracts": "90"}
+  ],
+  "seq": 12345,
+  "timestamp": "2026-04-09T14:30:00Z"
+}

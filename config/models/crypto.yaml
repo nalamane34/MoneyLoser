@@ -1,0 +1,23 @@
+model_type: "gbm"
+features:
+  - funding_rate_signal
+  - funding_rate_zscore
+  - open_interest_change
+  - crypto_orderbook_imbalance
+  - whale_flow_indicator
+  - volatility_regime
+  - basis_spread
+  - time_to_expiry
+  - orderbook_imbalance
+  - bid_ask_spread
+  - price_velocity
+hyperparams:
+  n_estimators: 400
+  max_depth: 4
+  learning_rate: 0.05
+  min_child_samples: 30
+  subsample: 0.8
+  colsample_bytree: 0.7
+calibration:
+  method: "isotonic"
+  cv_folds: 5

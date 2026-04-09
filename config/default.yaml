@@ -1,0 +1,69 @@
+exchange:
+  base_url: "https://demo-api.kalshi.co/trade-api/v2"
+  ws_url: "wss://demo-api.kalshi.co/trade-api/ws/v2"
+  demo_mode: true
+  rate_limit_rps: 10.0
+
+weather:
+  enabled: true
+  noaa_enabled: true
+  ecmwf_enabled: true
+  locations:
+    - name: "New York City"
+      lat: 40.7128
+      lon: -74.0060
+    - name: "Chicago"
+      lat: 41.8781
+      lon: -87.6298
+    - name: "Los Angeles"
+      lat: 34.0522
+      lon: -118.2437
+  fetch_interval_minutes: 60
+
+crypto:
+  enabled: true
+  exchanges:
+    - "binance"
+  symbols:
+    - "BTC/USDT"
+    - "ETH/USDT"
+  fetch_interval_seconds: 30
+
+model:
+  model_dir: "models/"
+  calibration_method: "isotonic"
+  ensemble_method: "inverse_variance"
+  retrain_interval_hours: 24
+
+execution:
+  min_edge_threshold: 0.02
+  max_edge_sanity: 0.30
+  prefer_maker: true
+  max_order_staleness_seconds: 60
+  evaluation_interval_seconds: 5.0
+  max_model_market_disagreement: 0.08
+
+risk:
+  kelly_fraction: 0.25
+  max_position_per_market: 100
+  max_position_per_category_pct: 0.20
+  max_total_exposure_pct: 0.50
+  daily_loss_limit_pct: 0.05
+  max_drawdown_pct: 0.15
+  min_contract_price: 0.10
+  max_contract_price: 0.90
+  max_tail_exposure_pct: 0.05
+
+backtest:
+  initial_bankroll: 10000.0
+  fill_model: "realistic"
+  slippage_bps: 0.0
+
+monitoring:
+  drift_window: 100
+  psi_threshold: 0.2
+  ece_threshold: 0.05
+  alert_webhook_url: null
+
+data_dir: "data/"
+log_level: "INFO"

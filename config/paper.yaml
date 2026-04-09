@@ -1,0 +1,12 @@
+# Paper trading overrides — uses demo API
+exchange:
+  base_url: "https://demo-api.kalshi.co/trade-api/v2"
+  ws_url: "wss://demo-api.kalshi.co/trade-api/ws/v2"
+  demo_mode: true
+
+risk:
+  kelly_fraction: 0.20
+  max_position_per_market: 50
+  daily_loss_limit_pct: 0.03
+
+log_level: "DEBUG"

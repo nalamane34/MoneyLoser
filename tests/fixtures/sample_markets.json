@@ -1,0 +1,47 @@
+[
+  {
+    "ticker": "KXWEATHER-NYC-T90-2026JUN01",
+    "event_ticker": "KXWEATHER-NYC-T90",
+    "series_ticker": "KXWEATHER",
+    "title": "Will NYC temperature exceed 90F by June 1, 2026?",
+    "status": "open",
+    "yes_bid": "0.60",
+    "yes_ask": "0.62",
+    "last_price": "0.61",
+    "volume": 5400,
+    "open_interest": 2200,
+    "close_time": "2026-06-01T20:00:00Z",
+    "result": "",
+    "category": "weather"
+  },
+  {
+    "ticker": "KXCPI-26APR-A3.0",
+    "event_ticker": "KXCPI-26APR",
+    "series_ticker": "KXCPI",
+    "title": "Will April 2026 CPI year-over-year be above 3.0%?",
+    "status": "open",
+    "yes_bid": "0.25",
+    "yes_ask": "0.28",
+    "last_price": "0.26",
+    "volume": 12000,
+    "open_interest": 4800,
+    "close_time": "2026-05-14T12:30:00Z",
+    "result": "",
+    "category": "economics"
+  },
+  {
+    "ticker": "KXBTC-26APR11-T100K",
+    "event_ticker": "KXBTC-26APR11",
+    "series_ticker": "KXBTC",
+    "title": "Will Bitcoin be above $100,000 on April 11, 2026?",
+    "status": "open",
+    "yes_bid": "0.45",
+    "yes_ask": "0.48",
+    "last_price": "0.46",
+    "volume": 8500,
+    "open_interest": 3100,
+    "close_time": "2026-04-11T23:59:00Z",
+    "result": "",
+    "category": "crypto"
+  }
+]

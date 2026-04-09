@@ -1,0 +1,23 @@
+model_type: "gbm"
+features:
+  - ensemble_mean
+  - ensemble_spread
+  - exceedance_prob
+  - forecast_revision_magnitude
+  - forecast_revision_direction
+  - model_disagreement
+  - forecast_horizon
+  - climatological_anomaly
+  - time_to_expiry
+  - orderbook_imbalance
+  - bid_ask_spread
+hyperparams:
+  n_estimators: 500
+  max_depth: 5
+  learning_rate: 0.05
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+calibration:
+  method: "isotonic"
+  cv_folds: 5
