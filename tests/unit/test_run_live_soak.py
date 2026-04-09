@@ -43,7 +43,7 @@ def test_paper_soak_overlay_is_conservative() -> None:
     assert config.crypto.enabled is False
     assert config.sportsbook.enabled is True
     assert config.sportsbook.leagues == ["nba"]
-    assert config.sportsbook.bookmakers == ["pinnacle"]
+    assert "pinnacle" in config.sportsbook.bookmakers
     assert config.sportsbook.markets == ["h2h"]
     assert config.sportsbook.fetch_interval_minutes >= 15  # Must poll often enough for line movement
     assert config.sportsbook.lookahead_hours == 12
@@ -63,4 +63,18 @@ def test_validate_paper_soak_config_rejects_broader_scope() -> None:
     config.sportsbook.fetch_interval_minutes = 5
 
     with pytest.raises(ValueError, match="too aggressive"):
+        module._validate_paper_soak_config(config)
+
+
+def test_validate_paper_soak_config_requires_pinnacle() -> None:
+    module = _load_run_live_module()
+    repo_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        base_path=repo_root / "config" / "default.yaml",
+        overlay_path=repo_root / "config" / "paper-soak.yaml",
+    )
+
+    config.sportsbook.bookmakers = ["fanduel"]
+
+    with pytest.raises(ValueError, match="pinnacle"):
         module._validate_paper_soak_config(config)

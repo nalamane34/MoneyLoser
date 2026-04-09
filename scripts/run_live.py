@@ -62,10 +62,10 @@ def _validate_paper_soak_config(config) -> None:
     if config.weather.enabled:
         raise ValueError("paper soak must keep weather feeds disabled")
 
-    expected_bookmakers = {"pinnacle"}
+    required_bookmakers = {"pinnacle"}
     expected_markets = {"h2h"}
-    if set(config.sportsbook.bookmakers) != expected_bookmakers:
-        raise ValueError("paper soak must use pinnacle only")
+    if not required_bookmakers.issubset(set(config.sportsbook.bookmakers)):
+        raise ValueError("paper soak must include pinnacle")
     if set(config.sportsbook.markets) != expected_markets:
         raise ValueError("paper soak must use h2h only")
     if config.sportsbook.fetch_interval_minutes < 15:
