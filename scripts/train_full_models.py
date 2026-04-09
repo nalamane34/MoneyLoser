@@ -156,6 +156,15 @@ def extract_features(market: dict) -> dict[str, float] | None:
         day_of_week = 0
         close_ts = 0.0
 
+    # Price momentum: direction of most recent price move
+    prev_price = safe_float(market.get("previous_price_dollars"))
+    price_momentum = last_price - prev_price  # positive = price moving up (YES favoured)
+    price_accel = abs(price_momentum)         # magnitude of move regardless of direction
+
+    # Settlement timer: markets with longer timers are less locked-in at close
+    settlement_timer = safe_float(market.get("settlement_timer_seconds"), default=1800.0)
+    settlement_timer_days = settlement_timer / 86400.0
+
     features: dict[str, float] = {
         "last_price": last_price,
         "yes_bid": yes_bid,
@@ -166,6 +175,11 @@ def extract_features(market: dict) -> dict[str, float] | None:
         "hours_open": hours_open,
         "hour_of_close": float(hour_of_close),
         "day_of_week": float(day_of_week),
+        # New features (all available pre-resolution)
+        "price_momentum": price_momentum,
+        "price_accel": price_accel,
+        "prev_price": prev_price,
+        "settlement_timer_days": settlement_timer_days,
         "_close_ts": close_ts,  # for time-based split, excluded from training
     }
 
@@ -231,6 +245,9 @@ FEATURE_COLS = [
     "volume_log", "open_interest_log",
     "hours_open", "hour_of_close", "day_of_week",
     "threshold", "is_above",
+    # New features (all available pre-resolution, no leakage)
+    "price_momentum", "price_accel", "prev_price",
+    "settlement_timer_days",
 ]
 
 
@@ -293,10 +310,10 @@ def train_category(
 
     # Train LightGBM with conservative hyperparameters
     model = LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=4,
-        num_leaves=15,
+        n_estimators=500,
+        learning_rate=0.03,
+        max_depth=5,
+        num_leaves=25,
         min_child_samples=30,
         subsample=0.8,
         colsample_bytree=0.8,
