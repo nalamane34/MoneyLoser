@@ -80,13 +80,17 @@ async def main() -> None:
     store = DataStore(data_dir / "execution.duckdb")
     store.initialize_schema(EXECUTION_TABLES)
 
-    # Attach collector and market_data databases read-only (via views)
-    store.attach_readonly("collector", data_dir / "collector.duckdb")
-    store.attach_readonly("market_data", data_dir / "market_data.duckdb")
-    store.create_attached_views({
-        "collector": ["sportsbook_game_lines", "forecast_ensembles", "funding_rates", "open_interest"],
-        "market_data": ["market_states", "orderbook_snapshots", "trades"],
-    })
+    # Cross-DB reads: DuckDB doesn't allow ATTACH when another process holds a
+    # write lock. Open a separate read-only DataStore for the collector DB.
+    # This uses a snapshot read and doesn't block the collector writer.
+    collector_db_path = data_dir / "collector.duckdb"
+    collector_store: DataStore | None = None
+    if collector_db_path.exists():
+        try:
+            collector_store = DataStore(collector_db_path, read_only=True)
+            log.info("execution.collector_db_opened", path=str(collector_db_path))
+        except Exception:
+            log.warning("execution.collector_db_unavailable", exc_info=True)
 
     # Build pipeline components
     model = SharpSportsbookModel()
@@ -132,8 +136,11 @@ async def main() -> None:
         exposure_calculator=exposure_calculator,
     )
 
+    # Use collector_store for sportsbook data (separate read-only connection),
+    # fall back to execution store if collector DB isn't available yet
+    sports_store = collector_store if collector_store is not None else store
     sports_provider = StoreBackedSportsSnapshotProvider(
-        store,
+        sports_store,
         leagues=config.sportsbook.leagues,
         rest_client=rest_client,
         max_line_age=timedelta(
@@ -189,6 +196,8 @@ async def main() -> None:
         await engine.stop()
         await sports_provider.close()
         await rest_client.close()
+        if collector_store is not None:
+            collector_store.close()
         store.close()
         log.info("execution.stopped")
 
