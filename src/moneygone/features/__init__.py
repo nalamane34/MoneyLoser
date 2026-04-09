@@ -22,6 +22,20 @@ from moneygone.features.market_features import (
     VolumeProfile,
     WeightedMidPrice,
 )
+from moneygone.features.game_winner_features import (
+    HomeFieldAdvantage,
+    InjuryAdjustedSpread,
+    KalshiVsSportsbookEdge,
+    MoneylineMovement,
+    PinnacleVsMarketEdge,
+    PinnacleWinProbability,
+    PowerRatingEdge,
+    PublicBettingLoad,
+    SharpVsPublicBias,
+    SpreadImpliedWinProb,
+    SportsbookWinProbability,
+    TeamInjuryImpact,
+)
 from moneygone.features.pipeline import FeaturePipeline
 from moneygone.features.registry import FeatureRegistry
 from moneygone.features.temporal import DayOfWeek, HourOfDay, IsWeekend, TimeToExpiryHours
@@ -95,6 +109,19 @@ __all__ = [
     "MinutesExpected",
     "PropLineVsMarket",
     "SharpMoneyIndicator",
+    # Game winners
+    "SportsbookWinProbability",
+    "PinnacleWinProbability",
+    "KalshiVsSportsbookEdge",
+    "PinnacleVsMarketEdge",
+    "MoneylineMovement",
+    "SharpVsPublicBias",
+    "PowerRatingEdge",
+    "HomeFieldAdvantage",
+    "TeamInjuryImpact",
+    "InjuryAdjustedSpread",
+    "SpreadImpliedWinProb",
+    "PublicBettingLoad",
     # Temporal
     "TimeToExpiryHours",
     "DayOfWeek",

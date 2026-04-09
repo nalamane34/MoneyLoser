@@ -234,4 +234,4 @@ class TimeFencedStore:
             msg="Raw SQL query bypasses temporal fencing",
             as_of=self._as_of.isoformat(),
         )
-        return self._store._conn.execute(sql, list((params or {}).values())).fetchall()
+        return self._store.query(sql, params)

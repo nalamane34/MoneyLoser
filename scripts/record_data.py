@@ -2,8 +2,8 @@
 """Data recording CLI.
 
 Connects to the Kalshi WebSocket feed and records market ticks, orderbook
-snapshots, and trades to the DuckDB DataStore.  Optionally fetches weather
-and crypto data on a schedule.
+snapshots, and trades to the DuckDB DataStore. Optionally fetches weather,
+crypto, and sportsbook data on a schedule.
 
 Usage::
 
@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -27,11 +28,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from moneygone.config import load_config
 from moneygone.data.market_data import MarketDataRecorder
+from moneygone.data.sports.odds import OddsAPIFeed
+from moneygone.data.sports.stats import PlayerStatsFeed
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger(__name__)
+
+_SPORTBOOK_LEAGUE_TO_SPORT = {
+    "nba": "basketball",
+    "ncaab": "basketball",
+    "nfl": "football",
+    "ncaaf": "football",
+    "nhl": "hockey",
+    "mlb": "baseball",
+}
 
 
 async def _fetch_weather_loop(config, store: DataStore) -> None:
@@ -100,6 +112,156 @@ async def _fetch_crypto_loop(config, store: DataStore) -> None:
         await asyncio.sleep(interval)
 
 
+def _scoreboard_event_start(event: dict) -> datetime | None:
+    """Extract an ESPN scoreboard event start time."""
+    raw = event.get("date")
+    if raw is None:
+        competitions = event.get("competitions", [])
+        if competitions:
+            raw = competitions[0].get("date")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _league_has_games_within_window(
+    stats_feed: PlayerStatsFeed,
+    league: str,
+    lookahead_hours: int,
+    *,
+    reference_time: datetime | None = None,
+) -> bool:
+    """Use free ESPN scoreboards to decide whether a paid poll is worthwhile."""
+    sport = _SPORTBOOK_LEAGUE_TO_SPORT.get(league.lower())
+    if sport is None:
+        log.warning("sportsbook_fetch.unsupported_league", league=league)
+        return False
+
+    start = reference_time or datetime.now(timezone.utc)
+    end = start + timedelta(hours=max(0, lookahead_hours))
+    day_count = (end.date() - start.date()).days + 1
+
+    for day_offset in range(day_count):
+        day = start.date() + timedelta(days=day_offset)
+        payload = await stats_feed.get_scoreboard(
+            sport,
+            league,
+            date=day.strftime("%Y%m%d"),
+        )
+        if not payload:
+            continue
+        for event in payload.get("events", []):
+            start_time = _scoreboard_event_start(event)
+            if start_time is None:
+                continue
+            if start <= start_time <= end:
+                return True
+
+    return False
+
+
+async def _fetch_sportsbook_loop(config, store: DataStore) -> None:
+    """Periodically record sharp-book line history with tight quota controls."""
+    interval = max(1, config.sportsbook.fetch_interval_minutes) * 60
+    leagues = [league.lower() for league in config.sportsbook.leagues]
+    odds_feed = OddsAPIFeed()
+    stats_feed = PlayerStatsFeed()
+
+    if not leagues:
+        log.info("sportsbook_fetch.disabled_no_leagues")
+        await odds_feed.close()
+        await stats_feed.close()
+        return
+
+    if not odds_feed.has_api_key:
+        log.warning("sportsbook_fetch.no_api_key")
+        await odds_feed.close()
+        await stats_feed.close()
+        return
+
+    log.info(
+        "sportsbook_fetch.started",
+        interval_minutes=config.sportsbook.fetch_interval_minutes,
+        leagues=leagues,
+        bookmakers=config.sportsbook.bookmakers,
+        markets=config.sportsbook.markets,
+        lookahead_hours=config.sportsbook.lookahead_hours,
+        min_requests_remaining=config.sportsbook.min_requests_remaining,
+    )
+
+    try:
+        while True:
+            try:
+                remaining = odds_feed.requests_remaining
+                reserve = config.sportsbook.min_requests_remaining
+                if remaining is not None and remaining <= reserve:
+                    log.warning(
+                        "sportsbook_fetch.quota_reserve_reached",
+                        remaining=remaining,
+                        reserve=reserve,
+                    )
+                    await asyncio.sleep(interval)
+                    continue
+
+                now = datetime.now(timezone.utc)
+                for league in leagues:
+                    remaining = odds_feed.requests_remaining
+                    if remaining is not None and remaining <= reserve:
+                        log.warning(
+                            "sportsbook_fetch.stop_for_quota",
+                            league=league,
+                            remaining=remaining,
+                            reserve=reserve,
+                        )
+                        break
+
+                    has_nearby_games = await _league_has_games_within_window(
+                        stats_feed,
+                        league,
+                        config.sportsbook.lookahead_hours,
+                        reference_time=now,
+                    )
+                    if not has_nearby_games:
+                        log.debug(
+                            "sportsbook_fetch.skip_no_games",
+                            league=league,
+                            lookahead_hours=config.sportsbook.lookahead_hours,
+                        )
+                        continue
+
+                    games = await odds_feed.get_upcoming_games(
+                        league,
+                        bookmakers=list(config.sportsbook.bookmakers),
+                        markets=list(config.sportsbook.markets),
+                    )
+                    rows = odds_feed.build_line_history_rows(
+                        league,
+                        games,
+                        captured_at=now,
+                    )
+                    store.insert_sportsbook_game_lines(rows)
+                    log.info(
+                        "sportsbook_fetch.recorded",
+                        league=league,
+                        games=len(games),
+                        rows=len(rows),
+                        remaining=odds_feed.requests_remaining,
+                    )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("sportsbook_fetch.error")
+
+            await asyncio.sleep(interval)
+    finally:
+        await odds_feed.close()
+        await stats_feed.close()
+
+
 async def _poll_markets_loop(
     rest_client: KalshiRestClient,
     recorder: MarketDataRecorder,
@@ -153,7 +315,7 @@ async def _poll_markets_loop(
                             }
                         })
 
-                        trades = await rest_client.get_trades(ticker, limit=20)
+                        trades, _ = await rest_client.get_trades(ticker, limit=20)
                         for trade in trades:
                             await recorder.on_trade({
                                 "data": {
@@ -257,6 +419,15 @@ async def main(args: argparse.Namespace) -> None:
             asyncio.create_task(
                 _fetch_crypto_loop(config, store),
                 name="crypto_fetch",
+            )
+        )
+
+    # Optional sportsbook line-history fetching
+    if config.sportsbook.enabled:
+        tasks.append(
+            asyncio.create_task(
+                _fetch_sportsbook_loop(config, store),
+                name="sportsbook_fetch",
             )
         )
 

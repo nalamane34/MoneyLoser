@@ -1,0 +1,48 @@
+# Conservative paper-trading soak profile for the sports execution path.
+# Designed to keep Odds API usage well below the 500-contract monthly cap
+# while still exercising the end-to-end live plumbing.
+
+exchange:
+  demo_mode: true
+
+weather:
+  enabled: false
+
+crypto:
+  enabled: false
+
+sportsbook:
+  enabled: true
+  leagues:
+    - "nba"
+  bookmakers:
+    - "pinnacle"
+    - "fanduel"
+    - "draftkings"
+    - "betmgm"
+  markets:
+    - "h2h"
+  fetch_interval_minutes: 30
+  lookahead_hours: 12
+  min_requests_remaining: 250
+
+execution:
+  min_edge_threshold: 0.03
+  max_edge_sanity: 0.20
+  prefer_maker: true
+  max_order_staleness_seconds: 90
+  evaluation_interval_seconds: 15.0
+  max_model_market_disagreement: 0.06
+
+risk:
+  kelly_fraction: 0.05
+  max_position_per_market: 10
+  max_position_per_category_pct: 0.05
+  max_total_exposure_pct: 0.10
+  daily_loss_limit_pct: 0.01
+  max_drawdown_pct: 0.05
+  min_contract_price: 0.20
+  max_contract_price: 0.80
+  max_tail_exposure_pct: 0.02
+
+log_level: "INFO"

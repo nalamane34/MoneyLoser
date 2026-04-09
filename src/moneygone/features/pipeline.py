@@ -49,13 +49,17 @@ class FeaturePipeline:
         Returns a dict mapping feature name to value.  Features that
         return ``None`` (missing data) are excluded from the result.
         """
+        if context.store is None and self._store is not None:
+            context.store = self._store
         cache: dict[str, float | None] = {}
+        errors = 0
 
         for feat in self._ordered:
             try:
                 value = feat.compute(context)
                 cache[feat.name] = value
             except Exception:
+                errors += 1
                 log.warning(
                     "feature_compute_error",
                     feature=feat.name,
@@ -64,8 +68,24 @@ class FeaturePipeline:
                 )
                 cache[feat.name] = None
 
-        # Strip None values from output
-        return {k: v for k, v in cache.items() if v is not None}
+        result = {k: v for k, v in cache.items() if v is not None}
+
+        if errors > 0:
+            log.warning(
+                "feature_pipeline.errors_summary",
+                ticker=context.ticker,
+                errors=errors,
+                total=len(self._ordered),
+                succeeded=len(result),
+            )
+        if len(result) == 0 and len(self._ordered) > 0:
+            log.error(
+                "feature_pipeline.all_features_failed",
+                ticker=context.ticker,
+                total=len(self._ordered),
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # Batch (training / backtesting)
@@ -100,6 +120,8 @@ class FeaturePipeline:
 
     def _compute_single_cached(self, context: FeatureContext) -> dict[str, float | None]:
         """Compute all features for a single context, caching intermediates."""
+        if context.store is None and self._store is not None:
+            context.store = self._store
         cache: dict[str, float | None] = {}
         for feat in self._ordered:
             try:

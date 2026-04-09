@@ -22,20 +22,15 @@ log = structlog.get_logger()
 def _yes_bid_ask(ob: OrderbookSnapshot) -> tuple[float, float] | None:
     """Extract best yes bid and ask from an orderbook snapshot.
 
-    Yes bids come from yes_levels (sorted descending by price -- best bid first).
-    Yes asks come from no_levels converted: yes_ask = 1 - no_bid.
+    Kalshi orderbooks are bid-only ladders sorted ascending with the best
+    price at the end. YES asks are derived from the best NO bid.
     """
-    if not ob.yes_levels and not ob.no_levels:
+    bid = ob.best_yes_bid
+    ask = ob.best_yes_ask
+    if bid is None or ask is None:
         return None
 
-    yes_bid = float(ob.yes_levels[0].price) if ob.yes_levels else 0.0
-    # The ask side for yes contracts comes from the best no bid:
-    # a no bid at price P implies a yes ask at 1-P (in cents).
-    yes_ask = (1.0 - float(ob.no_levels[0].price)) if ob.no_levels else 1.0
-
-    if yes_bid <= 0 and yes_ask >= 1.0:
-        return None
-    return yes_bid, yes_ask
+    return float(bid), float(ask)
 
 
 def _levels_to_arrays(
@@ -108,8 +103,8 @@ class OrderbookImbalance(Feature):
         _, bid_sizes = _levels_to_arrays(ob.yes_levels)
         _, ask_sizes = _levels_to_arrays(ob.no_levels)
 
-        bid_vol = float(bid_sizes[: self.n_levels].sum()) if len(bid_sizes) > 0 else 0.0
-        ask_vol = float(ask_sizes[: self.n_levels].sum()) if len(ask_sizes) > 0 else 0.0
+        bid_vol = float(bid_sizes[-self.n_levels :].sum()) if len(bid_sizes) > 0 else 0.0
+        ask_vol = float(ask_sizes[-self.n_levels :].sum()) if len(ask_sizes) > 0 else 0.0
 
         total = bid_vol + ask_vol
         if total == 0:
@@ -137,8 +132,8 @@ class WeightedMidPrice(Feature):
             return None
         yes_bid, yes_ask = ba
 
-        bid_size = float(ob.yes_levels[0].contracts) if ob.yes_levels else 0.0
-        ask_size = float(ob.no_levels[0].contracts) if ob.no_levels else 0.0
+        bid_size = float(ob.yes_bids[-1].contracts) if ob.yes_bids else 0.0
+        ask_size = float(ob.no_bids[-1].contracts) if ob.no_bids else 0.0
 
         total = bid_size + ask_size
         if total == 0:

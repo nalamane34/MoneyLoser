@@ -154,8 +154,8 @@ class EdgeAnalyzer:
 
                     ob = OrderbookSnapshot(
                         ticker=ticker,
-                        yes_levels=yes_levels,
-                        no_levels=no_levels,
+                        yes_bids=yes_levels,
+                        no_bids=no_levels,
                         seq=ob_data.get("seq", 0),
                         timestamp=snapshot_ts,
                     )

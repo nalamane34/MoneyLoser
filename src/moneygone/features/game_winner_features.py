@@ -21,10 +21,19 @@ Expected ``sports_snapshot`` keys for game-winner context:
         Consensus sportsbook implied win probability for home team.
         Derived by averaging 1/decimal_odds across bookmakers, normalised
         to remove the overround.
+    pinnacle_home_win_prob : float | None
+        Pinnacle-only implied win probability for the home team.
+        This is our sharpest single-book signal.
+    pinnacle_moneyline_home : float | None
+        Pinnacle decimal moneyline for the home team.
+    pinnacle_moneyline_away : float | None
+        Pinnacle decimal moneyline for the away team.
     opening_moneyline_home : float | None
-        Opening decimal odds for home team at line open (earliest snapshot).
+        Opening decimal odds for the home team used in line-movement
+        features, ideally from the earliest stored Pinnacle snapshot.
     current_moneyline_home : float | None
-        Current consensus decimal odds for home team (latest snapshot).
+        Current decimal odds for the home team used in line-movement
+        features, preferring Pinnacle so opening/current are comparable.
 
     # Public / sharp money
     public_pct_home : float | None
@@ -164,6 +173,31 @@ class SportsbookWinProbability(Feature):
         return _team_perspective(home_prob, away_prob, context)
 
 
+class PinnacleWinProbability(Feature):
+    """Pinnacle implied win probability for the priced team.
+
+    Pinnacle is generally the sharpest major book available through
+    Odds API, so this feature is often a cleaner proxy for "true" price
+    than a broad public consensus.
+    """
+
+    name = "pinnacle_win_prob"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        home_prob = _getf(context, "pinnacle_home_win_prob")
+        if home_prob is None:
+            home_odds = _getf(context, "pinnacle_moneyline_home")
+            away_odds = _getf(context, "pinnacle_moneyline_away")
+            if home_odds is None or away_odds is None:
+                return None
+            home_prob, away_prob = _consensus_implied_prob(home_odds, away_odds)
+        else:
+            away_prob = 1.0 - home_prob
+        return _team_perspective(home_prob, away_prob, context)
+
+
 class KalshiVsSportsbookEdge(Feature):
     """Difference between Kalshi implied probability and sportsbook consensus.
 
@@ -187,6 +221,26 @@ class KalshiVsSportsbookEdge(Feature):
         if sb_prob is None or kalshi_prob is None:
             return None
         return sb_prob - kalshi_prob
+
+
+class PinnacleVsMarketEdge(Feature):
+    """Pinnacle implied probability minus Kalshi implied probability.
+
+    Positive values indicate Pinnacle likes the priced team more than
+    Kalshi does, which is often the cleanest "sharp book vs market"
+    dislocation available in this stack.
+    """
+
+    name = "pinnacle_vs_market_edge"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        pinnacle_prob = PinnacleWinProbability().compute(context)
+        kalshi_prob = _getf(context, "kalshi_implied_prob")
+        if pinnacle_prob is None or kalshi_prob is None:
+            return None
+        return pinnacle_prob - kalshi_prob
 
 
 class MoneylineMovement(Feature):

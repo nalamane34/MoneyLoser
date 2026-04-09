@@ -132,26 +132,13 @@ class EdgeCalculator:
         is_maker: bool,
     ) -> EdgeResult:
         """Compute edge for a single side (yes or no)."""
-        if side == "yes":
-            levels = orderbook.yes_levels
-            # Buying YES: our model says prob is higher than ask price
-            relevant_prob = model_prob
-            action = "buy"
-        else:
-            levels = orderbook.no_levels
-            # Buying NO: our model says prob of NO is higher than ask price
-            relevant_prob = 1.0 - model_prob
-            action = "buy"
-
-        # Best ask is the lowest-priced level available (levels sorted ascending)
-        if not levels:
+        best_level = self._best_executable_level(orderbook, side)
+        if best_level is None:
             return self._empty_result(model_prob, side)
 
-        # Find best ask: sort levels by price ascending, take lowest
-        sorted_levels = sorted(levels, key=lambda lv: lv.price)
-        best_level = sorted_levels[0]
-        target_price = best_level.price
-        available_liquidity = int(best_level.contracts)
+        target_price, available_liquidity = best_level
+        relevant_prob = model_prob if side == "yes" else 1.0 - model_prob
+        action = "buy"
 
         implied_prob = float(target_price)
         raw_edge = relevant_prob - implied_prob
@@ -196,6 +183,29 @@ class EdgeCalculator:
             target_price=target_price,
             expected_value=ev,
         )
+
+    def _best_executable_level(
+        self,
+        orderbook: OrderbookSnapshot,
+        side: str,
+    ) -> tuple[Decimal, int] | None:
+        """Return the best executable ask and its liquidity for ``side``.
+
+        Kalshi orderbooks are bid-only ladders sorted ascending, with the
+        best price at the end. The executable ask is derived from the
+        opposite side's best bid.
+        """
+        if side == "yes":
+            if not orderbook.no_bids:
+                return None
+            best_bid = orderbook.no_bids[-1]
+        else:
+            if not orderbook.yes_bids:
+                return None
+            best_bid = orderbook.yes_bids[-1]
+
+        target_price = _ONE - best_bid.price
+        return target_price, int(best_bid.contracts)
 
     def _empty_result(self, model_prob: float, side: str) -> EdgeResult:
         """Return a non-actionable result when no levels exist."""

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import pickle
 import signal
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,15 +32,33 @@ from moneygone.config import AppConfig
 from moneygone.data.crypto.ccxt_feed import CryptoDataFeed
 from moneygone.data.market_data import MarketDataRecorder
 from moneygone.data.sports.espn import ESPNLiveFeed
+from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvider
 from moneygone.data.sports.live_weather import LiveWeatherFeed
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
+from moneygone.exchange.ws_client import KalshiWebSocket
+from moneygone.execution.engine import ExecutionEngine
+from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
+from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
+from moneygone.features import (
+    HomeFieldAdvantage,
+    KalshiVsSportsbookEdge,
+    MoneylineMovement,
+    PinnacleVsMarketEdge,
+    PinnacleWinProbability,
+    PowerRatingEdge,
+    SpreadImpliedWinProb,
+    SportsbookWinProbability,
+    TeamInjuryImpact,
+)
+from moneygone.features.pipeline import FeaturePipeline
 from moneygone.monitoring.alerts import AlertManager
 from moneygone.monitoring.calibration_monitor import CalibrationMonitor
 from moneygone.monitoring.drift import DriftDetector
 from moneygone.monitoring.pnl import PnLTracker
 from moneygone.monitoring.regime_detector import RegimeDetector
+from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.risk.manager import RiskManager
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
@@ -120,10 +139,12 @@ class Application:
         alert_manager: AlertManager,
         model: Any | None = None,
         pipeline: Any | None = None,
+        execution_engine: ExecutionEngine | None = None,
         resolution_sniper: ResolutionSniper | None = None,
         live_event_edge: LiveEventEdge | None = None,
         cross_market_arb: CrossMarketArbitrage | None = None,
         market_maker: MarketMaker | None = None,
+        async_closeables: list[Any] | None = None,
     ) -> None:
         self.config = config
         self.rest_client = rest_client
@@ -139,10 +160,12 @@ class Application:
         self.alert_manager = alert_manager
         self.model = model
         self.pipeline = pipeline
+        self.execution_engine = execution_engine
         self.resolution_sniper = resolution_sniper
         self.live_event_edge = live_event_edge
         self.cross_market_arb = cross_market_arb
         self.market_maker = market_maker
+        self._async_closeables = async_closeables or []
 
         self._tasks: list[asyncio.Task[None]] = []
         self._running = False
@@ -175,6 +198,10 @@ class Application:
                 self._monitoring_loop(), name="monitoring_loop"
             )
         )
+
+        if self.execution_engine:
+            await self.execution_engine.start()
+            log.info("app.execution_engine_started")
 
         # Start strategies
         if self.resolution_sniper:
@@ -219,6 +246,13 @@ class Application:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+        if self.execution_engine:
+            try:
+                await self.execution_engine.stop()
+                log.info("app.execution_engine_stopped")
+            except Exception:
+                log.exception("app.execution_engine_stop_error")
+
         # Stop strategies
         for name, strategy in [
             ("resolution_sniper", self.resolution_sniper),
@@ -239,6 +273,16 @@ class Application:
         # Close clients
         await self.rest_client.close()
         await self.alert_manager.close()
+        for closeable in self._async_closeables:
+            close = getattr(closeable, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                log.exception("app.async_closeable_error", closeable=type(closeable).__name__)
 
         # Close data store
         self.store.close()
@@ -277,6 +321,12 @@ class Application:
         interval = 60.0  # Check every minute
         while True:
             try:
+                # Auto-seed drift reference from first window of predictions
+                if not self.drift_detector._reference_seeded:
+                    recent = list(self.drift_detector._recent)
+                    if len(recent) >= self.drift_detector._window_size:
+                        self.drift_detector.set_reference(np.array(recent))
+
                 # Check drift
                 drift_result = self.drift_detector.check_drift()
                 if drift_result.is_drifted:
@@ -332,18 +382,12 @@ def build_app(config: AppConfig) -> Application:
     # 4. Data recorder
     recorder = MarketDataRecorder(store)
 
-    # 5. Feature pipeline (load features if available)
-    pipeline = None
-    try:
-        from moneygone.features.pipeline import FeaturePipeline
-        # Pipeline requires registered features; will be initialized
-        # when model and features are configured.
-        log.debug("build_app.pipeline_available")
-    except ImportError:
-        log.debug("build_app.pipeline_not_available")
-
-    # 6. Model loading
-    model = _load_latest_model(config)
+    # 5. Model + feature pipeline
+    pipeline: Any | None = None
+    model: Any | None = None
+    execution_engine: ExecutionEngine | None = None
+    async_closeables: list[Any] = []
+    sports_only_mode = bool(config.sportsbook.enabled and config.sportsbook.leagues)
 
     # 7. Signal generation
     fee_calculator = KalshiFeeCalculator()
@@ -359,10 +403,11 @@ def build_app(config: AppConfig) -> Application:
     log.info("build_app.signals_ready")
 
     # 8. Monitoring
-    #    Drift detector needs a reference distribution; use uniform as default
-    reference_dist = np.random.default_rng(42).uniform(0, 1, size=1000)
+    #    Drift detector starts with an empty reference; it will be seeded
+    #    from actual model predictions once enough data is collected, rather
+    #    than using random noise which would cause false positive drift alerts.
     drift_detector = DriftDetector(
-        reference_distribution=reference_dist,
+        reference_distribution=np.array([]),
         window_size=config.monitoring.drift_window,
         psi_critical=config.monitoring.psi_threshold,
     )
@@ -386,56 +431,130 @@ def build_app(config: AppConfig) -> Application:
     exposure_calculator = ExposureCalculator()
     risk_limits = RiskLimits(config.risk)
     risk_manager = RiskManager(
-        limits=risk_limits,
+        risk_config=config.risk,
+        risk_limits=risk_limits,
         portfolio=portfolio_tracker,
-        drawdown=drawdown_monitor,
-        exposure=exposure_calculator,
+        drawdown_monitor=drawdown_monitor,
+        exposure_calculator=exposure_calculator,
     )
     kelly_sizer = KellySizer(
-        fraction=config.risk.kelly_fraction,
+        kelly_fraction=config.risk.kelly_fraction,
         max_position_pct=config.risk.max_total_exposure_pct,
     )
     log.info("build_app.execution_ready")
 
     # 10. Data feeds
-    espn_feed = ESPNLiveFeed()
-    weather_feed = LiveWeatherFeed()
-    crypto_feed = CryptoDataFeed(config.crypto) if config.crypto.enabled else None
+    espn_feed = None
+    weather_feed = None
+    crypto_feed = None
+    if not sports_only_mode:
+        espn_feed = ESPNLiveFeed()
+        weather_feed = LiveWeatherFeed()
+        crypto_feed = CryptoDataFeed(config.crypto) if config.crypto.enabled else None
+        async_closeables.extend([espn_feed, weather_feed])
+        if crypto_feed is not None:
+            async_closeables.append(crypto_feed)
 
     # 11. Strategies
-    resolution_sniper = ResolutionSniper(
-        rest_client=rest_client,
-        order_manager=order_manager,
-        fee_calculator=fee_calculator,
-        contract_mappings=[],  # auto-discovered at start()
-        config=SnipeConfig(),
-    )
+    resolution_sniper = None
+    live_event_edge = None
+    cross_market_arb = None
+    market_maker = None
 
-    live_event_edge = LiveEventEdge(
-        rest_client=rest_client,
-        espn_feed=espn_feed,
-        weather_feed=weather_feed,
-        fee_calculator=fee_calculator,
-        edge_calculator=edge_calculator,
-        sizer=kelly_sizer,
-        risk_manager=risk_manager,
-        order_manager=order_manager,
-        config=LiveEdgeConfig(),
-    )
+    if not sports_only_mode:
+        resolution_sniper = ResolutionSniper(
+            rest_client=rest_client,
+            order_manager=order_manager,
+            fee_calculator=fee_calculator,
+            contract_mappings=[],  # auto-discovered at start()
+            config=SnipeConfig(),
+        )
 
-    cross_market_arb = CrossMarketArbitrage(
-        rest_client=rest_client,
-        fee_calculator=fee_calculator,
-        order_manager=order_manager,
-        config=ArbConfig(),
-    )
+        live_event_edge = LiveEventEdge(
+            rest_client=rest_client,
+            espn_feed=espn_feed,
+            weather_feed=weather_feed,
+            fee_calculator=fee_calculator,
+            edge_calculator=edge_calculator,
+            sizer=kelly_sizer,
+            risk_manager=risk_manager,
+            order_manager=order_manager,
+            config=LiveEdgeConfig(),
+        )
 
-    market_maker = MarketMaker(
-        rest_client=rest_client,
-        order_manager=order_manager,
-        fee_calculator=fee_calculator,
-        config=MMConfig(),
-    )
+        cross_market_arb = CrossMarketArbitrage(
+            rest_client=rest_client,
+            fee_calculator=fee_calculator,
+            order_manager=order_manager,
+            config=ArbConfig(),
+        )
+
+        market_maker = MarketMaker(
+            rest_client=rest_client,
+            order_manager=order_manager,
+            fee_calculator=fee_calculator,
+            config=MMConfig(),
+        )
+
+    if sports_only_mode:
+        model = SharpSportsbookModel()
+        pipeline = FeaturePipeline(
+            [
+                SportsbookWinProbability(),
+                PinnacleWinProbability(),
+                KalshiVsSportsbookEdge(),
+                PinnacleVsMarketEdge(),
+                MoneylineMovement(),
+                PowerRatingEdge(),
+                HomeFieldAdvantage(),
+                TeamInjuryImpact(),
+                SpreadImpliedWinProb(),
+            ],
+            store=store,
+        )
+        ws_client = KalshiWebSocket(config.exchange)
+        fill_tracker = FillTracker(store=store)
+        sports_provider = StoreBackedSportsSnapshotProvider(
+            store,
+            leagues=config.sportsbook.leagues,
+            rest_client=rest_client,
+            max_line_age=timedelta(
+                hours=max(
+                    config.sportsbook.lookahead_hours,
+                    max(2, config.sportsbook.fetch_interval_minutes // 60 + 1),
+                )
+            ),
+        )
+        async_closeables.append(sports_provider)
+        strategy = (
+            PassiveStrategy(timeout_seconds=30.0)
+            if config.execution.prefer_maker
+            else AggressiveStrategy()
+        )
+        execution_engine = ExecutionEngine(
+            rest_client=rest_client,
+            ws_client=ws_client,
+            feature_pipeline=pipeline,
+            model=model,
+            edge_calculator=edge_calculator,
+            sizer=kelly_sizer,
+            risk_manager=risk_manager,
+            order_manager=order_manager,
+            fill_tracker=fill_tracker,
+            strategy=strategy,
+            config=config.execution,
+            watched_tickers=[],
+            store=store,
+            sports_snapshot_provider=sports_provider,
+            recorder=recorder,
+        )
+        log.info(
+            "build_app.sports_execution_ready",
+            leagues=config.sportsbook.leagues,
+            model=model.name,
+        )
+    else:
+        model = _load_latest_model(config)
 
     log.info("build_app.strategies_ready")
 
@@ -455,10 +574,12 @@ def build_app(config: AppConfig) -> Application:
         alert_manager=alert_manager,
         model=model,
         pipeline=pipeline,
+        execution_engine=execution_engine,
         resolution_sniper=resolution_sniper,
         live_event_edge=live_event_edge,
         cross_market_arb=cross_market_arb,
         market_maker=market_maker,
+        async_closeables=async_closeables,
     )
 
     log.info(
@@ -480,26 +601,44 @@ def _load_latest_model(config: AppConfig) -> Any | None:
         log.info("build_app.no_model_dir", path=str(model_dir))
         return None
 
-    # Find the newest .pkl file
-    pkl_files = sorted(model_dir.glob("*.pkl"), key=lambda p: p.stat().st_mtime)
+    # Find the newest pickled model artifact anywhere under the model dir.
+    pkl_files = sorted(model_dir.rglob("*.pkl"), key=lambda p: p.stat().st_mtime)
     if not pkl_files:
         log.info("build_app.no_models_found", path=str(model_dir))
         return None
 
-    latest = pkl_files[-1]
-    try:
-        with open(latest, "rb") as f:
-            artifact = pickle.load(f)  # noqa: S301
+    for latest in reversed(pkl_files):
+        try:
+            with open(latest, "rb") as f:
+                artifact = pickle.load(f)  # noqa: S301
+        except Exception:
+            log.warning(
+                "build_app.model_load_failed",
+                path=str(latest),
+                exc_info=True,
+            )
+            continue
+
+        feature_names = artifact.get("feature_names", []) if isinstance(artifact, dict) else []
+        if _artifact_has_label_leakage(feature_names):
+            log.warning(
+                "build_app.model_rejected",
+                path=str(latest),
+                reason="label_leakage_features",
+            )
+            continue
+
         log.info(
             "build_app.model_loaded",
             path=str(latest),
-            model_type=artifact.get("type", "unknown"),
+            model_type=artifact.get("type", "unknown") if isinstance(artifact, dict) else type(artifact).__name__,
         )
         return artifact
-    except Exception:
-        log.warning(
-            "build_app.model_load_failed",
-            path=str(latest),
-            exc_info=True,
-        )
-        return None
+
+    log.warning("build_app.no_safe_models_found", path=str(model_dir))
+    return None
+
+
+def _artifact_has_label_leakage(feature_names: list[str]) -> bool:
+    leaked = {"settlement_value", "has_settlement_value"}
+    return any(name in leaked for name in feature_names)

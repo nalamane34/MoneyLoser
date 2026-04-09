@@ -187,6 +187,10 @@ class KalshiWebSocket:
 
         log.info("ws_client.initialized", ws_url=self._ws_url)
 
+    def set_on_event(self, handler: EventCallback | None) -> None:
+        """Update the event callback used for dispatched WebSocket messages."""
+        self._on_event = handler
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------

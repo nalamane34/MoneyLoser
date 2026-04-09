@@ -99,16 +99,13 @@ class MarketScreener:
             if cursor:
                 kwargs["cursor"] = cursor
 
-            batch = await rest_client.get_markets(**kwargs)
+            batch, cursor = await rest_client.get_markets_page(**kwargs)
             if not batch:
                 break
             all_markets.extend(batch)
 
-            # Simple pagination heuristic: if we got a full page, there may be more
-            if len(batch) < 200:
+            if not cursor:
                 break
-            # Use last ticker as pseudo-cursor (Kalshi API may use cursor differently)
-            cursor = batch[-1].ticker
 
         log.info("screener.fetched_markets", total=len(all_markets))
 

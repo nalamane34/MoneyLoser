@@ -6,6 +6,8 @@ build/
 .eggs/
 *.egg
 .env
+.env.*
+*.env
 *.pem
 *.key
 data/

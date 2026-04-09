@@ -20,7 +20,7 @@ from enum import Enum
 
 import structlog
 
-from moneygone.exchange.types import OrderbookSnapshot, OrderRequest, Side
+from moneygone.exchange.types import OrderbookLevel, OrderbookSnapshot, OrderRequest, Side
 from moneygone.signals.fees import KalshiFeeCalculator
 
 logger = structlog.get_logger(__name__)
@@ -119,14 +119,15 @@ class FillSimulator:
     def _instant_fill(self, order: OrderRequest) -> SimulatedFill:
         """Always fills at the order price.  Unrealistic baseline."""
         is_maker = order.post_only
+        order_price = self._order_limit_price(order)
         if is_maker:
-            fees = self._fees.maker_fee(order.count, order.yes_price)
+            fees = self._fees.maker_fee(order.count, order_price)
         else:
-            fees = self._fees.taker_fee(order.count, order.yes_price)
+            fees = self._fees.taker_fee(order.count, order_price)
 
         return SimulatedFill(
             filled=True,
-            fill_price=order.yes_price,
+            fill_price=order_price,
             filled_contracts=order.count,
             fees=fees,
             slippage=_ZERO,
@@ -153,7 +154,7 @@ class FillSimulator:
             return self._no_fill(order, "queue")
 
         # Find the level at or better than our order price
-        order_price = order.yes_price
+        order_price = self._order_limit_price(order)
         matching_volume = 0
         for level in levels:
             if self._price_matches(order, level.price):
@@ -210,7 +211,7 @@ class FillSimulator:
         if not levels:
             return self._no_fill(order, "realistic")
 
-        order_price = order.yes_price
+        order_price = self._order_limit_price(order)
 
         # Check if we cross the spread (aggressive order)
         best_ask = self._get_best_ask(order, orderbook)
@@ -249,7 +250,7 @@ class FillSimulator:
 
         # Apply configurable slippage
         slippage = order_price * self._slippage_bps
-        fill_price = order_price + slippage if order.side == Side.YES else order_price + slippage
+        fill_price = order_price + slippage
 
         is_maker = order.post_only
         if is_maker:
@@ -276,10 +277,13 @@ class FillSimulator:
         orderbook: OrderbookSnapshot,
     ) -> SimulatedFill:
         """Walk through orderbook levels to simulate aggressive fills."""
-        levels = self._get_relevant_levels(order, orderbook)
+        levels = self._get_opposite_levels(order, orderbook)
+        if not levels:
+            return self._no_fill(order, "realistic")
 
-        # Sort levels by price: ascending for buys (best ask first)
-        sorted_levels = sorted(levels, key=lambda lvl: lvl.price)
+        # Opposite-side bids are stored ascending; best executable ask is last.
+        sorted_levels = list(reversed(levels))
+        limit_price = self._order_limit_price(order)
 
         remaining = order.count
         total_cost = _ZERO
@@ -289,12 +293,14 @@ class FillSimulator:
             if remaining <= 0:
                 break
 
+            fill_price = self._opposite_bid_to_fill_price(level.price)
+
             # Only fill at prices at or better than our limit
-            if not self._price_acceptable(order, level.price):
+            if not self._price_acceptable(order, fill_price):
                 continue
 
             fill_at_level = min(remaining, int(level.contracts))
-            total_cost += Decimal(fill_at_level) * level.price
+            total_cost += Decimal(fill_at_level) * fill_price
             total_filled += fill_at_level
             remaining -= fill_at_level
 
@@ -306,7 +312,7 @@ class FillSimulator:
         )
 
         # Add configurable slippage
-        slippage = avg_price * self._slippage_bps + (avg_price - order.yes_price)
+        slippage = avg_price * self._slippage_bps + (avg_price - limit_price)
 
         fees = self._fees.taker_fee(total_filled, avg_price)
 
@@ -330,24 +336,44 @@ class FillSimulator:
         return ob.no_levels
 
     def _get_best_ask(self, order: OrderRequest, ob: OrderbookSnapshot) -> Decimal | None:
-        """Get the best (lowest) ask price for the order's side."""
-        levels = self._get_relevant_levels(order, ob)
+        """Get the best executable ask price for the order's side."""
+        levels = self._get_opposite_levels(order, ob)
         if not levels:
             return None
-        return min(lvl.price for lvl in levels)
+        return self._opposite_bid_to_fill_price(levels[-1].price)
+
+    def _get_opposite_levels(
+        self,
+        order: OrderRequest,
+        ob: OrderbookSnapshot,
+    ) -> tuple[OrderbookLevel, ...]:
+        """Get the opposite-side bid ladder that can satisfy ``order``."""
+        if order.side == Side.YES:
+            return ob.no_levels
+        return ob.yes_levels
+
+    def _order_limit_price(self, order: OrderRequest) -> Decimal:
+        """Return the native price limit for the requested contract side."""
+        if order.side == Side.YES:
+            return order.yes_price
+        return _ONE - order.yes_price
+
+    def _opposite_bid_to_fill_price(self, opposite_bid_price: Decimal) -> Decimal:
+        """Convert an opposite-side bid into the native fill price."""
+        return _ONE - opposite_bid_price
 
     def _price_matches(self, order: OrderRequest, level_price: Decimal) -> bool:
         """Check if a level is at our order price."""
-        return level_price == order.yes_price
+        return level_price == self._order_limit_price(order)
 
     def _price_crosses(self, order: OrderRequest, ask_price: Decimal) -> bool:
         """Check if our order price crosses (meets or exceeds) the ask."""
-        return order.yes_price >= ask_price
+        return self._order_limit_price(order) >= ask_price
 
     def _price_acceptable(self, order: OrderRequest, level_price: Decimal) -> bool:
         """Check if a level's price is acceptable for our order."""
-        # For a buy, we accept prices at or below our limit
-        return level_price <= order.yes_price
+        # For a buy, we accept prices at or below our limit.
+        return level_price <= self._order_limit_price(order)
 
     def _taker_fill(self, order: OrderRequest, ob: OrderbookSnapshot) -> SimulatedFill:
         """Simulate an immediate taker fill at the best available price."""
@@ -357,7 +383,7 @@ class FillSimulator:
         """Return a no-fill result."""
         return SimulatedFill(
             filled=False,
-            fill_price=order.yes_price,
+            fill_price=self._order_limit_price(order),
             filled_contracts=0,
             fees=_ZERO,
             slippage=_ZERO,

@@ -15,12 +15,18 @@ from moneygone.data.sports.odds import (
     OddsAPIFeed,
     PropLine,
 )
+from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvider
+from moneygone.data.sports.power_ratings import (
+    ESPNPowerRatings,
+    TeamRating,
+)
 from moneygone.data.sports.stats import (
     GameLogEntry,
     InjuryReport,
     PlayerInfo,
     PlayerSeasonStats,
     PlayerStatsFeed,
+    TeamInjurySummary,
 )
 
 __all__ = [
@@ -34,9 +40,14 @@ __all__ = [
     "GameLogEntry",
     "PlayerInfo",
     "InjuryReport",
+    "TeamInjurySummary",
     # Odds feed
     "OddsAPIFeed",
     "PropLine",
     "MoneylineOdds",
     "GameOdds",
+    "StoreBackedSportsSnapshotProvider",
+    # Power ratings
+    "ESPNPowerRatings",
+    "TeamRating",
 ]

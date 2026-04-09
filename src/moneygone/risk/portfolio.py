@@ -33,7 +33,8 @@ class LocalPosition:
     ticker: str
     yes_count: int = 0
     no_count: int = 0
-    cost_basis: Decimal = _ZERO
+    yes_cost_basis: Decimal = _ZERO
+    no_cost_basis: Decimal = _ZERO
     realized_pnl: Decimal = _ZERO
 
     @property
@@ -45,6 +46,11 @@ class LocalPosition:
     def is_flat(self) -> bool:
         """True if no contracts are held on either side."""
         return self.yes_count == 0 and self.no_count == 0
+
+    @property
+    def cost_basis(self) -> Decimal:
+        """Total cost basis across YES and NO legs."""
+        return self.yes_cost_basis + self.no_cost_basis
 
 
 class PortfolioTracker:
@@ -103,9 +109,10 @@ class PortfolioTracker:
         if fill.action == Action.BUY:
             if fill.side == Side.YES:
                 pos.yes_count += fill.count
+                pos.yes_cost_basis += cost
             else:
                 pos.no_count += fill.count
-            pos.cost_basis += cost
+                pos.no_cost_basis += cost
             self._cash -= cost
             logger.debug(
                 "fill_buy",
@@ -116,27 +123,27 @@ class PortfolioTracker:
                 cash_remaining=str(self._cash),
             )
         elif fill.action == Action.SELL:
-            total_count = pos.yes_count + pos.no_count
             if fill.side == Side.YES:
-                if pos.yes_count > 0 and total_count > 0:
-                    avg_cost = pos.cost_basis / Decimal(total_count)
-                    pnl = cost - avg_cost * Decimal(fill.count)
+                if pos.yes_count > 0:
+                    sold_count = min(fill.count, pos.yes_count)
+                    avg_cost = pos.yes_cost_basis / Decimal(pos.yes_count)
+                    sold_cost = avg_cost * Decimal(sold_count)
+                    pnl = Decimal(sold_count) * fill.price - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
+                    pos.yes_cost_basis -= sold_cost
                 pos.yes_count = max(0, pos.yes_count - fill.count)
             else:
-                if pos.no_count > 0 and total_count > 0:
-                    avg_cost = pos.cost_basis / Decimal(total_count)
-                    pnl = cost - avg_cost * Decimal(fill.count)
+                if pos.no_count > 0:
+                    sold_count = min(fill.count, pos.no_count)
+                    avg_cost = pos.no_cost_basis / Decimal(pos.no_count)
+                    sold_cost = avg_cost * Decimal(sold_count)
+                    pnl = Decimal(sold_count) * fill.price - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
+                    pos.no_cost_basis -= sold_cost
                 pos.no_count = max(0, pos.no_count - fill.count)
             self._cash += cost
-            # Reduce cost basis proportionally
-            total_before = pos.yes_count + pos.no_count + fill.count
-            if total_before > 0:
-                fraction_sold = Decimal(fill.count) / Decimal(total_before)
-                pos.cost_basis -= pos.cost_basis * fraction_sold
             logger.debug(
                 "fill_sell",
                 ticker=fill.ticker,
@@ -148,7 +155,8 @@ class PortfolioTracker:
 
         # Clean up flat positions
         if pos.is_flat:
-            pos.cost_basis = _ZERO
+            pos.yes_cost_basis = _ZERO
+            pos.no_cost_basis = _ZERO
 
     def on_settlement(self, settlement: Settlement) -> None:
         """Update realized PnL when a market settles.
@@ -165,7 +173,8 @@ class PortfolioTracker:
             pos.realized_pnl += settlement.revenue
             pos.yes_count = 0
             pos.no_count = 0
-            pos.cost_basis = _ZERO
+            pos.yes_cost_basis = _ZERO
+            pos.no_cost_basis = _ZERO
 
         logger.info(
             "settlement",
@@ -276,6 +285,10 @@ class PortfolioTracker:
                     )
                     local.yes_count = expos.yes_count
                     local.no_count = expos.no_count
+                    if local.yes_count == 0:
+                        local.yes_cost_basis = _ZERO
+                    if local.no_count == 0:
+                        local.no_cost_basis = _ZERO
 
             # Remove local positions that no longer exist on exchange
             for ticker in list(self._positions.keys()):
@@ -291,13 +304,20 @@ class PortfolioTracker:
                     del self._positions[ticker]
 
             # Reconcile cash
-            if self._cash != balance.available:  # type: ignore[attr-defined]
+            exchange_cash = balance.available  # type: ignore[attr-defined]
+            if exchange_cash is None:
+                logger.warning(
+                    "cash_reconciliation_skipped",
+                    reason="exchange_balance_is_none",
+                    local=str(self._cash),
+                )
+            elif self._cash != exchange_cash:
                 logger.warning(
                     "cash_reconciliation",
                     local=str(self._cash),
-                    exchange=str(balance.available),  # type: ignore[attr-defined]
+                    exchange=str(exchange_cash),
                 )
-                self._cash = balance.available  # type: ignore[attr-defined]
+                self._cash = exchange_cash
 
             logger.info("portfolio_synced", n_positions=len(self._positions))
 

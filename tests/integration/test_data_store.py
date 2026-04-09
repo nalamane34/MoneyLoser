@@ -31,6 +31,7 @@ class TestDataStoreSchema:
             "forecast_ensembles",
             "funding_rates",
             "open_interest",
+            "sportsbook_game_lines",
             "features",
             "predictions",
             "fills_log",
@@ -182,3 +183,64 @@ class TestTrades:
         assert len(results) == 2
         assert results[0]["trade_id"] == "t1"
         assert results[1]["trade_id"] == "t2"
+
+
+class TestSportsbookLines:
+    """Test sportsbook line-history inserts and ranked lookups."""
+
+    def test_insert_and_query_opening_and_latest_lines(self, data_store: DataStore) -> None:
+        """Opening should come from the first snapshot, latest from the most recent."""
+        t1 = datetime(2026, 4, 9, 9, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "event_id": "evt-1",
+                "sport": "nba",
+                "home_team": "Chicago Bulls",
+                "away_team": "Washington Wizards",
+                "bookmaker": "pinnacle",
+                "commence_time": datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+                "home_price": 1.62,
+                "away_price": 2.45,
+                "spread_home": -4.5,
+                "total": 229.5,
+                "captured_at": t1,
+            },
+            {
+                "event_id": "evt-1",
+                "sport": "nba",
+                "home_team": "Chicago Bulls",
+                "away_team": "Washington Wizards",
+                "bookmaker": "pinnacle",
+                "commence_time": datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+                "home_price": 1.48,
+                "away_price": 2.75,
+                "spread_home": -6.0,
+                "total": 231.0,
+                "captured_at": t2,
+            },
+        ]
+        data_store.insert_sportsbook_game_lines(rows)
+
+        opening = data_store.get_opening_sportsbook_lines(
+            bookmaker="pinnacle",
+            sport="nba",
+            event_ids=["evt-1"],
+        )
+        latest = data_store.get_latest_sportsbook_lines(
+            bookmaker="pinnacle",
+            sport="nba",
+            event_ids=["evt-1"],
+        )
+        latest_as_of_t1 = data_store.get_latest_sportsbook_lines(
+            bookmaker="pinnacle",
+            sport="nba",
+            event_ids=["evt-1"],
+            as_of=t1,
+        )
+
+        assert opening["evt-1"]["home_price"] == pytest.approx(1.62)
+        assert opening["evt-1"]["away_price"] == pytest.approx(2.45)
+        assert latest["evt-1"]["home_price"] == pytest.approx(1.48)
+        assert latest["evt-1"]["away_price"] == pytest.approx(2.75)
+        assert latest_as_of_t1["evt-1"]["home_price"] == pytest.approx(1.62)

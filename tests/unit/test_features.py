@@ -18,7 +18,9 @@ from moneygone.features.base import Feature, FeatureContext
 from moneygone.features.market_features import (
     BidAskSpread,
     OrderbookImbalance,
+    MidPrice,
     TimeToExpiry,
+    WeightedMidPrice,
 )
 from moneygone.features.pipeline import FeaturePipeline
 from moneygone.features.registry import CyclicDependencyError, FeatureRegistry
@@ -42,12 +44,14 @@ def _make_context(
         orderbook = OrderbookSnapshot(
             ticker="TEST",
             yes_bids=(
-                OrderbookLevel(price=Decimal("0.62"), contracts=Decimal("150")),
-                OrderbookLevel(price=Decimal("0.60"), contracts=Decimal("200")),
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("200")),
             ),
             no_bids=(
-                OrderbookLevel(price=Decimal("0.40"), contracts=Decimal("120")),
-                OrderbookLevel(price=Decimal("0.42"), contracts=Decimal("180")),
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("150")),
             ),
             seq=1,
             timestamp=_NOW,
@@ -59,9 +63,9 @@ def _make_context(
             series_ticker="SER-TEST",
             title="Test market",
             status=MarketStatus.OPEN,
-            yes_bid=Decimal("0.60"),
+            yes_bid=Decimal("0.58"),
             yes_ask=Decimal("0.62"),
-            last_price=Decimal("0.61"),
+            last_price=Decimal("0.60"),
             volume=1000,
             open_interest=500,
             close_time=_CLOSE_TIME,
@@ -83,65 +87,110 @@ class TestBidAskSpread:
     """Test bid-ask spread feature computation."""
 
     def test_bid_ask_spread_computation(self) -> None:
-        """Spread = yes_ask - yes_bid.
-
-        yes_bid = 0.62 (best yes level price),
-        yes_ask = 1 - 0.40 (best no level price) = 0.60.
-        Wait -- the function _yes_bid_ask says:
-          yes_bid = first yes level price = 0.62
-          yes_ask = 1 - first no level price = 1 - 0.40 = 0.60
-        So spread = 0.60 - 0.62 = -0.02.
-
-        That's a crossed book (bid > ask), which produces a negative spread.
-        Let's adjust the orderbook so bid < ask.
-        """
+        """Spread should use the best bid at the tail of each ladder."""
         ob = OrderbookSnapshot(
             ticker="TEST",
             yes_bids=(
-                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("200")),
             ),
             no_bids=(
-                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("150")),
             ),
             seq=1,
             timestamp=_NOW,
         )
         ctx = _make_context(orderbook=ob)
         feature = BidAskSpread()
-        # yes_bid = 0.58, yes_ask = 1 - 0.38 = 0.62
-        # spread = 0.62 - 0.58 = 0.04
         result = feature.compute(ctx)
 
         assert result is not None
         assert result == pytest.approx(0.04, abs=1e-10)
 
 
-class TestOrderbookImbalance:
-    """Test orderbook imbalance feature computation."""
+class TestMidPrice:
+    """Test mid-price computation on multi-level books."""
 
-    def test_orderbook_imbalance_computation(self) -> None:
-        """Imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)."""
+    def test_mid_price_uses_best_tail_levels(self) -> None:
         ob = OrderbookSnapshot(
             ticker="TEST",
             yes_bids=(
-                OrderbookLevel(price=Decimal("0.60"), contracts=Decimal("200")),
-                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("200")),
             ),
             no_bids=(
-                OrderbookLevel(price=Decimal("0.40"), contracts=Decimal("120")),
-                OrderbookLevel(price=Decimal("0.42"), contracts=Decimal("80")),
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("150")),
             ),
             seq=1,
             timestamp=_NOW,
         )
         ctx = _make_context(orderbook=ob)
-        feature = OrderbookImbalance(n_levels=5)
+        feature = MidPrice()
         result = feature.compute(ctx)
 
-        # bid_vol = 200 + 100 = 300, ask_vol = 120 + 80 = 200
-        # imbalance = (300 - 200) / (300 + 200) = 100/500 = 0.2
         assert result is not None
-        assert result == pytest.approx(0.2, abs=1e-10)
+        assert result == pytest.approx(0.60, abs=1e-10)
+
+
+class TestWeightedMidPrice:
+    """Test the weighted mid-price feature."""
+
+    def test_weighted_mid_price_uses_top_of_book_volume(self) -> None:
+        ob = OrderbookSnapshot(
+            ticker="TEST",
+            yes_bids=(
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("30")),
+            ),
+            no_bids=(
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("60")),
+            ),
+            seq=1,
+            timestamp=_NOW,
+        )
+        ctx = _make_context(orderbook=ob)
+        feature = WeightedMidPrice()
+        result = feature.compute(ctx)
+
+        assert result is not None
+        assert result == pytest.approx((0.58 * 60 + 0.62 * 30) / 90, abs=1e-10)
+
+
+class TestOrderbookImbalance:
+    """Test orderbook imbalance feature computation."""
+
+    def test_orderbook_imbalance_computation(self) -> None:
+        """Imbalance should use the best N levels from the tail of each book."""
+        ob = OrderbookSnapshot(
+            ticker="TEST",
+            yes_bids=(
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("5")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("15")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("80")),
+            ),
+            no_bids=(
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("10")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("20")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("70")),
+            ),
+            seq=1,
+            timestamp=_NOW,
+        )
+        ctx = _make_context(orderbook=ob)
+        feature = OrderbookImbalance(n_levels=2)
+        result = feature.compute(ctx)
+
+        assert result is not None
+        assert result == pytest.approx((95 - 90) / 185, abs=1e-10)
 
 
 class TestTimeToExpiry:
@@ -170,10 +219,14 @@ class TestFeaturePipeline:
         ob = OrderbookSnapshot(
             ticker="TEST",
             yes_bids=(
-                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.54"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.56"), contracts=Decimal("150")),
+                OrderbookLevel(price=Decimal("0.58"), contracts=Decimal("200")),
             ),
             no_bids=(
-                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.34"), contracts=Decimal("100")),
+                OrderbookLevel(price=Decimal("0.36"), contracts=Decimal("120")),
+                OrderbookLevel(price=Decimal("0.38"), contracts=Decimal("150")),
             ),
             seq=1,
             timestamp=_NOW,

@@ -34,6 +34,20 @@ class TimeInForce(str, Enum):
     GTD = "gtd"  # Good-til-date
     FOK = "fok"  # Fill-or-kill
 
+    @property
+    def api_value(self) -> str:
+        """Return the current Kalshi REST enum value for this TIF."""
+        mapping = {
+            TimeInForce.IOC: "immediate_or_cancel",
+            TimeInForce.GTC: "good_till_canceled",
+            TimeInForce.FOK: "fill_or_kill",
+        }
+        if self not in mapping:
+            raise ValueError(
+                f"time_in_force={self.value!r} is not supported by the current Kalshi REST API"
+            )
+        return mapping[self]
+
 
 class OrderStatus(str, Enum):
     RESTING = "resting"
@@ -85,6 +99,9 @@ class Market:
     close_time: datetime
     result: MarketResult = MarketResult.NOT_SETTLED
     category: str = ""
+    subtitle: str = ""
+    yes_sub_title: str = ""
+    no_sub_title: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +299,8 @@ class Fill:
     price: Decimal
     is_taker: bool
     created_time: datetime
+    order_id: str | None = None
+    client_order_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +345,11 @@ class Candlestick:
     close: Decimal
     volume: int
     open_interest: int
+    # Extended fields from batch/new API
+    mean_price: Decimal | None = None
+    previous_price: Decimal | None = None
+    yes_bid_ohlc: CandlestickOHLC | None = None
+    yes_ask_ohlc: CandlestickOHLC | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +450,58 @@ class BatchOrderResult:
     client_order_id: str | None
     order: Order | None
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CandlestickOHLC:
+    """OHLC prices for a specific series (yes_bid, yes_ask) in a candlestick."""
+
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class MarketCandlesticks:
+    """Candlesticks grouped by market from the batch endpoint."""
+
+    market_ticker: str
+    candlesticks: list[Candlestick]
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeStatus:
+    """Current exchange operational status."""
+
+    trading_active: bool
+    exchange_active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Milestone:
+    """A Kalshi milestone (resolution criteria / structured target)."""
+
+    milestone_id: str
+    title: str
+    category: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredTarget:
+    """A structured target definition for market resolution."""
+
+    structured_target_id: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class AccountLimits:
+    """API tier and rate limit information."""
+
+    tier: str
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

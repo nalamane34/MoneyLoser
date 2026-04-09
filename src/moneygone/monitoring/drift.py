@@ -65,10 +65,14 @@ class DriftDetector:
         self._psi_warning = psi_warning
         self._psi_critical = psi_critical
         self._ks_alpha = ks_critical_alpha
+        self._reference_seeded = len(self._reference) > 0
 
         # Pre-compute reference histogram proportions
         self._bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        self._ref_proportions = self._histogram_proportions(self._reference)
+        if self._reference_seeded:
+            self._ref_proportions = self._histogram_proportions(self._reference)
+        else:
+            self._ref_proportions = np.ones(n_bins) / n_bins
 
         # Rolling buffer of recent predictions
         self._recent: deque[float] = deque(maxlen=window_size)
@@ -79,6 +83,7 @@ class DriftDetector:
         log.info(
             "drift_detector.initialized",
             reference_size=len(self._reference),
+            reference_seeded=self._reference_seeded,
             window_size=window_size,
         )
 
@@ -90,12 +95,19 @@ class DriftDetector:
         """Buffer a single model prediction (probability 0-1)."""
         self._recent.append(float(prediction))
 
+    def set_reference(self, distribution: np.ndarray) -> None:
+        """Update the reference distribution from real model predictions."""
+        self._reference = np.asarray(distribution, dtype=float)
+        self._ref_proportions = self._histogram_proportions(self._reference)
+        self._reference_seeded = True
+        log.info("drift_detector.reference_set", reference_size=len(self._reference))
+
     def check_drift(self) -> DriftResult:
         """Run PSI and KS drift checks on the buffered predictions.
 
         Returns the *worst* (highest severity) of the two tests.
         """
-        if len(self._recent) < self._window_size:
+        if not self._reference_seeded or len(self._recent) < self._window_size:
             return DriftResult(
                 is_drifted=False,
                 metric_name="psi",

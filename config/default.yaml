@@ -29,6 +29,18 @@ crypto:
     - "ETH/USDT"
   fetch_interval_seconds: 30
 
+sportsbook:
+  enabled: false
+  leagues:
+    - "nba"
+  bookmakers:
+    - "pinnacle"
+  markets:
+    - "h2h"
+  fetch_interval_minutes: 240
+  lookahead_hours: 18
+  min_requests_remaining: 75
+
 model:
   model_dir: "models/"
   calibration_method: "isotonic"

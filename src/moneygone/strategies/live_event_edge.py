@@ -731,9 +731,10 @@ class LiveEventEdge:
         try:
             # Search by team names in the market title
             # Kalshi sports markets typically include team names
-            markets = await self._client.get_markets(
+            markets = await self._client.get_all_markets(
                 status="open",
                 series_ticker=game.league.upper() if game.league else None,
+                limit=100,
             )
 
             matching: list[Market] = []

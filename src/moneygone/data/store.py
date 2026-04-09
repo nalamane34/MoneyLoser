@@ -7,6 +7,7 @@ historical state can be reconstructed for backtesting or auditing.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import structlog
 from moneygone.data.schemas import ALL_TABLES
 
 logger = structlog.get_logger(__name__)
+_NAMED_PARAM_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _strip_tz(dt: datetime) -> datetime:
@@ -31,6 +33,13 @@ def _strip_tz(dt: datetime) -> datetime:
     return dt
 
 
+def _coerce_timestamp(value: datetime | str | None) -> datetime | str | None:
+    """Normalize timestamps for DuckDB inserts while preserving strings."""
+    if isinstance(value, datetime):
+        return _strip_tz(value)
+    return value
+
+
 class DataStore:
     """Thin wrapper around a DuckDB database with typed helpers.
 
@@ -39,27 +48,85 @@ class DataStore:
     db_path:
         Filesystem path for the DuckDB database file.  Use ``":memory:"``
         for a purely in-memory store (useful for tests).
+    read_only:
+        If ``True``, open the database in read-only mode.  Multiple
+        processes can read concurrently; writes will raise an error.
     """
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, read_only: bool = False) -> None:
         self._db_path = str(db_path)
-        self._conn = duckdb.connect(self._db_path, config={"threads": 1})
-        logger.info("datastore.opened", db_path=self._db_path)
+        self._read_only = read_only
+        config: dict[str, Any] = {"threads": 1}
+        if read_only:
+            config["access_mode"] = "read_only"
+        self._conn = duckdb.connect(self._db_path, config=config)
+        logger.info("datastore.opened", db_path=self._db_path, read_only=read_only)
 
     # ------------------------------------------------------------------
     # Schema management
     # ------------------------------------------------------------------
 
-    def initialize_schema(self) -> None:
-        """Create all tables if they do not already exist."""
-        for ddl in ALL_TABLES:
+    def initialize_schema(self, tables: list[str] | None = None) -> None:
+        """Create tables if they do not already exist.
+
+        Parameters
+        ----------
+        tables:
+            Specific DDL statements to execute.  If ``None``, creates all
+            tables (``ALL_TABLES``).
+        """
+        ddl_list = tables if tables is not None else ALL_TABLES
+        for ddl in ddl_list:
             self._conn.execute(ddl)
-        logger.info("datastore.schema_initialized", table_count=len(ALL_TABLES))
+        logger.info("datastore.schema_initialized", table_count=len(ddl_list))
+
+    def attach_readonly(self, name: str, db_path: Path | str) -> None:
+        """Attach another DuckDB file as a read-only schema.
+
+        After attaching, tables can be queried as ``{name}.table_name``.
+        Use :meth:`create_attached_views` to create local views that
+        transparently redirect queries to attached tables.
+        """
+        p = Path(db_path)
+        if not p.exists():
+            logger.warning("datastore.attach_skipped", name=name, reason="file_not_found", path=str(p))
+            return
+        self._conn.execute(f"ATTACH '{p}' AS {name} (READ_ONLY)")
+        logger.info("datastore.attached", name=name, path=str(p))
+
+    def create_attached_views(self, attachments: dict[str, list[str]]) -> None:
+        """Create local views pointing to tables in attached databases.
+
+        Parameters
+        ----------
+        attachments:
+            ``{schema_name: [table_name, ...]}`` mapping.  For each entry,
+            creates ``CREATE OR REPLACE VIEW table_name AS SELECT * FROM
+            schema_name.table_name``.  This lets existing query code work
+            unchanged against attached databases.
+        """
+        for schema, tables in attachments.items():
+            for table in tables:
+                try:
+                    self._conn.execute(
+                        f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM {schema}.{table}"
+                    )
+                except Exception:
+                    logger.debug("datastore.view_skipped", schema=schema, table=table, exc_info=True)
 
     def close(self) -> None:
         """Close the underlying DuckDB connection."""
         self._conn.close()
         logger.info("datastore.closed", db_path=self._db_path)
+
+    def query(self, sql: str, params: dict[str, Any] | None = None) -> Any:
+        """Execute a SQL query with ``$name`` parameters.
+
+        This gives feature code a stable, minimal interface without exposing
+        the underlying DuckDB connection directly.
+        """
+        bound_sql, bound_params = self._prepare_named_query(sql, params)
+        return self._conn.execute(bound_sql, bound_params).fetchall()
 
     # ------------------------------------------------------------------
     # Batch insert helpers
@@ -203,6 +270,37 @@ class DataStore:
             ],
         )
         logger.debug("datastore.inserted", table="open_interest", count=len(rows))
+
+    def insert_sportsbook_game_lines(self, rows: list[dict[str, Any]]) -> None:
+        """Append sportsbook moneyline snapshots for upcoming games."""
+        if not rows:
+            return
+        self._conn.executemany(
+            """
+            INSERT INTO sportsbook_game_lines
+                (event_id, sport, home_team, away_team, bookmaker,
+                 commence_time, home_price, away_price, spread_home,
+                 total, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["event_id"],
+                    str(r["sport"]).lower(),
+                    r["home_team"],
+                    r["away_team"],
+                    str(r["bookmaker"]).lower(),
+                    _coerce_timestamp(r.get("commence_time")),
+                    r["home_price"],
+                    r["away_price"],
+                    r.get("spread_home"),
+                    r.get("total"),
+                    _coerce_timestamp(r["captured_at"]),
+                )
+                for r in rows
+            ],
+        )
+        logger.debug("datastore.inserted", table="sportsbook_game_lines", count=len(rows))
 
     def insert_features(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -405,6 +503,40 @@ class DataStore:
         ).fetchall()
         return {name: value for name, value in results}
 
+    def get_opening_sportsbook_lines(
+        self,
+        *,
+        bookmaker: str = "pinnacle",
+        sport: str | None = None,
+        event_ids: list[str] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return the earliest stored line for each event/bookmaker."""
+        return self._get_ranked_sportsbook_lines(
+            order_by="captured_at ASC, ingested_at ASC",
+            bookmaker=bookmaker,
+            sport=sport,
+            event_ids=event_ids,
+            as_of=as_of,
+        )
+
+    def get_latest_sportsbook_lines(
+        self,
+        *,
+        bookmaker: str = "pinnacle",
+        sport: str | None = None,
+        event_ids: list[str] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return the latest stored line for each event/bookmaker."""
+        return self._get_ranked_sportsbook_lines(
+            order_by="captured_at DESC, ingested_at DESC",
+            bookmaker=bookmaker,
+            sport=sport,
+            event_ids=event_ids,
+            as_of=as_of,
+        )
+
     def get_trades_between(
         self,
         ticker: str,
@@ -509,3 +641,75 @@ class DataStore:
             return []
         columns = [desc[0] for desc in self._conn.description]
         return [dict(zip(columns, r)) for r in results]
+
+    def _get_ranked_sportsbook_lines(
+        self,
+        *,
+        order_by: str,
+        bookmaker: str = "pinnacle",
+        sport: str | None = None,
+        event_ids: list[str] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return one sportsbook line row per event according to *order_by*."""
+        if event_ids == []:
+            return {}
+
+        clauses: list[str] = ["bookmaker = ?"]
+        params: list[Any] = [bookmaker.lower()]
+
+        if sport is not None:
+            clauses.append("sport = ?")
+            params.append(sport.lower())
+        if as_of is not None:
+            clauses.append("captured_at <= ?")
+            params.append(_strip_tz(as_of))
+        if event_ids:
+            placeholders = ", ".join("?" for _ in event_ids)
+            clauses.append(f"event_id IN ({placeholders})")
+            params.extend(event_ids)
+
+        where = f"WHERE {' AND '.join(clauses)}"
+        results = self._conn.execute(
+            f"""
+            SELECT * EXCLUDE (rn)
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY event_id, bookmaker
+                           ORDER BY {order_by}
+                       ) AS rn
+                FROM sportsbook_game_lines
+                {where}
+            )
+            WHERE rn = 1
+            """,
+            params,
+        ).fetchall()
+        if not results:
+            return {}
+
+        columns = [desc[0] for desc in self._conn.description]
+        rows = [dict(zip(columns, result)) for result in results]
+        return {str(row["event_id"]): row for row in rows}
+
+    @staticmethod
+    def _prepare_named_query(
+        sql: str,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[str, list[Any]]:
+        """Convert ``$name`` parameters to DuckDB positional binds."""
+        bound_params: list[Any] = []
+        params = params or {}
+
+        def _replace(match: re.Match[str]) -> str:
+            key = match.group(1)
+            if key not in params:
+                raise KeyError(f"Missing query parameter: {key}")
+            value = params[key]
+            if isinstance(value, datetime):
+                value = _strip_tz(value)
+            bound_params.append(value)
+            return "?"
+
+        return _NAMED_PARAM_RE.sub(_replace, sql), bound_params

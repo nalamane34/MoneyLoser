@@ -7,6 +7,7 @@ from ESPN's free JSON endpoints -- no API key required.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,18 @@ _LEAGUE_PATHS: dict[str, str] = {
     "nfl": "football/nfl",
     "nhl": "hockey/nhl",
     "mlb": "baseball/mlb",
+    "ncaab": "basketball/mens-college-basketball",
+    "ncaaf": "football/college-football",
+}
+
+_INJURY_STATUS_WEIGHTS: dict[str, float] = {
+    "out": 1.0,
+    "inactive": 1.0,
+    "doubtful": 0.75,
+    "questionable": 0.5,
+    "day-to-day": 0.4,
+    "day to day": 0.4,
+    "probable": 0.15,
 }
 
 
@@ -81,6 +94,17 @@ class InjuryReport:
     description: str
 
 
+@dataclass(frozen=True, slots=True)
+class TeamInjurySummary:
+    """Severity-weighted injury summary for a team."""
+
+    team_id: str
+    team_name: str
+    key_injuries: int
+    injury_severity: float
+    impacted_players: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+
 # ---------------------------------------------------------------------------
 # Feed
 # ---------------------------------------------------------------------------
@@ -106,6 +130,7 @@ class PlayerStatsFeed:
         self._client = client
         self._owns_client = client is None
         self._timeout = request_timeout
+        self._player_minutes_cache: dict[tuple[str, str, str], float | None] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -159,6 +184,17 @@ class PlayerStatsFeed:
             return _LEAGUE_PATHS[key]
         return f"{sport.lower()}/{league.lower()}"
 
+    @staticmethod
+    def _web_athlete_url(sport: str, league: str, player_id: str) -> str:
+        return f"{_WEB_API_BASE}/{PlayerStatsFeed._league_path(sport, league)}/athletes/{player_id}"
+
+    @staticmethod
+    def _web_gamelog_url(sport: str, league: str, player_id: str) -> str:
+        return (
+            f"{_WEB_API_BASE}/{PlayerStatsFeed._league_path(sport, league)}"
+            f"/athletes/{player_id}/gamelog"
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -175,6 +211,14 @@ class PlayerStatsFeed:
         falls back to ``/athletes/{id}`` which sometimes includes an
         inline statistics block.
         """
+        web_data = await self._get_json(
+            self._web_athlete_url(sport, league, player_id)
+        )
+        if web_data is not None:
+            parsed = self._parse_web_athlete_summary(web_data, player_id)
+            if parsed is not None:
+                return parsed
+
         base = f"{_ESPN_BASE}/{self._league_path(sport, league)}"
 
         # Attempt 1: dedicated statistics endpoint.
@@ -201,10 +245,22 @@ class PlayerStatsFeed:
         Tries the core API ``statisticslog`` endpoint first for richer
         structured data, then falls back to the site API ``gamelog``.
         """
+        web_data = await self._get_json(
+            self._web_gamelog_url(sport, league, player_id)
+        )
+        if web_data is not None:
+            entries = self._parse_game_log(web_data, last_n)
+            if entries:
+                return entries
+
         lp = self._league_path(sport, league)
+        sport_name, league_name = lp.split("/", 1)
 
         # Attempt 1: core API statisticslog (better structured data).
-        core_url = f"{_CORE_API_BASE}/{lp}/athletes/{player_id}/statisticslog"
+        core_url = (
+            f"{_CORE_API_BASE}/{sport_name}/leagues/{league_name}"
+            f"/athletes/{player_id}/statisticslog"
+        )
         data = await self._get_json(core_url)
         if data is not None:
             entries = self._parse_game_log(data, last_n)
@@ -347,7 +403,126 @@ class PlayerStatsFeed:
         except Exception:
             logger.warning("stats.parse_team_injuries_error", team_id=team_id, exc_info=True)
 
+        if injuries:
+            return injuries
+
+        roster_url = f"{_ESPN_BASE}/{lp}/teams/{team_id}/roster"
+        roster_data = await self._get_json(roster_url)
+        if roster_data is None:
+            return []
+
+        try:
+            for athlete in roster_data.get("athletes", []):
+                for item in athlete.get("injuries", []):
+                    pid = str(athlete.get("id", ""))
+                    if not pid:
+                        continue
+                    injuries.append(
+                        InjuryReport(
+                            player_id=pid,
+                            name=athlete.get("displayName", athlete.get("fullName", "")),
+                            status=item.get("status", "Unknown"),
+                            description=item.get("date", ""),
+                        )
+                    )
+        except Exception:
+            logger.warning("stats.parse_team_roster_injuries_error", team_id=team_id, exc_info=True)
+
         return injuries
+
+    async def get_player_avg_minutes(
+        self,
+        sport: str,
+        league: str,
+        player_id: str,
+    ) -> float | None:
+        """Return a player's season-average minutes per game."""
+        cache_key = (sport.lower(), league.lower(), player_id)
+        if cache_key in self._player_minutes_cache:
+            return self._player_minutes_cache[cache_key]
+
+        data = await self._get_json(self._web_gamelog_url(sport, league, player_id))
+        minutes = self._parse_avg_minutes_from_gamelog(data) if data is not None else None
+        self._player_minutes_cache[cache_key] = minutes
+        return minutes
+
+    async def get_team_injury_summary(
+        self,
+        sport: str,
+        league: str,
+        team_id: str,
+        *,
+        key_minutes_threshold: float = 20.0,
+    ) -> TeamInjurySummary:
+        """Return severity-weighted injury impact for a team.
+
+        Severity is a normalized 0-1 proxy built from injury status and
+        average minutes per game.  This is intentionally lightweight:
+        we care more about distinguishing a rotation player from a bench
+        player than about perfect medical modeling.
+        """
+        roster = await self.get_team_roster(sport, league, team_id)
+        if not roster:
+            return TeamInjurySummary(
+                team_id=team_id,
+                team_name="",
+                key_injuries=0,
+                injury_severity=0.0,
+            )
+
+        impacted = [
+            player for player in roster
+            if self._injury_status_weight(player.status) > 0.0
+        ]
+        if not impacted:
+            team_name = roster[0].team_name if roster else ""
+            return TeamInjurySummary(
+                team_id=team_id,
+                team_name=team_name,
+                key_injuries=0,
+                injury_severity=0.0,
+            )
+
+        minute_tasks = [
+            self.get_player_avg_minutes(sport, league, player.player_id)
+            for player in impacted
+        ]
+        minute_results = await asyncio.gather(*minute_tasks)
+
+        team_name = impacted[0].team_name if impacted else ""
+        key_injuries = 0
+        weighted_role_sum = 0.0
+        impacted_players: list[dict[str, Any]] = []
+
+        for player, avg_minutes in zip(impacted, minute_results):
+            status_weight = self._injury_status_weight(player.status)
+            role_weight = min((avg_minutes or 0.0) / 36.0, 1.0) if avg_minutes is not None else 0.15
+            player_severity = status_weight * role_weight
+
+            if avg_minutes is not None and avg_minutes >= key_minutes_threshold and status_weight >= 0.4:
+                key_injuries += 1
+
+            weighted_role_sum += player_severity
+            impacted_players.append(
+                {
+                    "player_id": player.player_id,
+                    "name": player.name,
+                    "status": player.status,
+                    "avg_minutes": avg_minutes,
+                    "severity": round(player_severity, 4),
+                }
+            )
+
+        # Roughly, three starter-level outs should push the team toward 1.0.
+        team_severity = min(weighted_role_sum / 3.0, 1.0)
+
+        return TeamInjurySummary(
+            team_id=team_id,
+            team_name=team_name,
+            key_injuries=key_injuries,
+            injury_severity=round(team_severity, 4),
+            impacted_players=tuple(impacted_players),
+        )
 
     async def get_league_stats(
         self,
@@ -436,6 +611,40 @@ class PlayerStatsFeed:
             return None
 
     @staticmethod
+    def _parse_web_athlete_summary(
+        data: dict[str, Any],
+        player_id: str,
+    ) -> PlayerSeasonStats | None:
+        """Parse the site.web athlete summary endpoint."""
+        try:
+            athlete = data.get("athlete", data)
+            summary = athlete.get("statsSummary", {})
+            raw_stats = summary.get("statistics", [])
+            stats: dict[str, float] = {}
+
+            for entry in raw_stats:
+                name = entry.get("name", entry.get("abbreviation", ""))
+                value = entry.get("value", entry.get("displayValue"))
+                if not name or value is None:
+                    continue
+                try:
+                    stats[name] = float(value)
+                except (ValueError, TypeError):
+                    continue
+
+            return PlayerSeasonStats(
+                player_id=player_id,
+                name=athlete.get("displayName", athlete.get("fullName", f"Player {player_id}")),
+                team=athlete.get("team", {}).get("displayName", ""),
+                position=athlete.get("position", {}).get("abbreviation", ""),
+                games_played=0,
+                stats=stats,
+            )
+        except Exception:
+            logger.warning("stats.parse_web_athlete_error", player_id=player_id, exc_info=True)
+            return None
+
+    @staticmethod
     def _parse_athlete_with_stats(
         data: dict[str, Any],
         player_id: str,
@@ -483,6 +692,46 @@ class PlayerStatsFeed:
         """Parse the ``/athletes/{id}/gamelog`` response."""
         entries: list[GameLogEntry] = []
         try:
+            if isinstance(data.get("seasonTypes"), list):
+                names = data.get("names", [])
+                season_types = data.get("seasonTypes", [])
+                events_lookup = data.get("events", {})
+                collected: list[GameLogEntry] = []
+
+                for season_type in season_types:
+                    for category in season_type.get("categories", []):
+                        for event in category.get("events", []):
+                            stats_list = event.get("stats", [])
+                            if not stats_list:
+                                continue
+
+                            game_id = str(event.get("eventId", ""))
+                            metadata = events_lookup.get(game_id, {})
+                            opponent = metadata.get("opponent", {}).get("displayName", "")
+                            date = metadata.get("gameDate", "")
+
+                            game_stats: dict[str, float] = {}
+                            for idx, raw_val in enumerate(stats_list):
+                                if idx >= len(names):
+                                    continue
+                                parsed_val = PlayerStatsFeed._parse_numeric_stat(raw_val)
+                                if parsed_val is not None:
+                                    game_stats[names[idx]] = parsed_val
+
+                            minutes = game_stats.pop("minutes", 0.0)
+                            collected.append(
+                                GameLogEntry(
+                                    game_id=game_id,
+                                    date=date,
+                                    opponent=opponent,
+                                    minutes=minutes,
+                                    stats=game_stats,
+                                )
+                            )
+
+                if collected:
+                    return collected[-last_n:]
+
             # gamelog typically has "events", "labels", and "stats" arrays.
             events = data.get("events", [])
             labels = data.get("labels", [])
@@ -557,7 +806,10 @@ class PlayerStatsFeed:
 
             for group in athlete_groups:
                 # group may be a dict with "items" or itself a list.
-                items = group.get("items", [group]) if isinstance(group, dict) else [group]
+                if isinstance(group, dict) and "items" in group and isinstance(group["items"], list):
+                    items = group["items"]
+                else:
+                    items = [group]
                 for athlete in items:
                     pid = str(athlete.get("id", ""))
                     name = athlete.get("displayName", athlete.get("fullName", ""))
@@ -566,6 +818,9 @@ class PlayerStatsFeed:
                     jersey = str(athlete.get("jersey", ""))
                     status_val = athlete.get("status", {})
                     status_name = status_val.get("type", status_val.get("name", "Active")) if isinstance(status_val, dict) else str(status_val)
+                    injuries = athlete.get("injuries", [])
+                    if injuries and isinstance(injuries, list):
+                        status_name = str(injuries[0].get("status", status_name))
 
                     if pid and name:
                         players.append(
@@ -639,3 +894,77 @@ class PlayerStatsFeed:
             jersey=jersey,
             status=status_name,
         )
+
+    @staticmethod
+    def _parse_numeric_stat(value: Any) -> float | None:
+        """Parse ESPN stat strings into floats.
+
+        Handles plain numerics (``"22.1"``) and minute-like values
+        (``"18:30"`` -> ``18.5``).
+        """
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+        if not text:
+            return None
+        if ":" in text:
+            parts = text.split(":")
+            if len(parts) == 2:
+                try:
+                    mins = float(parts[0])
+                    secs = float(parts[1])
+                except ValueError:
+                    return None
+                return mins + secs / 60.0
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_avg_minutes_from_gamelog(data: dict[str, Any]) -> float | None:
+        """Extract average minutes from the site.web gamelog payload."""
+        if not data:
+            return None
+
+        names = data.get("names", [])
+        labels = data.get("labels", [])
+        minute_idx = None
+
+        for idx, name in enumerate(names):
+            lowered = str(name).lower()
+            if lowered in {"minutes", "timeonice"} or "minutes" in lowered:
+                minute_idx = idx
+                break
+
+        if minute_idx is None:
+            for idx, label in enumerate(labels):
+                if str(label).upper() in {"MIN", "TOI"}:
+                    minute_idx = idx
+                    break
+
+        if minute_idx is None:
+            return None
+
+        for season_type in data.get("seasonTypes", []):
+            summary = season_type.get("summary", {})
+            for stat_block in summary.get("stats", []):
+                if stat_block.get("type") != "avg":
+                    continue
+                stats = stat_block.get("stats", [])
+                if minute_idx >= len(stats):
+                    continue
+                return PlayerStatsFeed._parse_numeric_stat(stats[minute_idx])
+
+        return None
+
+    @staticmethod
+    def _injury_status_weight(status: str) -> float:
+        lowered = status.strip().lower()
+        for key, weight in _INJURY_STATUS_WEIGHTS.items():
+            if key in lowered:
+                return weight
+        return 0.0

@@ -41,6 +41,7 @@ class OrderManager:
         self._client = rest_client
         self._open_orders: dict[str, Order] = {}
         self._client_order_ids: dict[str, str] = {}  # client_order_id -> order_id
+        self._order_client_order_ids: dict[str, str] = {}  # order_id -> client_order_id
 
     # ------------------------------------------------------------------
     # Order submission
@@ -94,6 +95,7 @@ class OrderManager:
         # Track the order locally
         self._open_orders[order.order_id] = order
         self._client_order_ids[coid] = order.order_id
+        self._order_client_order_ids[order.order_id] = coid
 
         logger.info(
             "order_manager.submitted",
@@ -114,7 +116,7 @@ class OrderManager:
         """
         logger.info("order_manager.cancelling", order_id=order_id)
         await self._client.cancel_order(order_id)
-        self._open_orders.pop(order_id, None)
+        self._forget_order(order_id)
         logger.info("order_manager.cancelled", order_id=order_id)
 
     async def cancel_all(self, ticker: str | None = None) -> int:
@@ -151,7 +153,7 @@ class OrderManager:
             await self._client.cancel_order(to_cancel[0])
 
         for oid in to_cancel:
-            self._open_orders.pop(oid, None)
+            self._forget_order(oid)
 
         logger.info(
             "order_manager.cancelled_all",
@@ -164,23 +166,104 @@ class OrderManager:
     # Fill processing
     # ------------------------------------------------------------------
 
+    def _order_matches_fill(self, order: Order, fill: Fill) -> bool:
+        return (
+            order.ticker == fill.ticker
+            and order.side == fill.side
+            and order.action == fill.action
+            and order.status in (
+                OrderStatus.RESTING,
+                OrderStatus.PARTIAL,
+                OrderStatus.PENDING,
+            )
+        )
+
+    def _find_matching_order(self, fill: Fill) -> Order | None:
+        """Resolve the local order for a fill without guessing."""
+        if fill.order_id is not None:
+            order = self._open_orders.get(fill.order_id)
+            if order is None:
+                logger.warning(
+                    "order_manager.fill_unknown_order_id",
+                    trade_id=fill.trade_id,
+                    order_id=fill.order_id,
+                    ticker=fill.ticker,
+                )
+                return None
+            if not self._order_matches_fill(order, fill):
+                logger.error(
+                    "order_manager.fill_identifier_mismatch",
+                    trade_id=fill.trade_id,
+                    order_id=fill.order_id,
+                    ticker=fill.ticker,
+                    order_ticker=order.ticker,
+                )
+                return None
+            return order
+
+        if fill.client_order_id is not None:
+            order_id = self._client_order_ids.get(fill.client_order_id)
+            if order_id is None:
+                logger.warning(
+                    "order_manager.fill_unknown_client_order_id",
+                    trade_id=fill.trade_id,
+                    client_order_id=fill.client_order_id,
+                    ticker=fill.ticker,
+                )
+                return None
+            order = self._open_orders.get(order_id)
+            if order is None:
+                logger.warning(
+                    "order_manager.fill_stale_client_order_id",
+                    trade_id=fill.trade_id,
+                    client_order_id=fill.client_order_id,
+                    order_id=order_id,
+                    ticker=fill.ticker,
+                )
+                return None
+            if not self._order_matches_fill(order, fill):
+                logger.error(
+                    "order_manager.fill_identifier_mismatch",
+                    trade_id=fill.trade_id,
+                    client_order_id=fill.client_order_id,
+                    order_id=order_id,
+                    ticker=fill.ticker,
+                    order_ticker=order.ticker,
+                )
+                return None
+            return order
+
+        candidates = [
+            order
+            for order in self._open_orders.values()
+            if self._order_matches_fill(order, fill)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        logger.warning(
+            "order_manager.fill_ambiguous",
+            trade_id=fill.trade_id,
+            ticker=fill.ticker,
+            candidate_count=len(candidates),
+            candidate_order_ids=[order.order_id for order in candidates],
+        )
+        return None
+
+    def _forget_order(self, order_id: str) -> None:
+        """Remove an order from local tracking and clear identifier indexes."""
+        self._open_orders.pop(order_id, None)
+        client_order_id = self._order_client_order_ids.pop(order_id, None)
+        if client_order_id is not None:
+            self._client_order_ids.pop(client_order_id, None)
+
     def on_fill(self, fill: Fill) -> None:
         """Process a fill event and update order tracking.
 
         When all contracts on an order have been filled, the order is
         removed from the open orders map.
         """
-        # Find the matching order by ticker (fills don't carry order_id directly)
-        matching_order: Order | None = None
-        for order in self._open_orders.values():
-            if (
-                order.ticker == fill.ticker
-                and order.side == fill.side
-                and order.action == fill.action
-                and order.status in (OrderStatus.RESTING, OrderStatus.PARTIAL, OrderStatus.PENDING)
-            ):
-                matching_order = order
-                break
+        matching_order = self._find_matching_order(fill)
 
         if matching_order is None:
             logger.warning(
@@ -213,7 +296,7 @@ class OrderManager:
         )
 
         if new_status == OrderStatus.EXECUTED:
-            self._open_orders.pop(matching_order.order_id, None)
+            self._forget_order(matching_order.order_id)
             logger.info(
                 "order_manager.order_filled",
                 order_id=matching_order.order_id,
@@ -251,6 +334,7 @@ class OrderManager:
                 order_id=oid,
                 ticker=self._open_orders[oid].ticker,
             )
+            self._forget_order(oid)
 
         # Find orders on the exchange we don't track locally
         new = set(exchange_map.keys()) - set(self._open_orders.keys())
@@ -261,8 +345,10 @@ class OrderManager:
                 ticker=exchange_map[oid].ticker,
             )
 
-        # Replace local state with exchange truth
-        self._open_orders = exchange_map
+        # Update local state in-place to preserve client_order_id mappings
+        # for orders that existed in both local and exchange state.
+        for oid, order in exchange_map.items():
+            self._open_orders[oid] = order
 
         logger.info(
             "order_manager.reconciled",

@@ -9,15 +9,21 @@ https://the-odds-api.com/liveapi/guides/v4/
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from moneygone.data.store import DataStore
+    from moneygone.data.sports.power_ratings import ESPNPowerRatings, TeamRating
+    from moneygone.data.sports.stats import PlayerStatsFeed, TeamInjurySummary
 
 _ODDS_BASE = "https://api.the-odds-api.com/v4"
 
@@ -129,10 +135,16 @@ class OddsAPIFeed:
         self._client = client
         self._owns_client = client is None
         self._timeout = request_timeout
+        self._last_requests_remaining: int | None = None
 
     @property
     def has_api_key(self) -> bool:
         return bool(self._api_key)
+
+    @property
+    def requests_remaining(self) -> int | None:
+        """Last seen Odds API remaining-request header, if available."""
+        return self._last_requests_remaining
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -167,6 +179,10 @@ class OddsAPIFeed:
             resp.raise_for_status()
             remaining = resp.headers.get("x-requests-remaining")
             if remaining is not None:
+                try:
+                    self._last_requests_remaining = int(remaining)
+                except ValueError:
+                    self._last_requests_remaining = None
                 logger.debug("odds.quota", remaining=remaining)
             return resp.json()
         except httpx.HTTPStatusError as exc:
@@ -197,23 +213,39 @@ class OddsAPIFeed:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_upcoming_games(self, league: str) -> list[GameOdds]:
+    async def get_upcoming_games(
+        self,
+        league: str,
+        *,
+        bookmakers: list[str] | None = None,
+        markets: list[str] | None = None,
+    ) -> list[GameOdds]:
         """Fetch upcoming games with bookmaker odds.
 
         Parameters
         ----------
         league:
             League shorthand (e.g. ``"nba"``) or full Odds API sport key.
+        bookmakers:
+            Optional Odds API bookmaker keys to filter the response.
+        markets:
+            Optional Odds API market keys. Defaults to ``["h2h", "spreads",
+            "totals"]`` for richer game-winner snapshots, but collectors can
+            pass ``["h2h"]`` to minimise credit spend.
         """
         sport_key = self._sport_key(league)
         url = f"{_ODDS_BASE}/sports/{sport_key}/odds"
+        market_keys = markets or ["h2h", "spreads", "totals"]
+        params = {
+            "regions": "us",
+            "markets": ",".join(market_keys),
+            "oddsFormat": "decimal",
+        }
+        if bookmakers:
+            params["bookmakers"] = ",".join(bookmakers)
         data = await self._get_json(
             url,
-            params={
-                "regions": "us",
-                "markets": "h2h,spreads,totals",
-                "oddsFormat": "decimal",
-            },
+            params=params,
         )
         if data is None or not isinstance(data, list):
             return []
@@ -353,6 +385,12 @@ class OddsAPIFeed:
         self,
         league: str,
         opening_lines: dict[str, dict[str, float]] | None = None,
+        *,
+        store: DataStore | None = None,
+        stats_feed: PlayerStatsFeed | None = None,
+        power_ratings: ESPNPowerRatings | None = None,
+        key_minutes_threshold: float = 20.0,
+        movement_bookmaker: str = "pinnacle",
     ) -> list[dict]:
         """Build game-winner feature snapshot dicts for all upcoming games.
 
@@ -368,6 +406,22 @@ class OddsAPIFeed:
             "away": decimal_odds}`` representing the opening line.  Used
             to compute :class:`~moneygone.features.game_winner_features.MoneylineMovement`.
             When not provided those snapshot keys will be ``None``.
+        store:
+            Optional datastore containing previously recorded sportsbook
+            snapshots. When available, opening lines are loaded from the
+            earliest stored row for ``movement_bookmaker``.
+        stats_feed:
+            Optional ESPN stats feed.  When omitted, the method creates
+            a temporary one to enrich snapshots with injury data.
+        power_ratings:
+            Optional ESPN power-rating feed.  When omitted, the method
+            creates a temporary one to enrich snapshots with team ratings.
+        key_minutes_threshold:
+            Minimum average minutes per game for an injured player to
+            count as a "key" absence.
+        movement_bookmaker:
+            Bookmaker to use for opening/current line-movement fields.
+            Defaults to Pinnacle, the sharpest book available in this stack.
 
         Returns
         -------
@@ -375,91 +429,150 @@ class OddsAPIFeed:
             One dict per game, with keys matching ``game_winner_features.py``
             snapshot contract.
         """
-        games = await self.get_upcoming_games(league)
-        snapshots: list[dict] = []
+        created_stats_feed = False
+        created_power_ratings = False
 
-        for game in games:
-            h2h_home: list[float] = []
-            h2h_away: list[float] = []
-            spread_home: list[float] = []
-            totals: list[float] = []
+        if stats_feed is None:
+            from moneygone.data.sports.stats import PlayerStatsFeed
 
-            for bm in game.bookmakers:
-                for mkt in bm.get("markets", []):
-                    key = mkt.get("key")
-                    outcomes = mkt.get("outcomes", [])
-                    if key == "h2h":
-                        for o in outcomes:
-                            try:
-                                price = float(o.get("price", 0))
-                            except (ValueError, TypeError):
-                                continue
-                            if o.get("name") == game.home_team:
-                                h2h_home.append(price)
-                            elif o.get("name") == game.away_team:
-                                h2h_away.append(price)
-                    elif key == "spreads":
-                        for o in outcomes:
-                            if o.get("name") == game.home_team:
-                                try:
-                                    spread_home.append(float(o.get("point", 0)))
-                                except (ValueError, TypeError):
-                                    pass
-                    elif key == "totals":
-                        for o in outcomes:
-                            if o.get("name", "").lower() == "over":
-                                try:
-                                    totals.append(float(o.get("point", 0)))
-                                except (ValueError, TypeError):
-                                    pass
+            stats_feed = PlayerStatsFeed()
+            created_stats_feed = True
 
-            curr_home_odds = sum(h2h_home) / len(h2h_home) if h2h_home else None
-            curr_away_odds = sum(h2h_away) / len(h2h_away) if h2h_away else None
+        if power_ratings is None:
+            from moneygone.data.sports.power_ratings import ESPNPowerRatings
 
-            # Consensus normalised win probabilities (remove overround).
-            sb_home_win_prob = None
-            if curr_home_odds and curr_away_odds:
-                raw_h = 1.0 / curr_home_odds
-                raw_a = 1.0 / curr_away_odds
-                total_implied = raw_h + raw_a
-                if total_implied > 0:
-                    sb_home_win_prob = raw_h / total_implied
+            power_ratings = ESPNPowerRatings()
+            created_power_ratings = True
 
-            opening = (opening_lines or {}).get(game.event_id, {})
+        try:
+            games = await self.get_upcoming_games(
+                league,
+                bookmakers=["pinnacle", "draftkings", "fanduel"],
+            )
+            if not games:
+                games = await self.get_upcoming_games(league)
+            snapshots: list[dict] = []
+            event_ids = [game.event_id for game in games if game.event_id]
+            stored_opening_lines: dict[str, dict[str, Any]] = {}
+            stored_latest_lines: dict[str, dict[str, Any]] = {}
+            if store is not None and event_ids:
+                stored_opening_lines = store.get_opening_sportsbook_lines(
+                    bookmaker=movement_bookmaker,
+                    sport=league.lower(),
+                    event_ids=event_ids,
+                )
+                stored_latest_lines = store.get_latest_sportsbook_lines(
+                    bookmaker=movement_bookmaker,
+                    sport=league.lower(),
+                    event_ids=event_ids,
+                )
+            ratings = await power_ratings.get_ratings(league)
+            injury_summaries = await self._load_team_injury_summaries(
+                league,
+                games,
+                stats_feed,
+                power_ratings,
+                ratings,
+                key_minutes_threshold=key_minutes_threshold,
+            )
 
-            snap: dict = {
-                "event_id": game.event_id,
-                "home_team": game.home_team,
-                "away_team": game.away_team,
-                "commence_time": game.commence_time,
-                "sport": league.lower(),
-                # Sportsbook win probability.
-                "sportsbook_home_win_prob": sb_home_win_prob,
-                # Raw moneyline odds (current).
-                "current_moneyline_home": curr_home_odds,
-                "current_moneyline_away": curr_away_odds,
-                # Opening line for movement calculation.
-                "opening_moneyline_home": opening.get("home"),
-                "opening_moneyline_away": opening.get("away"),
-                # Spread and total.
-                "spread": sum(spread_home) / len(spread_home) if spread_home else None,
-                "total": sum(totals) / len(totals) if totals else None,
-                # Placeholders populated by downstream (injury feed, ESPN).
-                "home_key_injuries": None,
-                "away_key_injuries": None,
-                "home_injury_severity": None,
-                "away_injury_severity": None,
-                "home_team_rating": None,
-                "away_team_rating": None,
-                "public_pct_home": None,
-                "public_pct_away": None,
-                # Set by the caller to orient features toward home or away.
-                "is_home_team": None,
-                "kalshi_implied_prob": None,
-            }
-            snapshots.append(snap)
+            for game in games:
+                moneyline_data = self._extract_moneyline_data(game)
+                current_home_odds = moneyline_data["consensus_home"]
+                current_away_odds = moneyline_data["consensus_away"]
+                pinnacle_home_odds = moneyline_data["pinnacle_home"]
+                pinnacle_away_odds = moneyline_data["pinnacle_away"]
 
-        return snapshots
+                sb_home_win_prob = self._normalised_home_probability(
+                    current_home_odds,
+                    current_away_odds,
+                )
+                pinnacle_home_win_prob = self._normalised_home_probability(
+                    pinnacle_home_odds,
+                    pinnacle_away_odds,
+                )
+
+                opening = (opening_lines or {}).get(game.event_id, {})
+                stored_opening = stored_opening_lines.get(game.event_id, {})
+                stored_latest = stored_latest_lines.get(game.event_id, {})
+                if not opening and stored_opening:
+                    opening = {
+                        "home": stored_opening.get("home_price"),
+                        "away": stored_opening.get("away_price"),
+                    }
+
+                movement_home_odds = (
+                    pinnacle_home_odds
+                    or stored_latest.get("home_price")
+                    or current_home_odds
+                )
+                movement_away_odds = (
+                    pinnacle_away_odds
+                    or stored_latest.get("away_price")
+                    or current_away_odds
+                )
+                movement_source = (
+                    movement_bookmaker
+                    if (
+                        (pinnacle_home_odds is not None and pinnacle_away_odds is not None)
+                        or stored_latest
+                    )
+                    else "consensus"
+                )
+                home_rating = power_ratings.lookup(game.home_team, ratings)
+                away_rating = power_ratings.lookup(game.away_team, ratings)
+                home_injury = injury_summaries.get(game.home_team)
+                away_injury = injury_summaries.get(game.away_team)
+
+                snap: dict[str, Any] = {
+                    "event_id": game.event_id,
+                    "home_team": game.home_team,
+                    "away_team": game.away_team,
+                    "commence_time": game.commence_time,
+                    "sport": league.lower(),
+                    # Consensus sportsbook probability across available books.
+                    "sportsbook_home_win_prob": sb_home_win_prob,
+                    # Pinnacle-only line, our primary sharp-money proxy.
+                    "pinnacle_home_win_prob": pinnacle_home_win_prob,
+                    "pinnacle_moneyline_home": pinnacle_home_odds,
+                    "pinnacle_moneyline_away": pinnacle_away_odds,
+                    # Raw moneyline odds used for line-movement calculations.
+                    # Prefer the sharp book so opening/current compare like-for-like.
+                    "current_moneyline_home": movement_home_odds,
+                    "current_moneyline_away": movement_away_odds,
+                    # Opening line for movement calculation, ideally from stored
+                    # pre-game Pinnacle history.
+                    "opening_moneyline_home": opening.get("home"),
+                    "opening_moneyline_away": opening.get("away"),
+                    "movement_line_source": movement_source,
+                    "opening_line_captured_at": stored_opening.get("captured_at"),
+                    "latest_line_captured_at": stored_latest.get("captured_at"),
+                    # Spread and total.
+                    "spread": moneyline_data["spread"],
+                    "total": moneyline_data["total"],
+                    # Injury and power-rating enrichment.
+                    "home_key_injuries": home_injury.key_injuries if home_injury else None,
+                    "away_key_injuries": away_injury.key_injuries if away_injury else None,
+                    "home_injury_severity": home_injury.injury_severity if home_injury else None,
+                    "away_injury_severity": away_injury.injury_severity if away_injury else None,
+                    "home_team_rating": home_rating.rating if home_rating else None,
+                    "away_team_rating": away_rating.rating if away_rating else None,
+                    "home_team_win_pct": home_rating.win_pct if home_rating else None,
+                    "away_team_win_pct": away_rating.win_pct if away_rating else None,
+                    "public_pct_home": None,
+                    "public_pct_away": None,
+                    # Set by the caller to orient features toward home or away.
+                    "is_home_team": None,
+                    "kalshi_implied_prob": None,
+                }
+                snapshots.append(snap)
+
+            return snapshots
+        finally:
+            if created_stats_feed and stats_feed is not None:
+                await stats_feed.close()
+            if created_power_ratings and power_ratings is not None:
+                await power_ratings.close()
 
     # ------------------------------------------------------------------
     # Parsing helpers
@@ -516,3 +629,236 @@ class OddsAPIFeed:
             logger.warning("odds.parse_props_error", exc_info=True)
 
         return props
+
+    @staticmethod
+    def _normalised_home_probability(
+        home_odds: float | None,
+        away_odds: float | None,
+    ) -> float | None:
+        """Convert decimal moneyline odds into an overround-removed home win prob."""
+        if home_odds is None or away_odds is None or home_odds <= 1.0 or away_odds <= 1.0:
+            return None
+
+        raw_h = 1.0 / home_odds
+        raw_a = 1.0 / away_odds
+        total = raw_h + raw_a
+        if total <= 0:
+            return None
+        return raw_h / total
+
+    @staticmethod
+    def _extract_moneyline_data(game: GameOdds) -> dict[str, float | None]:
+        """Extract consensus and Pinnacle-specific line data for a game."""
+        h2h_home: list[float] = []
+        h2h_away: list[float] = []
+        spread_home: list[float] = []
+        totals: list[float] = []
+        pinnacle_home: float | None = None
+        pinnacle_away: float | None = None
+
+        for bookmaker in game.bookmakers:
+            bm_key = str(bookmaker.get("key", "")).lower()
+            for market in bookmaker.get("markets", []):
+                key = market.get("key")
+                outcomes = market.get("outcomes", [])
+
+                if key == "h2h":
+                    home_price: float | None = None
+                    away_price: float | None = None
+                    for outcome in outcomes:
+                        try:
+                            price = float(outcome.get("price", 0))
+                        except (ValueError, TypeError):
+                            continue
+                        if outcome.get("name") == game.home_team:
+                            h2h_home.append(price)
+                            home_price = price
+                        elif outcome.get("name") == game.away_team:
+                            h2h_away.append(price)
+                            away_price = price
+
+                    if bm_key == "pinnacle":
+                        pinnacle_home = home_price
+                        pinnacle_away = away_price
+
+                elif key == "spreads":
+                    for outcome in outcomes:
+                        if outcome.get("name") == game.home_team:
+                            try:
+                                spread_home.append(float(outcome.get("point", 0)))
+                            except (ValueError, TypeError):
+                                continue
+
+                elif key == "totals":
+                    for outcome in outcomes:
+                        if str(outcome.get("name", "")).lower() == "over":
+                            try:
+                                totals.append(float(outcome.get("point", 0)))
+                            except (ValueError, TypeError):
+                                continue
+
+        return {
+            "consensus_home": sum(h2h_home) / len(h2h_home) if h2h_home else None,
+            "consensus_away": sum(h2h_away) / len(h2h_away) if h2h_away else None,
+            "pinnacle_home": pinnacle_home,
+            "pinnacle_away": pinnacle_away,
+            "spread": sum(spread_home) / len(spread_home) if spread_home else None,
+            "total": sum(totals) / len(totals) if totals else None,
+        }
+
+    @staticmethod
+    def _extract_bookmaker_line(
+        game: GameOdds,
+        bookmaker: dict[str, Any],
+    ) -> dict[str, float | None]:
+        """Extract one bookmaker's line snapshot for a game."""
+        home_price: float | None = None
+        away_price: float | None = None
+        spread_home: float | None = None
+        total: float | None = None
+
+        for market in bookmaker.get("markets", []):
+            key = market.get("key")
+            outcomes = market.get("outcomes", [])
+
+            if key == "h2h":
+                for outcome in outcomes:
+                    try:
+                        price = float(outcome.get("price", 0))
+                    except (ValueError, TypeError):
+                        continue
+                    if outcome.get("name") == game.home_team:
+                        home_price = price
+                    elif outcome.get("name") == game.away_team:
+                        away_price = price
+
+            elif key == "spreads":
+                for outcome in outcomes:
+                    if outcome.get("name") != game.home_team:
+                        continue
+                    try:
+                        spread_home = float(outcome.get("point", 0))
+                    except (ValueError, TypeError):
+                        spread_home = None
+
+            elif key == "totals":
+                for outcome in outcomes:
+                    if str(outcome.get("name", "")).lower() != "over":
+                        continue
+                    try:
+                        total = float(outcome.get("point", 0))
+                    except (ValueError, TypeError):
+                        total = None
+
+        return {
+            "home_price": home_price,
+            "away_price": away_price,
+            "spread_home": spread_home,
+            "total": total,
+        }
+
+    def build_line_history_rows(
+        self,
+        league: str,
+        games: list[GameOdds],
+        *,
+        captured_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Convert game odds into datastore rows for line-history persistence."""
+        captured_at = captured_at or datetime.now(timezone.utc)
+        rows: list[dict[str, Any]] = []
+
+        for game in games:
+            for bookmaker in game.bookmakers:
+                line = self._extract_bookmaker_line(game, bookmaker)
+                home_price = line["home_price"]
+                away_price = line["away_price"]
+                if home_price is None or away_price is None:
+                    continue
+                rows.append(
+                    {
+                        "event_id": game.event_id,
+                        "sport": league.lower(),
+                        "home_team": game.home_team,
+                        "away_team": game.away_team,
+                        "bookmaker": str(bookmaker.get("key", bookmaker.get("title", ""))).lower(),
+                        "commence_time": self._parse_timestamp(game.commence_time),
+                        "home_price": home_price,
+                        "away_price": away_price,
+                        "spread_home": line["spread_home"],
+                        "total": line["total"],
+                        "captured_at": captured_at,
+                    }
+                )
+
+        return rows
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        """Parse a basic ISO timestamp into a timezone-aware datetime."""
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    async def _load_team_injury_summaries(
+        self,
+        league: str,
+        games: list[GameOdds],
+        stats_feed: PlayerStatsFeed,
+        power_ratings: ESPNPowerRatings,
+        ratings: dict[str, TeamRating],
+        *,
+        key_minutes_threshold: float,
+    ) -> dict[str, TeamInjurySummary]:
+        """Fetch injury summaries for all teams present in ``games``."""
+        sport_lookup = {
+            "nba": "basketball",
+            "ncaab": "basketball",
+            "nfl": "football",
+            "ncaaf": "football",
+            "nhl": "hockey",
+            "mlb": "baseball",
+        }
+        sport = sport_lookup.get(league.lower())
+        if sport is None:
+            return {}
+
+        tasks: dict[str, asyncio.Task[TeamInjurySummary]] = {}
+        team_names = {
+            team_name
+            for game in games
+            for team_name in (game.home_team, game.away_team)
+            if team_name
+        }
+
+        for team_name in team_names:
+            rating = power_ratings.lookup(team_name, ratings)
+            if rating is None or not rating.team_id:
+                continue
+            tasks[team_name] = asyncio.create_task(
+                stats_feed.get_team_injury_summary(
+                    sport,
+                    league,
+                    rating.team_id,
+                    key_minutes_threshold=key_minutes_threshold,
+                )
+            )
+
+        if not tasks:
+            return {}
+
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        summaries: dict[str, TeamInjurySummary] = {}
+        for team_name, result in zip(tasks.keys(), results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "odds.injury_enrichment_failed",
+                    team=team_name,
+                    error=str(result),
+                )
+                continue
+            summaries[team_name] = result
+        return summaries

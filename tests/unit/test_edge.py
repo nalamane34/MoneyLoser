@@ -176,3 +176,23 @@ class TestEdgeCalculator:
         # Edge is positive but liquidity is too thin
         assert result.raw_edge > 0
         assert not result.is_actionable
+
+    def test_multi_level_book_uses_tail_as_best_price(self) -> None:
+        """Best price should come from the last level on each bid ladder."""
+        fees = KalshiFeeCalculator()
+        calc = EdgeCalculator(fees, min_edge_threshold=0.01, min_liquidity=1)
+
+        ob = _make_orderbook(
+            yes_prices=["0.54", "0.56", "0.58"],
+            yes_sizes=["10", "20", "30"],
+            no_prices=["0.34", "0.36", "0.38"],
+            no_sizes=["40", "50", "60"],
+        )
+
+        result = calc.compute_edge(0.67, ob, is_maker=False)
+
+        assert result.side == "yes"
+        assert result.target_price == Decimal("0.62")
+        assert result.implied_probability == pytest.approx(0.62, abs=1e-10)
+        assert result.available_liquidity == 60
+        assert result.raw_edge == pytest.approx(0.05, abs=1e-10)

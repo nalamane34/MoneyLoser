@@ -16,7 +16,7 @@ Also runs periodic re-evaluation of watched markets on a timer.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -24,11 +24,13 @@ from typing import Any
 import structlog
 
 from moneygone.config import ExecutionConfig
+from moneygone.data.market_data import MarketDataRecorder
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.types import (
     Action,
     Fill,
     Market,
+    MarketResult,
     MarketStatus,
     OrderbookSnapshot,
     Side,
@@ -118,6 +120,9 @@ class ExecutionEngine:
         strategy: ExecutionStrategy,
         config: ExecutionConfig,
         watched_tickers: list[str] | None = None,
+        store: Any | None = None,
+        sports_snapshot_provider: Any | None = None,
+        recorder: MarketDataRecorder | None = None,
     ) -> None:
         self._rest = rest_client
         self._ws = ws_client
@@ -131,11 +136,17 @@ class ExecutionEngine:
         self._strategy = strategy
         self._config = config
         self._watched: list[str] = watched_tickers or []
+        self._store = store
+        self._sports = sports_snapshot_provider
+        self._recorder = recorder
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
         self._market_cache: dict[str, Market] = {}
         self._last_eval: dict[str, datetime] = {}
+        self._decision_context: dict[str, TradeDecision] = {}
+        self._decision_context_by_client_order_id: dict[str, TradeDecision] = {}
+        self._last_universe_refresh: datetime | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -154,9 +165,10 @@ class ExecutionEngine:
         )
 
         self._running = True
+        self._ws.set_on_event(self.on_event)
+        await self._refresh_market_universe(force=True)
 
         # Connect WebSocket and subscribe to channels
-        self._ws = self._ws  # ws_client should have on_event set
         await self._ws.connect()
         await self._ws.wait_connected()
 
@@ -231,13 +243,15 @@ class ExecutionEngine:
         data = event.data
         fill = Fill(
             trade_id=data.get("trade_id", ""),
-            ticker=data.get("ticker", ""),
+            ticker=data.get("market_ticker", data.get("ticker", "")),
             side=Side(data.get("side", "yes")),
             action=Action(data.get("action", "buy")),
             count=int(data.get("count", 0)),
             price=Decimal(str(data.get("yes_price_dollars", data.get("yes_price", 0)))),
             is_taker=bool(data.get("is_taker", False)),
-            created_time=datetime.now(timezone.utc),
+            created_time=event.timestamp or datetime.now(timezone.utc),
+            order_id=data.get("order_id"),
+            client_order_id=data.get("client_order_id"),
         )
 
         # Update order manager
@@ -245,6 +259,9 @@ class ExecutionEngine:
 
         # Update risk state (portfolio, drawdown, etc.)
         self._risk.post_trade_update(fill)
+        decision = self._resolve_decision_context(fill)
+        if decision is not None:
+            self._fills.on_fill(fill, decision.prediction, decision.edge_result)
 
         logger.info(
             "engine.fill_received",
@@ -258,17 +275,50 @@ class ExecutionEngine:
         """Process a ticker update from the WebSocket."""
         data = event.data
         ticker = data.get("market_ticker", data.get("ticker", ""))
-        if ticker:
-            logger.debug("engine.ticker_update", ticker=ticker)
+        if not ticker:
+            return
+
+        market = self._merge_market_update(ticker, data, event.timestamp)
+        if market is not None:
+            self._market_cache[ticker] = market
+            if self._recorder is not None:
+                await self._recorder.on_ticker_update({"data": self._market_to_row(market)})
+        logger.debug("engine.ticker_update", ticker=ticker)
 
     async def _handle_orderbook_event(self, event: WSEvent) -> None:
         """Process an orderbook snapshot or delta from the WebSocket."""
-        # Orderbook is maintained internally by ws_client
-        pass
+        ticker = event.data.get("market_ticker", event.data.get("ticker", ""))
+        if not ticker or self._recorder is None:
+            return
+
+        orderbook = self._ws.get_orderbook(ticker)
+        if orderbook is None:
+            return
+
+        await self._recorder.on_orderbook_update(
+            {"data": self._orderbook_to_row(orderbook)}
+        )
 
     async def _handle_trade_event(self, event: WSEvent) -> None:
         """Process a public trade event."""
-        pass
+        if self._recorder is None:
+            return
+        data = event.data
+        ticker = data.get("market_ticker", data.get("ticker", ""))
+        if not ticker:
+            return
+        await self._recorder.on_trade(
+            {
+                "data": {
+                    "trade_id": data.get("trade_id", ""),
+                    "ticker": ticker,
+                    "count": int(data.get("count", 0)),
+                    "yes_price": float(data.get("yes_price_dollars", data.get("yes_price", 0)) or 0),
+                    "taker_side": data.get("taker_side", "yes"),
+                    "trade_time": (event.timestamp or datetime.now(timezone.utc)).isoformat(),
+                }
+            }
+        )
 
     # ------------------------------------------------------------------
     # Market evaluation
@@ -302,6 +352,8 @@ class ExecutionEngine:
             observation_time=now,
             orderbook=orderbook,
             market_state=self._market_cache.get(ticker),
+            sports_snapshot=await self._get_sports_snapshot(ticker),
+            store=self._store,
         )
 
         # 3. Run feature pipeline
@@ -426,6 +478,10 @@ class ExecutionEngine:
         )
 
         if order is not None:
+            self._decision_context[order.order_id] = decision
+            client_order_id = getattr(self._orders, "_order_client_order_ids", {}).get(order.order_id)
+            if client_order_id:
+                self._decision_context_by_client_order_id[client_order_id] = decision
             logger.info(
                 "engine.order_executed",
                 order_id=order.order_id,
@@ -444,6 +500,7 @@ class ExecutionEngine:
         while self._running:
             try:
                 await asyncio.sleep(interval)
+                await self._refresh_market_universe()
 
                 for ticker in self._watched:
                     if not self._running:
@@ -485,3 +542,194 @@ class ExecutionEngine:
         if ticker in self._watched:
             self._watched.remove(ticker)
             logger.info("engine.ticker_removed", ticker=ticker)
+
+    async def _refresh_market_universe(self, *, force: bool = False) -> None:
+        """Refresh watched sports markets from the store-backed snapshot provider."""
+        if self._sports is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        if (
+            not force
+            and self._last_universe_refresh is not None
+            and (now - self._last_universe_refresh).total_seconds() < 900
+        ):
+            return
+
+        markets = await self._rest.get_all_markets(status="open", limit=1000)
+        matched = await self._sports.refresh(markets)
+        new_tickers: list[str] = []
+        for market in matched:
+            self._market_cache[market.ticker] = market
+            if market.ticker not in self._watched:
+                self._watched.append(market.ticker)
+                new_tickers.append(market.ticker)
+        if self._ws.is_connected and new_tickers:
+            await self._ws.subscribe_orderbook(new_tickers)
+            await self._ws.subscribe_ticker(new_tickers)
+            await self._ws.subscribe_trades(new_tickers)
+        self._last_universe_refresh = now
+        logger.info("engine.market_universe_refreshed", watched=len(self._watched))
+
+    async def _get_sports_snapshot(self, ticker: str) -> dict[str, Any] | None:
+        if self._sports is None:
+            return None
+        market = self._market_cache.get(ticker)
+        if market is None:
+            return None
+        return await self._sports.get_snapshot(market)
+
+    def _resolve_decision_context(self, fill: Fill) -> TradeDecision | None:
+        decision = None
+        if fill.order_id is not None:
+            decision = self._decision_context.get(fill.order_id)
+        if decision is None and fill.client_order_id is not None:
+            decision = self._decision_context_by_client_order_id.get(fill.client_order_id)
+
+        # Clean up context for fully filled orders (no longer open)
+        if fill.order_id is not None and not any(
+            order.order_id == fill.order_id for order in self._orders.get_open_orders()
+        ):
+            self._decision_context.pop(fill.order_id, None)
+            # Also clean up the client_order_id mapping
+            if fill.client_order_id is not None:
+                self._decision_context_by_client_order_id.pop(fill.client_order_id, None)
+
+        # Bound the context dicts to prevent unbounded memory growth
+        max_context_size = 500
+        if len(self._decision_context) > max_context_size:
+            open_ids = {o.order_id for o in self._orders.get_open_orders()}
+            stale = [k for k in self._decision_context if k not in open_ids]
+            for k in stale:
+                self._decision_context.pop(k, None)
+        if len(self._decision_context_by_client_order_id) > max_context_size:
+            to_remove = list(self._decision_context_by_client_order_id.keys())[
+                : len(self._decision_context_by_client_order_id) - max_context_size
+            ]
+            for k in to_remove:
+                self._decision_context_by_client_order_id.pop(k, None)
+
+        return decision
+
+    def _merge_market_update(
+        self,
+        ticker: str,
+        data: dict[str, Any],
+        timestamp: datetime | None,
+    ) -> Market | None:
+        existing = self._market_cache.get(ticker)
+        close_time = self._parse_timestamp(
+            data.get("close_time"),
+            fallback=existing.close_time if existing is not None else None,
+        )
+        if close_time is None:
+            close_time = timestamp or datetime.now(timezone.utc)
+
+        status_value = data.get("status", existing.status.value if existing is not None else "open")
+        try:
+            status = MarketStatus(status_value)
+        except ValueError:
+            status = existing.status if existing is not None else MarketStatus.OPEN
+
+        try:
+            result_value = data.get(
+                "result",
+                existing.result.value if existing is not None else "",
+            )
+            try:
+                result = MarketResult(result_value) if result_value else MarketResult.NOT_SETTLED
+            except ValueError:
+                result = existing.result if existing is not None else MarketResult.NOT_SETTLED
+
+            return Market(
+                ticker=ticker,
+                event_ticker=data.get("event_ticker", existing.event_ticker if existing is not None else ""),
+                series_ticker=data.get("series_ticker", existing.series_ticker if existing is not None else ""),
+                title=data.get("title", existing.title if existing is not None else ""),
+                status=status,
+                yes_bid=self._decimal_field(data, "yes_bid_dollars", "yes_bid", fallback=existing.yes_bid if existing is not None else _ZERO),
+                yes_ask=self._decimal_field(data, "yes_ask_dollars", "yes_ask", fallback=existing.yes_ask if existing is not None else _ZERO),
+                last_price=self._decimal_field(
+                    data,
+                    "last_price_dollars",
+                    "last_price",
+                    fallback=existing.last_price if existing is not None else _ZERO,
+                ),
+                volume=int(data.get("volume", existing.volume if existing is not None else 0) or 0),
+                open_interest=int(
+                    data.get("open_interest", existing.open_interest if existing is not None else 0) or 0
+                ),
+                close_time=close_time,
+                result=result,
+                category=data.get("category", existing.category if existing is not None else ""),
+                subtitle=data.get("subtitle", existing.subtitle if existing is not None else ""),
+                yes_sub_title=data.get("yes_sub_title", existing.yes_sub_title if existing is not None else ""),
+                no_sub_title=data.get("no_sub_title", existing.no_sub_title if existing is not None else ""),
+            )
+        except Exception:
+            logger.warning("engine.market_cache_update_failed", ticker=ticker, exc_info=True)
+            return existing
+
+    @staticmethod
+    def _decimal_field(
+        data: dict[str, Any],
+        primary: str,
+        secondary: str,
+        *,
+        fallback: Decimal,
+    ) -> Decimal:
+        value = data.get(primary, data.get(secondary, fallback))
+        return Decimal(str(value))
+
+    @staticmethod
+    def _parse_timestamp(
+        value: Any,
+        *,
+        fallback: datetime | None = None,
+    ) -> datetime | None:
+        if value is None:
+            return fallback
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _market_to_row(market: Market) -> dict[str, Any]:
+        return {
+            "ticker": market.ticker,
+            "event_ticker": market.event_ticker,
+            "title": market.title,
+            "status": market.status.value,
+            "yes_bid": float(market.yes_bid),
+            "yes_ask": float(market.yes_ask),
+            "last_price": float(market.last_price),
+            "volume": market.volume,
+            "open_interest": market.open_interest,
+            "close_time": market.close_time.isoformat(),
+            "result": market.result.value,
+            "category": market.category,
+        }
+
+    @staticmethod
+    def _orderbook_to_row(orderbook: OrderbookSnapshot) -> dict[str, Any]:
+        return {
+            "ticker": orderbook.ticker,
+            "yes_levels": [
+                [float(level.price), float(level.contracts)]
+                for level in orderbook.yes_bids
+            ],
+            "no_levels": [
+                [float(level.price), float(level.contracts)]
+                for level in orderbook.no_bids
+            ],
+            "seq": orderbook.seq,
+            "snapshot_time": orderbook.timestamp.isoformat(),
+        }

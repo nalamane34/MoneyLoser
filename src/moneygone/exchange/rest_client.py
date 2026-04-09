@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -25,20 +25,25 @@ from moneygone.exchange.errors import (
 )
 from moneygone.exchange.rate_limiter import AsyncRateLimiter
 from moneygone.exchange.types import (
+    AccountLimits,
     Action,
     AmendOrderRequest,
     Balance,
     BatchOrderItem,
     BatchOrderResult,
     Candlestick,
+    CandlestickOHLC,
     DailySchedule,
     ExchangeAnnouncement,
     ExchangeSchedule,
+    ExchangeStatus,
     Fill,
     MaintenanceWindow,
     Market,
+    MarketCandlesticks,
     MarketResult,
     MarketStatus,
+    Milestone,
     Order,
     OrderGroup,
     OrderbookLevel,
@@ -51,6 +56,7 @@ from moneygone.exchange.types import (
     Settlement,
     SettlementStatus,
     Side,
+    StructuredTarget,
     Trade,
 )
 
@@ -86,6 +92,23 @@ def _dec(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+def _money(
+    dollars_value: Any | None = None,
+    cents_value: Any | None = None,
+) -> Decimal:
+    """Parse a money field from either dollar or cent denominations."""
+    if dollars_value is not None:
+        return _dec(dollars_value)
+    if cents_value is not None:
+        return _dec(cents_value) / Decimal("100")
+    return Decimal(0)
+
+
+def _fixed_point_dollars(value: Any) -> str:
+    """Serialize a money value in Kalshi's fixed-point dollar string format."""
+    return format(_dec(value).quantize(Decimal("0.0001")), "f")
+
+
 def _market_result(value: str | None) -> MarketResult:
     """Convert a raw result string to a ``MarketResult`` enum."""
     if not value:
@@ -94,6 +117,23 @@ def _market_result(value: str | None) -> MarketResult:
         return MarketResult(value)
     except ValueError:
         return MarketResult.NOT_SETTLED
+
+
+def _market_status(value: str | None) -> MarketStatus:
+    """Convert raw market status strings into a ``MarketStatus`` enum."""
+    normalized = (value or MarketStatus.OPEN.value).strip().lower()
+    aliases = {
+        "active": MarketStatus.OPEN,
+        "finalized": MarketStatus.SETTLED,
+        "resolved": MarketStatus.SETTLED,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    try:
+        return MarketStatus(normalized)
+    except ValueError:
+        log.warning("rest_client.unknown_market_status", raw_status=value)
+        return MarketStatus.OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +201,8 @@ class KalshiRestClient:
         """Send an authenticated, rate-limited request with retries."""
         client = await self._ensure_client()
 
-        # Build the full path for signing (includes query string)
+        # Kalshi signs only the request path; query parameters are excluded.
         sign_path = urlparse(self._base_url).path.rstrip("/") + "/" + path.lstrip("/")
-        if params:
-            # Filter out None values
-            filtered = {k: v for k, v in params.items() if v is not None}
-            if filtered:
-                sign_path = sign_path + "?" + urlencode(filtered, doseq=True)
 
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
@@ -256,7 +291,7 @@ class KalshiRestClient:
             event_ticker=data.get("event_ticker", ""),
             series_ticker=data.get("series_ticker", ""),
             title=data.get("title", ""),
-            status=MarketStatus(data.get("status", "open")),
+            status=_market_status(data.get("status")),
             yes_bid=_dec(data.get("yes_bid_dollars", data.get("yes_bid"))),
             yes_ask=_dec(data.get("yes_ask_dollars", data.get("yes_ask"))),
             last_price=_dec(data.get("last_price_dollars", data.get("last_price"))),
@@ -265,6 +300,9 @@ class KalshiRestClient:
             close_time=_ts(data.get("close_time")),
             result=_market_result(data.get("result")),
             category=data.get("category", ""),
+            subtitle=data.get("subtitle", ""),
+            yes_sub_title=data.get("yes_sub_title", ""),
+            no_sub_title=data.get("no_sub_title", ""),
         )
 
     @staticmethod
@@ -306,14 +344,18 @@ class KalshiRestClient:
             price=_dec(data.get("yes_price_dollars", data.get("yes_price"))),
             is_taker=bool(data.get("is_taker", False)),
             created_time=_ts(data.get("created_time")),
+            order_id=data.get("order_id"),
+            client_order_id=data.get("client_order_id"),
         )
 
     @staticmethod
     def _parse_trade(data: dict[str, Any]) -> Trade:
+        # count_fp is the new fixed-point string field (e.g. "10.00")
+        count_raw = data.get("count_fp", data.get("count", 0))
         return Trade(
             trade_id=data["trade_id"],
             ticker=data["ticker"],
-            count=int(data.get("count", 0)),
+            count=int(float(str(count_raw))),
             yes_price=_dec(data.get("yes_price_dollars", data.get("yes_price"))),
             taker_side=Side(data.get("taker_side", "yes")),
             created_time=_ts(data.get("created_time")),
@@ -341,8 +383,8 @@ class KalshiRestClient:
         )
         return OrderbookSnapshot(
             ticker=ticker,
-            yes_levels=yes_levels,
-            no_levels=no_levels,
+            yes_bids=yes_levels,
+            no_bids=no_levels,
             seq=int(data.get("seq", 0)),
             timestamp=_ts(data.get("timestamp")),
         )
@@ -359,6 +401,31 @@ class KalshiRestClient:
         """
         data = await self._request("GET", "/markets", params=filters)
         return [self._parse_market(m) for m in data.get("markets", [])]
+
+    async def get_markets_page(
+        self,
+        **filters: Any,
+    ) -> tuple[list[Market], str | None]:
+        """Fetch a single page of markets plus the next cursor, if any."""
+        data = await self._request("GET", "/markets", params=filters)
+        return [self._parse_market(m) for m in data.get("markets", [])], data.get("cursor")
+
+    async def get_all_markets(self, **filters: Any) -> list[Market]:
+        """Fetch all pages of markets for the supplied filters."""
+        base_filters = dict(filters)
+        cursor = base_filters.pop("cursor", None)
+        markets: list[Market] = []
+
+        while True:
+            page_filters = dict(base_filters)
+            if cursor:
+                page_filters["cursor"] = cursor
+            batch, cursor = await self.get_markets_page(**page_filters)
+            markets.extend(batch)
+            if not cursor:
+                break
+
+        return markets
 
     async def get_market(self, ticker: str) -> Market:
         """Fetch a single market by ticker."""
@@ -387,14 +454,32 @@ class KalshiRestClient:
         return results
 
     async def get_trades(
-        self, ticker: str, limit: int | None = None
-    ) -> list[Trade]:
-        """Fetch public trades for a market."""
-        params: dict[str, Any] = {"ticker": ticker}
+        self,
+        ticker: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+    ) -> tuple[list[Trade], str]:
+        """Fetch public trades, optionally filtered by market.
+
+        Returns (trades, cursor).  Pass the cursor to the next call
+        for pagination.  An empty cursor means no more pages.
+        """
+        params: dict[str, Any] = {}
+        if ticker is not None:
+            params["ticker"] = ticker
         if limit is not None:
             params["limit"] = limit
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
         data = await self._request("GET", "/markets/trades", params=params)
-        return [self._parse_trade(t) for t in data.get("trades", [])]
+        trades = [self._parse_trade(t) for t in data.get("trades", [])]
+        return trades, data.get("cursor", "")
 
     async def get_events(self, **filters: Any) -> list[dict[str, Any]]:
         """Fetch events with optional filters.
@@ -411,9 +496,21 @@ class KalshiRestClient:
     async def get_balance(self) -> Balance:
         """Fetch the account balance."""
         data = await self._request("GET", "/portfolio/balance")
+        available = _money(
+            data.get("available_balance_dollars"),
+            data.get("available_balance", data.get("balance")),
+        )
+        total = _money(
+            data.get("total_balance_dollars"),
+            data.get("total_balance"),
+        )
+        if total == Decimal(0) and data.get("portfolio_value") is not None:
+            total = available + _money(cents_value=data.get("portfolio_value"))
+        elif total == Decimal(0):
+            total = available
         return Balance(
-            available=_dec(data.get("available_balance_dollars", data.get("available_balance", 0))),
-            total=_dec(data.get("total_balance_dollars", data.get("total_balance", 0))),
+            available=available,
+            total=total,
         )
 
     async def get_positions(self, **filters: Any) -> list[Position]:
@@ -455,9 +552,8 @@ class KalshiRestClient:
             "side": request.side.value,
             "action": request.action.value,
             "count": request.count,
-            "type": "limit",
-            "yes_price_dollars": float(request.yes_price),
-            "time_in_force": request.time_in_force.value,
+            "yes_price_dollars": _fixed_point_dollars(request.yes_price),
+            "time_in_force": request.time_in_force.api_value,
         }
         if request.post_only:
             body["post_only"] = True
@@ -490,11 +586,11 @@ class KalshiRestClient:
         log.info("rest_client.order_cancelled", order_id=order_id)
 
     async def batch_cancel_orders(self, order_ids: list[str]) -> None:
-        """Cancel multiple orders in a single request."""
+        """Cancel multiple orders in a single request (up to 20)."""
         body: dict[str, Any] = {"order_ids": order_ids}
         try:
             await self._request(
-                "DELETE", "/portfolio/orders", json_body=body
+                "DELETE", "/portfolio/orders/batched", json_body=body
             )
         except KalshiAPIError as exc:
             raise OrderError(
@@ -533,7 +629,7 @@ class KalshiRestClient:
             "action": request.action.value,
         }
         if request.yes_price is not None:
-            body["yes_price_dollars"] = float(request.yes_price)
+            body["yes_price_dollars"] = _fixed_point_dollars(request.yes_price)
         if request.count is not None:
             body["count"] = request.count
 
@@ -604,8 +700,8 @@ class KalshiRestClient:
                 "side": req.side.value,
                 "action": req.action.value,
                 "count": req.count,
-                "yes_price_dollars": float(req.yes_price),
-                "time_in_force": req.time_in_force.value,
+                "yes_price_dollars": _fixed_point_dollars(req.yes_price),
+                "time_in_force": req.time_in_force.api_value,
             }
             if req.post_only:
                 item["post_only"] = True
@@ -885,16 +981,60 @@ class KalshiRestClient:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _parse_ohlc(data: dict[str, Any]) -> CandlestickOHLC:
+        """Parse an OHLC sub-object (yes_bid or yes_ask)."""
+        return CandlestickOHLC(
+            open=_dec(data.get("open_dollars", data.get("open", 0))),
+            high=_dec(data.get("high_dollars", data.get("high", 0))),
+            low=_dec(data.get("low_dollars", data.get("low", 0))),
+            close=_dec(data.get("close_dollars", data.get("close", 0))),
+        )
+
+    @staticmethod
     def _parse_candlestick(c: dict[str, Any]) -> Candlestick:
         price = c.get("price", {})
+
+        # Handle dollar-string format (new API) or legacy integer format
+        open_val = _dec(price.get("open_dollars", price.get("open", 0)))
+        high_val = _dec(price.get("high_dollars", price.get("high", 0)))
+        low_val = _dec(price.get("low_dollars", price.get("low", 0)))
+        close_val = _dec(price.get("close_dollars", price.get("close", 0)))
+
+        # Fallback to yes_ask if price block is empty
+        if open_val == 0 and not price:
+            ask = c.get("yes_ask", {})
+            open_val = _dec(ask.get("open_dollars", ask.get("open", 0)))
+            high_val = _dec(ask.get("high_dollars", ask.get("high", 0)))
+            low_val = _dec(ask.get("low_dollars", ask.get("low", 0)))
+            close_val = _dec(ask.get("close_dollars", ask.get("close", 0)))
+
+        # Volume and OI: handle fixed-point string or integer
+        vol_raw = c.get("volume_fp", c.get("volume", 0))
+        oi_raw = c.get("open_interest_fp", c.get("open_interest", 0))
+
+        # Parse end_period_ts: can be a unix timestamp integer or ISO string
+        end_ts_raw = c.get("end_period_ts", "")
+        if isinstance(end_ts_raw, (int, float)) and end_ts_raw > 0:
+            end_ts = datetime.fromtimestamp(int(end_ts_raw), tz=timezone.utc)
+        else:
+            end_ts = _ts(str(end_ts_raw))
+
+        # Optional extended OHLC for bid/ask
+        yes_bid_data = c.get("yes_bid")
+        yes_ask_data = c.get("yes_ask")
+
         return Candlestick(
-            end_period_ts=_ts(str(c.get("end_period_ts", ""))),
-            open=_dec(price.get("open", c.get("yes_ask", {}).get("open", 0))),
-            high=_dec(price.get("high", c.get("yes_ask", {}).get("high", 0))),
-            low=_dec(price.get("low", c.get("yes_ask", {}).get("low", 0))),
-            close=_dec(price.get("close", c.get("yes_ask", {}).get("close", 0))),
-            volume=int(c.get("volume", 0)),
-            open_interest=int(c.get("open_interest", 0)),
+            end_period_ts=end_ts,
+            open=open_val,
+            high=high_val,
+            low=low_val,
+            close=close_val,
+            volume=int(float(str(vol_raw))),
+            open_interest=int(float(str(oi_raw))),
+            mean_price=_dec(price["mean_dollars"]) if price.get("mean_dollars") else None,
+            previous_price=_dec(price["previous_dollars"]) if price.get("previous_dollars") else None,
+            yes_bid_ohlc=KalshiRestClient._parse_ohlc(yes_bid_data) if yes_bid_data else None,
+            yes_ask_ohlc=KalshiRestClient._parse_ohlc(yes_ask_data) if yes_ask_data else None,
         )
 
     async def get_market_candlesticks(
@@ -1001,3 +1141,340 @@ class KalshiRestClient:
         """
         data = await self._request("GET", "/search/tags_by_categories")
         return data.get("categories", data)
+
+    async def get_filters_by_sport(self) -> dict[str, Any]:
+        """Return search filters organized by sport.
+
+        Useful for discovering sports-related markets and filtering
+        by league, team, etc.
+        """
+        return await self._request("GET", "/search/filters_by_sport")
+
+    # ------------------------------------------------------------------
+    # Batch market candlesticks
+    # ------------------------------------------------------------------
+
+    async def get_batch_candlesticks(
+        self,
+        market_tickers: list[str],
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 60,
+        include_latest_before_start: bool = False,
+    ) -> list[MarketCandlesticks]:
+        """Fetch candlestick data for multiple markets in one request.
+
+        Parameters
+        ----------
+        market_tickers:
+            Up to 100 market tickers.
+        start_ts / end_ts:
+            Unix timestamps in seconds.
+        period_interval:
+            Candle size in minutes (1, 60, 1440).
+        include_latest_before_start:
+            If True, prepends a synthetic candlestick for price continuity.
+
+        Returns up to 10,000 total candlesticks across all markets.
+        """
+        params: dict[str, Any] = {
+            "market_tickers": ",".join(market_tickers),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        if include_latest_before_start:
+            params["include_latest_before_start"] = "true"
+
+        data = await self._request("GET", "/markets/candlesticks", params=params)
+        results: list[MarketCandlesticks] = []
+        for entry in data.get("markets", []):
+            ticker = entry.get("market_ticker", "")
+            candles = [
+                self._parse_candlestick(c)
+                for c in entry.get("candlesticks", [])
+            ]
+            results.append(MarketCandlesticks(
+                market_ticker=ticker,
+                candlesticks=candles,
+            ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Event candlesticks
+    # ------------------------------------------------------------------
+
+    async def get_event_candlesticks(
+        self,
+        series_ticker: str,
+        event_ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 60,
+    ) -> list[Candlestick]:
+        """Fetch aggregated candlesticks across all markets in an event.
+
+        Parameters
+        ----------
+        series_ticker:
+            Parent series ticker.
+        event_ticker:
+            Event ticker within the series.
+        start_ts / end_ts:
+            Unix timestamps.
+        period_interval:
+            Candle size in minutes: 1, 60, or 1440.
+        """
+        data = await self._request(
+            "GET",
+            f"/series/{series_ticker}/events/{event_ticker}/candlesticks",
+            params={
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period_interval,
+            },
+        )
+        return [self._parse_candlestick(c) for c in data.get("candlesticks", [])]
+
+    # ------------------------------------------------------------------
+    # Exchange status & metadata
+    # ------------------------------------------------------------------
+
+    async def get_exchange_status(self) -> ExchangeStatus:
+        """Check whether the exchange is open for trading."""
+        data = await self._request("GET", "/exchange/status")
+        return ExchangeStatus(
+            trading_active=bool(data.get("trading_active", False)),
+            exchange_active=bool(data.get("exchange_active", False)),
+        )
+
+    async def get_user_data_timestamp(self) -> str:
+        """Get the approximate validation timestamp for user data endpoints.
+
+        Returns an ISO timestamp string indicating how fresh the
+        portfolio/orders data is.
+        """
+        data = await self._request("GET", "/exchange/user_data_timestamp")
+        return data.get("timestamp", "")
+
+    async def get_fee_changes(self) -> list[dict[str, Any]]:
+        """Fetch any pending or recent fee schedule changes."""
+        data = await self._request("GET", "/series/fee_changes")
+        return data.get("fee_changes", [])
+
+    # ------------------------------------------------------------------
+    # Account
+    # ------------------------------------------------------------------
+
+    async def get_account_limits(self) -> AccountLimits:
+        """Fetch API tier and rate limit information."""
+        data = await self._request("GET", "/account/limits")
+        return AccountLimits(
+            tier=data.get("tier", ""),
+            data=data,
+        )
+
+    # ------------------------------------------------------------------
+    # Events (extended)
+    # ------------------------------------------------------------------
+
+    async def get_event_metadata(self, event_ticker: str) -> dict[str, Any]:
+        """Fetch metadata only for an event (lighter than full event)."""
+        data = await self._request("GET", f"/events/{event_ticker}/metadata")
+        return data.get("metadata", data)
+
+    async def get_multivariate_events(self, **filters: Any) -> list[dict[str, Any]]:
+        """Fetch multivariate combo events with optional filtering.
+
+        These are multi-outcome events (e.g. "which team wins the Super Bowl").
+        """
+        data = await self._request("GET", "/events/multivariate", params=filters)
+        return data.get("events", [])
+
+    # ------------------------------------------------------------------
+    # Milestones
+    # ------------------------------------------------------------------
+
+    async def get_milestone(self, milestone_id: str) -> Milestone:
+        """Fetch a single milestone by ID."""
+        data = await self._request("GET", f"/milestones/{milestone_id}")
+        m = data.get("milestone", data)
+        return Milestone(
+            milestone_id=str(m.get("id", milestone_id)),
+            title=m.get("title", ""),
+            category=m.get("category", ""),
+            data=m,
+        )
+
+    async def get_milestones(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        **filters: Any,
+    ) -> list[Milestone]:
+        """Fetch milestones with optional date filtering.
+
+        Parameters
+        ----------
+        start_date / end_date:
+            ISO date strings for filtering.
+        """
+        params: dict[str, Any] = dict(filters)
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+
+        data = await self._request("GET", "/milestones", params=params)
+        return [
+            Milestone(
+                milestone_id=str(m.get("id", "")),
+                title=m.get("title", ""),
+                category=m.get("category", ""),
+                data=m,
+            )
+            for m in data.get("milestones", [])
+        ]
+
+    # ------------------------------------------------------------------
+    # Live data
+    # ------------------------------------------------------------------
+
+    async def get_live_data(self, milestone_id: str) -> dict[str, Any]:
+        """Fetch live data for a specific milestone.
+
+        Returns real-time data relevant to the milestone's resolution
+        (e.g. current temperature, game score).
+        """
+        data = await self._request("GET", f"/live_data/milestone/{milestone_id}")
+        return data
+
+    async def get_live_game_stats(self, milestone_id: str) -> dict[str, Any]:
+        """Fetch play-by-play game statistics for a milestone.
+
+        Only applicable for sports-related milestones.
+        """
+        data = await self._request(
+            "GET", f"/live_data/milestone/{milestone_id}/game_stats"
+        )
+        return data
+
+    async def get_live_data_batch(
+        self, milestone_ids: list[str]
+    ) -> dict[str, Any]:
+        """Fetch live data for multiple milestones in one request."""
+        params: dict[str, Any] = {
+            "milestone_ids": ",".join(milestone_ids),
+        }
+        data = await self._request("GET", "/live_data/batch", params=params)
+        return data
+
+    # ------------------------------------------------------------------
+    # Structured targets
+    # ------------------------------------------------------------------
+
+    async def get_structured_target(
+        self, structured_target_id: str
+    ) -> StructuredTarget:
+        """Fetch a single structured target by ID."""
+        data = await self._request(
+            "GET", f"/structured_targets/{structured_target_id}"
+        )
+        st = data.get("structured_target", data)
+        return StructuredTarget(
+            structured_target_id=str(st.get("id", structured_target_id)),
+            data=st,
+        )
+
+    async def get_structured_targets(self, **filters: Any) -> list[StructuredTarget]:
+        """Fetch all structured targets (paginated, max 2000 per page).
+
+        Filters: ``cursor``, ``limit``, etc.
+        """
+        data = await self._request(
+            "GET", "/structured_targets", params=filters
+        )
+        return [
+            StructuredTarget(
+                structured_target_id=str(st.get("id", "")),
+                data=st,
+            )
+            for st in data.get("structured_targets", [])
+        ]
+
+    # ------------------------------------------------------------------
+    # Historical data (extended)
+    # ------------------------------------------------------------------
+
+    async def get_historical_market(self, ticker: str) -> Market:
+        """Fetch a single historical (settled/archived) market by ticker."""
+        data = await self._request("GET", f"/historical/markets/{ticker}")
+        return self._parse_market(data.get("market", data))
+
+    async def get_historical_markets(self, **filters: Any) -> list[Market]:
+        """Fetch archived markets from the historical database.
+
+        Filters: ``ticker``, ``event_ticker``, ``series_ticker``,
+        ``status``, ``cursor``, ``limit``.
+        """
+        data = await self._request("GET", "/historical/markets", params=filters)
+        return [self._parse_market(m) for m in data.get("markets", [])]
+
+    # ------------------------------------------------------------------
+    # Order group (single)
+    # ------------------------------------------------------------------
+
+    async def get_order_group(self, order_group_id: str) -> OrderGroup:
+        """Fetch a single order group by ID."""
+        data = await self._request(
+            "GET", f"/portfolio/order_groups/{order_group_id}"
+        )
+        g = data.get("order_group", data)
+        return OrderGroup(
+            order_group_id=g.get("id", order_group_id),
+            contracts_limit=_dec(g.get("contracts_limit_fp", "0")),
+            is_auto_cancel_enabled=bool(g.get("is_auto_cancel_enabled", False)),
+        )
+
+    # ------------------------------------------------------------------
+    # Multivariate event collections
+    # ------------------------------------------------------------------
+
+    async def get_mve_collection(
+        self, collection_ticker: str
+    ) -> dict[str, Any]:
+        """Fetch a multivariate event collection."""
+        data = await self._request(
+            "GET",
+            f"/multivariate_event_collections/{collection_ticker}",
+        )
+        return data.get("collection", data)
+
+    async def get_mve_collections(self, **filters: Any) -> list[dict[str, Any]]:
+        """Fetch all multivariate event collections."""
+        data = await self._request(
+            "GET", "/multivariate_event_collections", params=filters
+        )
+        return data.get("collections", [])
+
+    async def lookup_mve_market(
+        self, collection_ticker: str, **params: Any
+    ) -> dict[str, Any]:
+        """Look up a specific market in a multivariate event collection."""
+        data = await self._request(
+            "PUT",
+            f"/multivariate_event_collections/{collection_ticker}/lookup",
+            json_body=params,
+        )
+        return data
+
+    # ------------------------------------------------------------------
+    # Incentive programs
+    # ------------------------------------------------------------------
+
+    async def get_incentive_programs(self, **filters: Any) -> list[dict[str, Any]]:
+        """List available incentive programs."""
+        data = await self._request(
+            "GET", "/incentive_programs", params=filters
+        )
+        return data.get("incentive_programs", [])

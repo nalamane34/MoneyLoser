@@ -95,6 +95,27 @@ CREATE TABLE IF NOT EXISTS open_interest (
 """
 
 # ---------------------------------------------------------------------------
+# Sportsbook tables
+# ---------------------------------------------------------------------------
+
+CREATE_SPORTSBOOK_GAME_LINES = """
+CREATE TABLE IF NOT EXISTS sportsbook_game_lines (
+    event_id       VARCHAR NOT NULL,
+    sport          VARCHAR NOT NULL,
+    home_team      VARCHAR NOT NULL,
+    away_team      VARCHAR NOT NULL,
+    bookmaker      VARCHAR NOT NULL,
+    commence_time  TIMESTAMP,
+    home_price     DOUBLE NOT NULL,
+    away_price     DOUBLE NOT NULL,
+    spread_home    DOUBLE,
+    total          DOUBLE,
+    captured_at    TIMESTAMP NOT NULL,
+    ingested_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"""
+
+# ---------------------------------------------------------------------------
 # Feature / model tables
 # ---------------------------------------------------------------------------
 
@@ -154,6 +175,30 @@ CREATE TABLE IF NOT EXISTS settlements_log (
 # Ordered list for schema initialization
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-worker table partitions (for multi-process architecture)
+# ---------------------------------------------------------------------------
+
+COLLECTOR_TABLES: list[str] = [
+    CREATE_SPORTSBOOK_GAME_LINES,
+    CREATE_FORECAST_ENSEMBLES,
+    CREATE_FUNDING_RATES,
+    CREATE_OPEN_INTEREST,
+]
+
+MARKET_DATA_TABLES: list[str] = [
+    CREATE_MARKET_STATES,
+    CREATE_ORDERBOOK_SNAPSHOTS,
+    CREATE_TRADES,
+]
+
+EXECUTION_TABLES: list[str] = [
+    CREATE_FEATURES,
+    CREATE_PREDICTIONS,
+    CREATE_FILLS_LOG,
+    CREATE_SETTLEMENTS_LOG,
+]
+
 ALL_TABLES: list[str] = [
     CREATE_MARKET_STATES,
     CREATE_ORDERBOOK_SNAPSHOTS,
@@ -161,6 +206,7 @@ ALL_TABLES: list[str] = [
     CREATE_FORECAST_ENSEMBLES,
     CREATE_FUNDING_RATES,
     CREATE_OPEN_INTEREST,
+    CREATE_SPORTSBOOK_GAME_LINES,
     CREATE_FEATURES,
     CREATE_PREDICTIONS,
     CREATE_FILLS_LOG,

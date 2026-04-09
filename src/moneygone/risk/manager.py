@@ -8,12 +8,13 @@ DrawdownMonitor, and ExposureCalculator into a single interface.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 import structlog
 
 from moneygone.config import RiskConfig
-from moneygone.exchange.types import Fill
+from moneygone.exchange.types import Fill, Settlement
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
 from moneygone.risk.portfolio import PortfolioTracker
@@ -64,7 +65,7 @@ class RiskSummary:
     """Highest equity observed."""
 
     daily_pnl: Decimal
-    """Realized + unrealized PnL for the current day."""
+    """Realized PnL delta tracked for the current session."""
 
     n_positions: int
     """Number of active positions."""
@@ -108,6 +109,8 @@ class RiskManager:
         self._exposure = exposure_calculator
         self._categories = categories or {}
         self._daily_pnl = _ZERO
+        self._last_realized_pnl = self._portfolio.realized_pnl
+        self._session_date: date = datetime.now(timezone.utc).date()
 
     # ------------------------------------------------------------------
     # Pre-trade
@@ -191,16 +194,26 @@ class RiskManager:
         equity = self._portfolio.get_equity()
         self._drawdown.track(equity)
 
-        # Update daily PnL tracking in risk limits
-        self._limits.update_daily_pnl(
-            fill.price * Decimal(fill.count)
-            if fill.action.value == "sell"
-            else _ZERO
-        )
+        self._sync_daily_pnl_from_portfolio()
 
         logger.debug(
             "post_trade_updated",
             ticker=fill.ticker,
+            equity=str(equity),
+            drawdown=round(self._drawdown.current_drawdown(), 4),
+        )
+
+    def post_settlement_update(self, settlement: Settlement) -> None:
+        """Update all risk state after a market settlement is received."""
+        self._portfolio.on_settlement(settlement)
+
+        equity = self._portfolio.get_equity()
+        self._drawdown.track(equity)
+        self._sync_daily_pnl_from_portfolio()
+
+        logger.debug(
+            "post_settlement_updated",
+            ticker=settlement.ticker,
             equity=str(equity),
             drawdown=round(self._drawdown.current_drawdown(), 4),
         )
@@ -330,3 +343,34 @@ class RiskManager:
         for ticker, cat in self._categories.items():
             result.setdefault(cat, []).append(ticker)
         return result
+
+    def _maybe_reset_daily_pnl(self) -> None:
+        """Reset daily PnL if the UTC trading date has rolled over."""
+        today = datetime.now(timezone.utc).date()
+        if today != self._session_date:
+            logger.info(
+                "risk.daily_pnl_reset",
+                previous_date=self._session_date.isoformat(),
+                new_date=today.isoformat(),
+                previous_daily_pnl=str(self._daily_pnl),
+            )
+            self._daily_pnl = _ZERO
+            self._limits.reset_daily()
+            self._session_date = today
+
+    def reset_daily_pnl(self) -> None:
+        """Manually reset daily PnL tracking (e.g. at session start)."""
+        self._daily_pnl = _ZERO
+        self._limits.reset_daily()
+        self._session_date = datetime.now(timezone.utc).date()
+        logger.info("risk.daily_pnl_manual_reset")
+
+    def _sync_daily_pnl_from_portfolio(self) -> None:
+        """Accumulate realized PnL deltas into the session daily PnL."""
+        self._maybe_reset_daily_pnl()
+        current_realized = self._portfolio.realized_pnl
+        realized_delta = current_realized - self._last_realized_pnl
+        if realized_delta != _ZERO:
+            self._daily_pnl += realized_delta
+            self._limits.update_daily_pnl(realized_delta)
+        self._last_realized_pnl = current_realized

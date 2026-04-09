@@ -332,8 +332,8 @@ class BacktestEngine:
 
             return OrderbookSnapshot(
                 ticker=data["ticker"],
-                yes_levels=tuple(yes_levels),
-                no_levels=tuple(no_levels),
+                yes_bids=tuple(yes_levels),
+                no_bids=tuple(no_levels),
                 seq=int(data.get("seq", 0) or 0),
                 timestamp=event.timestamp,
             )

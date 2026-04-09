@@ -994,7 +994,7 @@ class ResolutionSniper:
         to create ContractMapping objects automatically.
         """
         try:
-            markets = await self._client.get_markets(status="open", limit=200)
+            markets = await self._client.get_all_markets(status="open", limit=100)
         except Exception:
             logger.warning(
                 "sniper.auto_discover_failed",

@@ -5,6 +5,7 @@ from moneygone.models.calibration import Calibrator
 from moneygone.models.ensemble import EnsembleModel
 from moneygone.models.evaluation import ModelEvaluator
 from moneygone.models.registry import ModelRegistry
+from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.models.trainers.bayesian import BayesianModel
 from moneygone.models.trainers.gbm import GBMModel
 from moneygone.models.trainers.logistic import LogisticModel
@@ -20,6 +21,7 @@ __all__ = [
     "LogisticModel",
     "GBMModel",
     "BayesianModel",
+    "SharpSportsbookModel",
     # Ensemble
     "EnsembleModel",
     # Registry

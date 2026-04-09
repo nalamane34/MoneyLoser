@@ -34,6 +34,16 @@ class CryptoConfig(BaseModel):
     fetch_interval_seconds: int = 30
 
 
+class SportsbookConfig(BaseModel):
+    enabled: bool = False
+    leagues: list[str] = Field(default_factory=lambda: ["nba"])
+    bookmakers: list[str] = Field(default_factory=lambda: ["pinnacle"])
+    markets: list[str] = Field(default_factory=lambda: ["h2h"])
+    fetch_interval_minutes: int = 240
+    lookahead_hours: int = 18
+    min_requests_remaining: int = 75
+
+
 class ModelConfig(BaseModel):
     model_dir: Path = Path("models/")
     calibration_method: str = "isotonic"
@@ -79,6 +89,7 @@ class AppConfig(BaseSettings):
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
     crypto: CryptoConfig = Field(default_factory=CryptoConfig)
+    sportsbook: SportsbookConfig = Field(default_factory=SportsbookConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)

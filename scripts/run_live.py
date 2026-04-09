@@ -7,7 +7,7 @@ via config overlays.
 
 Usage::
 
-    # Paper trading (default)
+    # Paper trading soak (default)
     python scripts/run_live.py
 
     # Paper trading with explicit overlay
@@ -38,11 +38,48 @@ from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger(__name__)
 
+DEFAULT_SOAK_OVERLAY = Path("config/paper-soak.yaml")
+
+
+def _resolve_overlay_path(args: argparse.Namespace) -> Path:
+    """Return the requested overlay or the conservative soak default."""
+    return Path(args.overlay) if args.overlay else DEFAULT_SOAK_OVERLAY
+
+
+def _is_paper_soak_overlay(overlay: Path) -> bool:
+    """Identify the conservative soak overlay, regardless of path spelling."""
+    return overlay.resolve() == DEFAULT_SOAK_OVERLAY.resolve()
+
+
+def _validate_paper_soak_config(config) -> None:
+    """Guardrails for the conservative sports soak profile."""
+    if not config.exchange.demo_mode:
+        raise ValueError("paper soak must run in demo mode")
+    if not config.sportsbook.enabled:
+        raise ValueError("paper soak must enable sportsbook polling")
+    if config.crypto.enabled:
+        raise ValueError("paper soak must keep crypto feeds disabled")
+    if config.weather.enabled:
+        raise ValueError("paper soak must keep weather feeds disabled")
+
+    expected_bookmakers = {"pinnacle"}
+    expected_markets = {"h2h"}
+    if set(config.sportsbook.bookmakers) != expected_bookmakers:
+        raise ValueError("paper soak must use pinnacle only")
+    if set(config.sportsbook.markets) != expected_markets:
+        raise ValueError("paper soak must use h2h only")
+    if config.sportsbook.fetch_interval_minutes < 15:
+        raise ValueError("paper soak polling is too aggressive")
+    if config.sportsbook.min_requests_remaining < 200:
+        raise ValueError("paper soak reserve is too low")
+    if config.execution.evaluation_interval_seconds < 10.0:
+        raise ValueError("paper soak evaluation loop is too aggressive")
+
 
 async def main(args: argparse.Namespace) -> None:
     """Main entry point for the live trading system."""
     # Load configuration with optional overlay
-    overlay = Path(args.overlay) if args.overlay else None
+    overlay = _resolve_overlay_path(args)
     config = load_config(
         base_path=Path(args.config),
         overlay_path=overlay,
@@ -51,11 +88,15 @@ async def main(args: argparse.Namespace) -> None:
     # Setup logging first
     setup_logging(config.log_level)
 
+    if _is_paper_soak_overlay(overlay):
+        _validate_paper_soak_config(config)
+
     log.info(
         "run_live.starting",
         config_path=args.config,
-        overlay_path=args.overlay,
+        overlay_path=str(overlay),
         demo_mode=config.exchange.demo_mode,
+        paper_soak=_is_paper_soak_overlay(overlay),
         log_level=config.log_level,
     )
 
@@ -70,6 +111,9 @@ async def main(args: argparse.Namespace) -> None:
         daily_loss_limit=config.risk.daily_loss_limit_pct,
         max_drawdown=config.risk.max_drawdown_pct,
         data_dir=str(config.data_dir),
+        sportsbook_enabled=config.sportsbook.enabled,
+        sportsbook_poll_interval_minutes=config.sportsbook.fetch_interval_minutes,
+        sportsbook_quota_reserve=config.sportsbook.min_requests_remaining,
     )
 
     if not config.exchange.demo_mode:
@@ -90,7 +134,10 @@ async def main(args: argparse.Namespace) -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_signal)
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            log.debug("run_live.signal_handler_unsupported", signal=str(sig))
 
     # Run the application
     try:
@@ -120,10 +167,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overlay",
         type=str,
-        default=None,
+        default=str(DEFAULT_SOAK_OVERLAY),
         help=(
             "Path to config overlay YAML, e.g. config/paper.yaml or "
-            "config/live.yaml (default: none)"
+            "config/live.yaml (default: config/paper-soak.yaml)"
         ),
     )
     return parser.parse_args()

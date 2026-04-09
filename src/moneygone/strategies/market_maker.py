@@ -144,7 +144,7 @@ class MarketMaker:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self, tickers: list[str]) -> None:
+    async def start(self, tickers: list[str] | None = None) -> None:
         """Start market making on specified tickers.
 
         Initialises state for each ticker, computes initial quotes, and
@@ -158,6 +158,9 @@ class MarketMaker:
         if self._running:
             logger.warning("market_maker.already_running")
             return
+
+        if tickers is None:
+            tickers = await self.select_markets()
 
         active_tickers = tickers[: self._config.max_markets]
 
@@ -239,7 +242,7 @@ class MarketMaker:
         list[str]
             Tickers of suitable markets, sorted by spread descending.
         """
-        markets = await self._client.get_markets(status="open")
+        markets = await self._client.get_all_markets(status="open", limit=100)
         now = datetime.now(timezone.utc)
         min_spread = Decimal(str(self._config.min_spread))
         candidates: list[tuple[Decimal, str]] = []
