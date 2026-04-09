@@ -8,10 +8,11 @@ build/
 .env
 *.pem
 *.key
-data/*.duckdb
-data/*.db
+data/
+models/trained/
 models/*.pkl
 models/*.joblib
+.claude/
 .pytest_cache/
 .coverage
 htmlcov/
