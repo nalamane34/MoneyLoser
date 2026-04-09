@@ -39,7 +39,7 @@ async def _monitoring_loop(
     calibration_monitor: CalibrationMonitor,
     pnl_tracker: PnLTracker,
     alert_manager: AlertManager,
-    exec_store: DataStore | None,
+    exec_db_path: Path,
 ) -> None:
     """Periodic monitoring checks."""
     interval = 60.0
@@ -53,13 +53,18 @@ async def _monitoring_loop(
                     drift_detector.set_reference(np.array(recent))
 
             # Load recent predictions from execution DB
-            if exec_store is not None:
+            # Open briefly and close — don't hold a lock that blocks the writer
+            if exec_db_path.exists():
                 try:
-                    recent_preds = exec_store.query(
-                        "SELECT probability FROM predictions ORDER BY prediction_time DESC LIMIT 100"
-                    )
-                    for row in recent_preds:
-                        drift_detector.add_prediction(float(row[0]))
+                    exec_store = DataStore(exec_db_path, read_only=True)
+                    try:
+                        recent_preds = exec_store.query(
+                            "SELECT probability FROM predictions ORDER BY prediction_time DESC LIMIT 100"
+                        )
+                        for row in recent_preds:
+                            drift_detector.add_prediction(float(row[0]))
+                    finally:
+                        exec_store.close()
                 except Exception:
                     log.debug("monitor.prediction_load_failed", exc_info=True)
 
@@ -111,15 +116,7 @@ async def main() -> None:
     setup_logging(config.log_level)
 
     data_dir = Path(config.data_dir)
-
-    # Open execution DB read-only if it exists
-    exec_db = data_dir / "execution.duckdb"
-    exec_store: DataStore | None = None
-    if exec_db.exists():
-        try:
-            exec_store = DataStore(exec_db, read_only=True)
-        except Exception:
-            log.warning("monitor.exec_db_open_failed", exc_info=True)
+    exec_db_path = data_dir / "execution.duckdb"
 
     # Build monitoring components
     drift_detector = DriftDetector(
@@ -146,7 +143,7 @@ async def main() -> None:
     log.info("monitor.started")
 
     task = asyncio.create_task(
-        _monitoring_loop(config, drift_detector, calibration_monitor, pnl_tracker, alert_manager, exec_store)
+        _monitoring_loop(config, drift_detector, calibration_monitor, pnl_tracker, alert_manager, exec_db_path)
     )
 
     try:
@@ -157,8 +154,6 @@ async def main() -> None:
             await task
         except asyncio.CancelledError:
             pass
-        if exec_store is not None:
-            exec_store.close()
         await alert_manager.close()
         log.info("monitor.stopped")
 

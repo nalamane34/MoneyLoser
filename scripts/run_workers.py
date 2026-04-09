@@ -41,11 +41,12 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 PYTHON = sys.executable
 
 # Worker definitions: (name, script, is_writer)
+# Writers start first so their DBs exist before readers try to ATTACH.
 WORKER_DEFS = [
     ("collector", "worker_collector.py", True),
     ("market_data", "worker_market_data.py", True),
-    ("execution", "worker_execution.py", False),
-    ("monitor", "worker_monitor.py", False),
+    ("execution", "worker_execution.py", True),   # writes to execution.duckdb
+    ("monitor", "worker_monitor.py", False),       # read-only
 ]
 
 MAX_RESTARTS = 5
