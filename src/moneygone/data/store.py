@@ -80,19 +80,40 @@ class DataStore:
             self._conn.execute(ddl)
         logger.info("datastore.schema_initialized", table_count=len(ddl_list))
 
-    def attach_readonly(self, name: str, db_path: Path | str) -> None:
+    def attach_readonly(self, name: str, db_path: Path | str, retries: int = 5) -> None:
         """Attach another DuckDB file as a read-only schema.
 
         After attaching, tables can be queried as ``{name}.table_name``.
         Use :meth:`create_attached_views` to create local views that
         transparently redirect queries to attached tables.
+
+        Retries on lock conflicts since the writer process only holds
+        the lock briefly during flushes.
         """
+        import time
+
         p = Path(db_path)
         if not p.exists():
             logger.warning("datastore.attach_skipped", name=name, reason="file_not_found", path=str(p))
             return
-        self._conn.execute(f"ATTACH '{p}' AS {name} (READ_ONLY)")
-        logger.info("datastore.attached", name=name, path=str(p))
+
+        for attempt in range(retries):
+            try:
+                self._conn.execute(f"ATTACH '{p}' AS {name} (READ_ONLY)")
+                logger.info("datastore.attached", name=name, path=str(p))
+                return
+            except duckdb.IOException as exc:
+                if "lock" in str(exc).lower() and attempt < retries - 1:
+                    wait = 2.0 * (attempt + 1)
+                    logger.warning(
+                        "datastore.attach_lock_retry",
+                        name=name,
+                        attempt=attempt + 1,
+                        wait=wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
 
     def create_attached_views(self, attachments: dict[str, list[str]]) -> None:
         """Create local views pointing to tables in attached databases.
