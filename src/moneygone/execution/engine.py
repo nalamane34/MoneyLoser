@@ -346,13 +346,22 @@ class ExecutionEngine:
             logger.debug("engine.no_orderbook", ticker=ticker)
             return None
 
-        # 2. Build feature context
+        # 2. Build feature context — require sports snapshot
+        sports_snapshot = await self._get_sports_snapshot(ticker)
+        if sports_snapshot is None:
+            logger.debug(
+                "engine.no_sports_snapshot",
+                ticker=ticker,
+                msg="Skipping — no sportsbook data for this market",
+            )
+            return None
+
         context = FeatureContext(
             ticker=ticker,
             observation_time=now,
             orderbook=orderbook,
             market_state=self._market_cache.get(ticker),
-            sports_snapshot=await self._get_sports_snapshot(ticker),
+            sports_snapshot=sports_snapshot,
             store=self._store,
         )
 
@@ -362,8 +371,16 @@ class ExecutionEngine:
             logger.debug("engine.no_features", ticker=ticker)
             return None
 
-        # 4. Run model
+        # 4. Run model — reject low-confidence predictions
         prediction = self._model.predict_proba(features)
+        if prediction.confidence < 0.30:
+            logger.debug(
+                "engine.low_confidence",
+                ticker=ticker,
+                confidence=prediction.confidence,
+                msg="Model confidence too low to act",
+            )
+            return None
 
         # 5. Compute edge
         edge = self._edge_calc.compute_edge(

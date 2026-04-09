@@ -35,13 +35,21 @@ class SharpSportsbookModel(ProbabilityModel):
         if base_prob is None:
             base_prob = features.get("sportsbook_win_prob")
         if base_prob is None:
+            # No sportsbook anchor — return uninvestable prediction
             logger.warning(
                 "sharp_model.no_sportsbook_data",
                 features_available=list(features.keys()),
-                msg="Falling back to 0.5 — prediction unreliable",
+                msg="No sharp line available — refusing to predict",
             )
-            base_prob = 0.5
-            no_sharp_data = True
+            return ModelPrediction(
+                probability=0.5,
+                raw_probability=0.5,
+                confidence=0.0,
+                model_name=self.name,
+                model_version=self.version,
+                features_used=dict(features),
+                prediction_time=datetime.now(timezone.utc),
+            )
 
         movement = features.get("moneyline_movement", 0.0)
         power = features.get("power_rating_edge", 0.0)
@@ -67,8 +75,6 @@ class SharpSportsbookModel(ProbabilityModel):
             if key in features
         )
         confidence = _clip(0.50 + 0.08 * available, 0.50, 0.90)
-        if no_sharp_data:
-            confidence = 0.10  # Very low — this is essentially a coin flip
 
         return ModelPrediction(
             probability=probability,
