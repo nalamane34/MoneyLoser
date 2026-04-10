@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from moneygone.exchange.errors import OrderError
 from moneygone.exchange.types import (
     Action,
     Order,
@@ -141,7 +142,18 @@ class PassiveStrategy(ExecutionStrategy):
             post_only=True,
         )
 
-        order = await order_manager.submit_order(request)
+        try:
+            order = await order_manager.submit_order(request)
+        except OrderError as exc:
+            if "post only cross" in str(exc).lower():
+                logger.warning(
+                    "passive.post_only_cross",
+                    ticker=orderbook.ticker,
+                    side=edge_result.side,
+                    price=str(price),
+                )
+                return None
+            raise
 
         logger.info(
             "passive.order_placed",
@@ -176,30 +188,29 @@ class PassiveStrategy(ExecutionStrategy):
         edge: EdgeResult,
         orderbook: OrderbookSnapshot,
     ) -> Decimal | None:
-        """Determine the passive limit price.
+        """Determine the passive limit price (always returned as yes_price).
 
-        For buying YES: join or improve the best YES bid.
-        For buying NO: join or improve the best NO bid.
+        The Kalshi API always uses ``yes_price_dollars`` regardless of side.
+        For YES buys: yes_price = one tick below YES ask (= target_price).
+        For NO buys: compute NO bid one tick below NO ask, then convert
+        to yes_price via ``1 - no_bid``.
         """
         if edge.side == "yes":
-            # Best bid on YES side
-            levels = orderbook.yes_levels
-            if not levels:
+            if not orderbook.yes_levels:
                 return None
-            # Best bid = highest price someone is willing to buy at
-            # But in Kalshi YES levels from API may be asks; we use target_price
-            # as the reference and improve inward
-            price = edge.target_price - Decimal("0.01")  # one cent inside the ask
-            price += self._improve
-            # Clamp to valid range
+            # target_price = YES ask = 1 - best NO bid
+            # Post one tick below the ask
+            price = edge.target_price - Decimal("0.01") + self._improve
             price = max(Decimal("0.01"), min(Decimal("0.99"), price))
         else:
-            levels = orderbook.no_levels
-            if not levels:
+            if not orderbook.no_levels:
                 return None
-            price = edge.target_price - Decimal("0.01")
-            price += self._improve
-            price = max(Decimal("0.01"), min(Decimal("0.99"), price))
+            # target_price = NO ask = 1 - best YES bid
+            # Desired NO bid = NO ask - 1 tick
+            no_bid = edge.target_price - Decimal("0.01") + self._improve
+            no_bid = max(Decimal("0.01"), min(Decimal("0.99"), no_bid))
+            # Convert to yes_price for the API
+            price = _ONE - no_bid
 
         return price
 
@@ -253,8 +264,14 @@ class AggressiveStrategy(ExecutionStrategy):
         if size_result.contracts <= 0:
             return None
 
-        # For aggressive execution, use the target price (best ask)
-        price = edge_result.target_price
+        # target_price is in the side's frame (YES ask or NO ask).
+        # The API always uses yes_price_dollars, so convert NO prices.
+        if edge_result.side == "yes":
+            price = edge_result.target_price
+        else:
+            # target_price = NO ask; to fill at ask, yes_price = 1 - NO_ask
+            price = _ONE - edge_result.target_price
+
         if price <= _ZERO or price >= _ONE:
             logger.warning(
                 "aggressive.invalid_price",
