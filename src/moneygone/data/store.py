@@ -325,9 +325,9 @@ class DataStore:
             """
             INSERT INTO sportsbook_game_lines
                 (event_id, sport, home_team, away_team, bookmaker,
-                 commence_time, home_price, away_price, spread_home,
-                 total, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 commence_time, home_price, away_price, draw_price,
+                 spread_home, total, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -339,6 +339,7 @@ class DataStore:
                     _coerce_timestamp(r.get("commence_time")),
                     r["home_price"],
                     r["away_price"],
+                    r.get("draw_price"),
                     r.get("spread_home"),
                     r.get("total"),
                     _coerce_timestamp(r["captured_at"]),

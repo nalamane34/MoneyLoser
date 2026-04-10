@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS sportsbook_game_lines (
     commence_time  TIMESTAMP,
     home_price     DOUBLE NOT NULL,
     away_price     DOUBLE NOT NULL,
+    draw_price     DOUBLE,
     spread_home    DOUBLE,
     total          DOUBLE,
     captured_at    TIMESTAMP NOT NULL,
