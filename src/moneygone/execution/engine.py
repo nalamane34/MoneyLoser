@@ -561,6 +561,11 @@ class ExecutionEngine:
         """
         orderbook = self._ws.get_orderbook(decision.ticker)
         if orderbook is None:
+            try:
+                orderbook = await self._rest.get_orderbook(decision.ticker)
+            except Exception:
+                pass
+        if orderbook is None:
             logger.warning(
                 "engine.execute_no_orderbook",
                 ticker=decision.ticker,
