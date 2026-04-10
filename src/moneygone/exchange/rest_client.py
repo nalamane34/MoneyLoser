@@ -410,11 +410,23 @@ class KalshiRestClient:
         data = await self._request("GET", "/markets", params=filters)
         return [self._parse_market(m) for m in data.get("markets", [])], data.get("cursor")
 
-    async def get_all_markets(self, **filters: Any) -> list[Market]:
-        """Fetch all pages of markets for the supplied filters."""
+    async def get_all_markets(
+        self,
+        max_pages: int = 0,
+        **filters: Any,
+    ) -> list[Market]:
+        """Fetch pages of markets for the supplied filters.
+
+        Parameters
+        ----------
+        max_pages:
+            Maximum number of pages to fetch.  0 means unlimited (fetch
+            all pages).  Each page returns up to ``limit`` markets.
+        """
         base_filters = dict(filters)
         cursor = base_filters.pop("cursor", None)
         markets: list[Market] = []
+        page_count = 0
 
         while True:
             page_filters = dict(base_filters)
@@ -422,7 +434,10 @@ class KalshiRestClient:
                 page_filters["cursor"] = cursor
             batch, cursor = await self.get_markets_page(**page_filters)
             markets.extend(batch)
+            page_count += 1
             if not cursor:
+                break
+            if max_pages and page_count >= max_pages:
                 break
 
         return markets

@@ -168,10 +168,12 @@ class MarketDiscoveryService:
         rest_client: KalshiRestClient,
         cache_path: Path,
         refresh_interval: float = 120.0,
+        max_pages: int = 20,
     ) -> None:
         self._rest = rest_client
         self._cache_path = cache_path
         self._refresh_interval = refresh_interval
+        self._max_pages = max_pages  # 20 pages × 1000 = up to 20k markets
         self._markets: list[tuple[Market, MarketCategory]] = []
         self._task: asyncio.Task | None = None
         self._refreshed_at: datetime | None = None
@@ -204,8 +206,10 @@ class MarketDiscoveryService:
     # -- core --
 
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
-        """Fetch all markets from Kalshi, classify, write cache file."""
-        markets = await self._rest.get_all_markets(status="open", limit=1000)
+        """Fetch markets from Kalshi, classify, write cache file."""
+        markets = await self._rest.get_all_markets(
+            status="open", limit=1000, max_pages=self._max_pages,
+        )
         classified: list[tuple[Market, MarketCategory]] = []
         category_counts: dict[str, int] = {}
 

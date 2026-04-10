@@ -644,9 +644,11 @@ class ExecutionEngine:
                     cache_used = True
                     logger.debug("engine.using_discovery_cache", age_s=int(age), markets=len(markets))
 
-        # Fallback: fetch directly via REST
+        # Fallback: fetch directly via REST (cap at 20 pages = ~20k markets)
         if not markets:
-            markets = await self._rest.get_all_markets(status="open", limit=1000)
+            markets = await self._rest.get_all_markets(
+                status="open", limit=1000, max_pages=20,
+            )
             classified = [(m, classify_market(m)) for m in markets]
             logger.debug("engine.direct_rest_fetch", markets=len(markets))
 
