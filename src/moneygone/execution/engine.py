@@ -650,6 +650,7 @@ class ExecutionEngine:
             max_close = int((now + timedelta(hours=72)).timestamp())
             all_fetched = await self._rest.get_all_markets(
                 limit=1000, max_pages=20, max_close_ts=max_close,
+                mve_filter="exclude",
             )
             markets = [m for m in all_fetched if m.status == MarketStatus.OPEN]
             classified = [(m, classify_market(m)) for m in markets]

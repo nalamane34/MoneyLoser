@@ -50,8 +50,8 @@ class MarketCategory(str, Enum):
 
 
 _CRYPTO_PATTERNS = re.compile(
-    r"bitcoin|btc|ethereum|eth|solana|sol|crypto|doge|xrp|hype|"
-    r"coin price|token|bnb|ada|avax|matic|litecoin|ltc",
+    r"bitcoin|\bbtc\b|ethereum|\beth\b|solana|\bsol\b|crypto|\bdoge\b|\bxrp\b|"
+    r"coin price|\bbnb\b|\bada\b|\bavax\b|litecoin|\bltc\b",
     re.IGNORECASE,
 )
 _WEATHER_PATTERNS = re.compile(
@@ -219,6 +219,7 @@ class MarketDiscoveryService:
             limit=1000,
             max_pages=self._max_pages,
             max_close_ts=max_close,
+            mve_filter="exclude",  # Skip multivariate combos (KXMVE*)
         )
 
         # Filter to only open/active markets (API can't combine close_ts + status)
