@@ -102,6 +102,18 @@ class Market:
     subtitle: str = ""
     yes_sub_title: str = ""
     no_sub_title: str = ""
+    created_time: datetime | None = None
+    open_time: datetime | None = None
+    previous_price: Decimal = Decimal("0")
+    liquidity_dollars: Decimal = Decimal("0")
+    no_bid: Decimal = Decimal("0")  # no_bid_dollars
+    no_ask: Decimal = Decimal("0")  # no_ask_dollars
+    volume_24h: int = 0  # volume_24h_fp
+    market_type: str = ""  # e.g. "binary"
+    strike_type: str = ""
+    floor_strike: Decimal | None = None
+    cap_strike: Decimal | None = None
+    mve_selected_legs: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,39 +280,74 @@ class Order:
     status: OrderStatus
     count: int
     remaining_count: int
-    price: Decimal
+    price: Decimal  # yes_price_dollars
     taker_fees: Decimal
     maker_fees: Decimal
     created_time: datetime
+    no_price: Decimal = Decimal("0")
+    fill_count: int = 0
+    order_type: str = "limit"  # "limit" | "market"
+    taker_fill_cost: Decimal = Decimal("0")
+    maker_fill_cost: Decimal = Decimal("0")
+    expiration_time: datetime | None = None
+    last_update_time: datetime | None = None
+    client_order_id: str = ""
+    order_group_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """Current position in a single market."""
+    """Current position in a single market.
+
+    The API returns ``position_fp``: positive = YES contracts, negative = NO.
+    Legacy ``yes_count``/``no_count`` are derived properties for convenience.
+    """
 
     ticker: str
-    event_ticker: str
-    market_result: MarketResult
-    yes_count: int
-    no_count: int
-    realized_pnl: Decimal
-    settlement_status: SettlementStatus
+    position: int  # from position_fp; positive=YES, negative=NO
+    market_exposure: Decimal  # market_exposure_dollars
+    realized_pnl: Decimal  # realized_pnl_dollars
+    total_traded: Decimal  # total_traded_dollars
+    fees_paid: Decimal  # fees_paid_dollars
+    last_updated_ts: datetime | None = None
+    event_ticker: str = ""
+    market_result: MarketResult = MarketResult.NOT_SETTLED
+    resting_orders_count: int = 0
+
+    @property
+    def yes_count(self) -> int:
+        return max(self.position, 0)
+
+    @property
+    def no_count(self) -> int:
+        return abs(min(self.position, 0))
+
+    @property
+    def side(self) -> Side | None:
+        if self.position > 0:
+            return Side.YES
+        elif self.position < 0:
+            return Side.NO
+        return None
 
 
 @dataclass(frozen=True, slots=True)
 class Fill:
     """A single fill (partial or full) on an order."""
 
-    trade_id: str
+    fill_id: str  # primary key (API: fill_id)
     ticker: str
     side: Side
     action: Action
-    count: int
-    price: Decimal
+    count: int  # from count_fp
+    price: Decimal  # yes_price_dollars
+    no_price: Decimal  # no_price_dollars
+    fee_cost: Decimal  # fee_cost (fixed-point dollars)
     is_taker: bool
     created_time: datetime
     order_id: str | None = None
     client_order_id: str | None = None
+    trade_id: str = ""  # legacy alias for fill_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,8 +366,9 @@ class Trade:
 class Balance:
     """Account balance snapshot."""
 
-    available: Decimal
-    total: Decimal
+    available: Decimal  # available_balance (cents) or available_balance_dollars
+    total: Decimal  # balance + portfolio_value
+    updated_ts: int = 0  # unix timestamp of last update
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,9 +377,14 @@ class Settlement:
 
     ticker: str
     market_result: MarketResult
-    revenue: Decimal
-    payout: Decimal
+    revenue: Decimal  # revenue in cents (legacy)
     settled_time: datetime
+    event_ticker: str = ""
+    yes_count: int = 0  # from yes_count_fp
+    no_count: int = 0  # from no_count_fp
+    yes_total_cost: Decimal = Decimal("0")  # yes_total_cost_dollars
+    no_total_cost: Decimal = Decimal("0")  # no_total_cost_dollars
+    fee_cost: Decimal = Decimal("0")  # fee_cost (fixed-point dollars)
 
 
 @dataclass(frozen=True, slots=True)

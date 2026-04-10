@@ -34,11 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from moneygone.app import Application, build_app
 from moneygone.config import load_config
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger(__name__)
 
 DEFAULT_SOAK_OVERLAY = Path("config/paper-soak.yaml")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _resolve_overlay_path(args: argparse.Namespace) -> Path:
@@ -78,6 +80,8 @@ def _validate_paper_soak_config(config) -> None:
 
 async def main(args: argparse.Namespace) -> None:
     """Main entry point for the live trading system."""
+    loaded_env = load_repo_env(REPO_ROOT)
+
     # Load configuration with optional overlay
     overlay = _resolve_overlay_path(args)
     config = load_config(
@@ -87,6 +91,12 @@ async def main(args: argparse.Namespace) -> None:
 
     # Setup logging first
     setup_logging(config.log_level)
+    if loaded_env:
+        log.info(
+            "run_live.repo_env_loaded",
+            path=str(REPO_ROOT / ".env"),
+            keys=sorted(loaded_env),
+        )
 
     if _is_paper_soak_overlay(overlay):
         _validate_paper_soak_config(config)

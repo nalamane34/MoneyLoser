@@ -93,13 +93,14 @@ class PassiveStrategy(ExecutionStrategy):
     """Place a post-only limit order at or better than best bid/ask.
 
     Designed to earn maker rebates (zero fees on Kalshi). The order rests
-    in the book and waits for a counterparty.  If not filled within
-    ``timeout_seconds``, the order is cancelled.
+    in the book and is left to fill naturally — does NOT block the eval
+    loop.  Stale order cleanup is handled by the engine's reconciliation.
 
     Parameters
     ----------
     timeout_seconds:
-        Maximum time to wait for a fill before cancelling.
+        Ignored (kept for config compat). Orders rest until filled or
+        cleaned up by the engine's stale order check.
     price_improve_cents:
         Number of cents to improve over best bid/ask (0 = join).
     """
@@ -109,7 +110,6 @@ class PassiveStrategy(ExecutionStrategy):
         timeout_seconds: float = 30.0,
         price_improve_cents: int = 0,
     ) -> None:
-        self._timeout = timeout_seconds
         self._improve = Decimal(str(price_improve_cents)) / Decimal("100")
 
     async def execute(
@@ -163,24 +163,9 @@ class PassiveStrategy(ExecutionStrategy):
             contracts=size_result.contracts,
         )
 
-        # Wait for fill or timeout
-        filled = await self._wait_for_fill(order, order_manager)
-        if not filled:
-            try:
-                await order_manager.cancel_order(order.order_id)
-                logger.info(
-                    "passive.timeout_cancel",
-                    order_id=order.order_id,
-                    timeout=self._timeout,
-                )
-            except Exception:
-                logger.warning(
-                    "passive.cancel_failed",
-                    order_id=order.order_id,
-                    exc_info=True,
-                )
-            return None
-
+        # Return immediately — let the order rest in the book.
+        # The engine's stale order check will cancel orders whose edge
+        # has evaporated on the next evaluation cycle.
         return order
 
     def _compute_passive_price(
@@ -213,24 +198,6 @@ class PassiveStrategy(ExecutionStrategy):
             price = _ONE - no_bid
 
         return price
-
-    async def _wait_for_fill(
-        self, order: Order, order_manager: OrderManager
-    ) -> bool:
-        """Poll order status until filled or timeout."""
-        deadline = asyncio.get_event_loop().time() + self._timeout
-        poll_interval = 0.5
-
-        while asyncio.get_event_loop().time() < deadline:
-            # Check if the order is still in open orders
-            open_orders = order_manager.get_open_orders()
-            still_open = any(o.order_id == order.order_id for o in open_orders)
-            if not still_open:
-                # Order was removed from open orders => filled or cancelled
-                return True
-            await asyncio.sleep(poll_interval)
-
-        return False
 
 
 # ---------------------------------------------------------------------------

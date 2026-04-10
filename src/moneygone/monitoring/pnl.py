@@ -129,7 +129,7 @@ class PnLTracker:
             Market category for attribution.
         """
         record = _TradeRecord(
-            trade_id=fill.trade_id,
+            trade_id=fill.fill_id,
             ticker=fill.ticker,
             side=fill.side.value,
             action=fill.action.value,
@@ -160,22 +160,23 @@ class PnLTracker:
         settlement:
             Exchange settlement object.
         """
+        revenue_dollars = float(settlement.revenue) / 100  # cents to dollars
         self._settlements[settlement.ticker] = (
             settlement.market_result.value,
-            float(settlement.payout),
+            revenue_dollars,
         )
 
         # Retroactively update trade records for this ticker
         for trade in self._trades:
             if trade.ticker == settlement.ticker:
                 trade.settlement_result = settlement.market_result.value
-                trade.settlement_payout = float(settlement.payout)
+                trade.settlement_payout = revenue_dollars
 
         log.debug(
             "pnl.settlement_recorded",
             ticker=settlement.ticker,
             result=settlement.market_result.value,
-            payout=float(settlement.payout),
+            revenue=revenue_dollars,
         )
 
     # ------------------------------------------------------------------

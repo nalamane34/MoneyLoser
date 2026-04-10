@@ -54,7 +54,6 @@ from moneygone.exchange.types import (
     QueuePosition,
     Series,
     Settlement,
-    SettlementStatus,
     Side,
     StructuredTarget,
     Trade,
@@ -123,7 +122,15 @@ def _market_status(value: str | None) -> MarketStatus:
     """Convert raw market status strings into a ``MarketStatus`` enum."""
     normalized = (value or MarketStatus.OPEN.value).strip().lower()
     aliases = {
+        "open": MarketStatus.OPEN,
         "active": MarketStatus.OPEN,
+        "initialized": MarketStatus.CLOSED,
+        "inactive": MarketStatus.CLOSED,
+        "closed": MarketStatus.CLOSED,
+        "disputed": MarketStatus.CLOSED,
+        "amended": MarketStatus.CLOSED,
+        "settled": MarketStatus.SETTLED,
+        "determined": MarketStatus.SETTLED,
         "finalized": MarketStatus.SETTLED,
         "resolved": MarketStatus.SETTLED,
     }
@@ -133,7 +140,7 @@ def _market_status(value: str | None) -> MarketStatus:
         return MarketStatus(normalized)
     except ValueError:
         log.warning("rest_client.unknown_market_status", raw_status=value)
-        return MarketStatus.OPEN
+        return MarketStatus.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +310,29 @@ class KalshiRestClient:
             subtitle=data.get("subtitle", ""),
             yes_sub_title=data.get("yes_sub_title", ""),
             no_sub_title=data.get("no_sub_title", ""),
+            created_time=_ts(data.get("created_time")) if data.get("created_time") else None,
+            open_time=_ts(data.get("open_time")) if data.get("open_time") else None,
+            previous_price=_dec(data.get("previous_price_dollars", data.get("previous_price"))),
+            liquidity_dollars=_money(
+                data.get("liquidity_dollars"),
+                data.get("liquidity"),
+            ),
+            no_bid=_dec(data.get("no_bid_dollars", 0)),
+            no_ask=_dec(data.get("no_ask_dollars", 0)),
+            volume_24h=int(float(str(data.get("volume_24h_fp", data.get("volume_24h", 0))))),
+            market_type=str(data.get("market_type", "") or ""),
+            strike_type=str(data.get("strike_type", "") or ""),
+            floor_strike=(
+                _dec(data.get("floor_strike"))
+                if data.get("floor_strike") not in (None, "")
+                else None
+            ),
+            cap_strike=(
+                _dec(data.get("cap_strike"))
+                if data.get("cap_strike") not in (None, "")
+                else None
+            ),
+            mve_selected_legs=tuple(data.get("mve_selected_legs", ()) or ()),
         )
 
     @staticmethod
@@ -313,39 +343,67 @@ class KalshiRestClient:
             side=Side(data["side"]),
             action=Action(data["action"]),
             status=OrderStatus(data.get("status", "pending")),
-            count=int(data.get("count", 0)),
-            remaining_count=int(data.get("remaining_count", 0)),
+            count=int(float(str(data.get("initial_count_fp", data.get("count", 0))) or 0)),
+            remaining_count=int(
+                float(str(data.get("remaining_count_fp", data.get("remaining_count", 0))) or 0)
+            ),
             price=_dec(data.get("yes_price_dollars", data.get("yes_price"))),
+            no_price=_dec(data.get("no_price_dollars", 0)),
+            fill_count=int(float(str(data.get("fill_count_fp", 0)) or 0)),
+            order_type=str(data.get("type", "limit")),
             taker_fees=_dec(data.get("taker_fees_dollars", data.get("taker_fees", 0))),
             maker_fees=_dec(data.get("maker_fees_dollars", data.get("maker_fees", 0))),
+            taker_fill_cost=_dec(data.get("taker_fill_cost_dollars", 0)),
+            maker_fill_cost=_dec(data.get("maker_fill_cost_dollars", 0)),
             created_time=_ts(data.get("created_time")),
+            expiration_time=_ts(data["expiration_time"]) if data.get("expiration_time") else None,
+            last_update_time=_ts(data["last_update_time"]) if data.get("last_update_time") else None,
+            client_order_id=data.get("client_order_id", ""),
+            order_group_id=data.get("order_group_id", ""),
         )
 
     @staticmethod
     def _parse_position(data: dict[str, Any]) -> Position:
+        # API returns position_fp (positive=YES, negative=NO)
+        pos_raw = data.get("position_fp", None)
+        if pos_raw is not None:
+            position = int(float(str(pos_raw)))
+        else:
+            # Legacy fallback
+            yes_c = int(data.get("yes_count", 0))
+            no_c = int(data.get("no_count", 0))
+            position = yes_c if yes_c > 0 else -no_c
+
         return Position(
             ticker=data["ticker"],
+            position=position,
+            market_exposure=_dec(data.get("market_exposure_dollars", 0)),
+            realized_pnl=_dec(data.get("realized_pnl_dollars", data.get("realized_pnl", 0))),
+            total_traded=_dec(data.get("total_traded_dollars", 0)),
+            fees_paid=_dec(data.get("fees_paid_dollars", 0)),
+            last_updated_ts=_ts(data["last_updated_ts"]) if data.get("last_updated_ts") else None,
             event_ticker=data.get("event_ticker", ""),
             market_result=_market_result(data.get("market_result")),
-            yes_count=int(data.get("yes_count", 0)),
-            no_count=int(data.get("no_count", 0)),
-            realized_pnl=_dec(data.get("realized_pnl_dollars", data.get("realized_pnl", 0))),
-            settlement_status=SettlementStatus(data.get("settlement_status", "unsettled")),
+            resting_orders_count=int(data.get("resting_orders_count", 0)),
         )
 
     @staticmethod
     def _parse_fill(data: dict[str, Any]) -> Fill:
+        fill_id = data.get("fill_id", data.get("trade_id", ""))
         return Fill(
-            trade_id=data["trade_id"],
-            ticker=data["ticker"],
+            fill_id=fill_id,
+            ticker=data.get("ticker", data.get("market_ticker", "")),
             side=Side(data["side"]),
             action=Action(data["action"]),
-            count=int(data.get("count", 0)),
+            count=int(float(str(data.get("count_fp", data.get("count", 0))))),
             price=_dec(data.get("yes_price_dollars", data.get("yes_price"))),
+            no_price=_dec(data.get("no_price_dollars", 0)),
+            fee_cost=_dec(data.get("fee_cost", 0)),
             is_taker=bool(data.get("is_taker", False)),
             created_time=_ts(data.get("created_time")),
             order_id=data.get("order_id"),
             client_order_id=data.get("client_order_id"),
+            trade_id=data.get("trade_id", fill_id),
         )
 
     @staticmethod
@@ -366,9 +424,14 @@ class KalshiRestClient:
         return Settlement(
             ticker=data["ticker"],
             market_result=_market_result(data.get("market_result")),
-            revenue=_dec(data.get("revenue_dollars", data.get("revenue", 0))),
-            payout=_dec(data.get("payout_dollars", data.get("payout", 0))),
+            revenue=_dec(data.get("revenue", 0)),
             settled_time=_ts(data.get("settled_time")),
+            event_ticker=data.get("event_ticker", ""),
+            yes_count=int(float(str(data.get("yes_count_fp", 0)))),
+            no_count=int(float(str(data.get("no_count_fp", 0)))),
+            yes_total_cost=_dec(data.get("yes_total_cost_dollars", 0)),
+            no_total_cost=_dec(data.get("no_total_cost_dollars", 0)),
+            fee_cost=_dec(data.get("fee_cost", 0)),
         )
 
     @staticmethod
@@ -532,6 +595,7 @@ class KalshiRestClient:
         return Balance(
             available=available,
             total=total,
+            updated_ts=int(data.get("updated_ts", 0)),
         )
 
     async def get_positions(self, **filters: Any) -> list[Position]:

@@ -38,6 +38,49 @@ _LEAGUE_MARKERS = {
 }
 
 
+def recommended_max_line_age(fetch_interval_minutes: int) -> timedelta:
+    """Return a conservative freshness window for sportsbook lines.
+
+    We allow roughly two collection intervals plus a small grace period, but
+    never trust lines that are more than two hours old in live trading.
+    """
+    minutes = min(max(fetch_interval_minutes * 2 + 5, 30), 120)
+    return timedelta(minutes=minutes)
+
+
+# Map Kalshi ticker prefixes to sportsbook sport keys
+_TICKER_SPORT_MAP: dict[str, str] = {
+    "kxmlb": "mlb", "kxnba": "nba", "kxnhl": "nhl", "kxnfl": "nfl",
+    "kxncaabb": "ncaab", "kxncaafb": "ncaaf",
+    "kxepl": "soccer_epl", "kxmls": "soccer_usa_mls",
+    "kxlaliga": "soccer_spain_la_liga", "kxbundesliga": "soccer_germany_bundesliga",
+    "kxseriea": "soccer_italy_serie_a", "kxligue1": "soccer_france_ligue_one",
+    "kxucl": "soccer_ucl",
+    "kxkbo": "kbo", "kxnpb": "npb", "kxelh": "elh",
+    "kxipl": "ipl", "kxpsl": "psl",
+    "kxpga": "pga", "kxlpga": "lpga", "kxtennis": "tennis",
+}
+
+
+def _sport_from_ticker(ticker: str) -> str:
+    """Extract the sport from a Kalshi ticker prefix."""
+    t = ticker.lower()
+    for prefix, sport in _TICKER_SPORT_MAP.items():
+        if t.startswith(prefix):
+            return sport
+    return ""
+
+
+def _sports_compatible(ticker_sport: str, row_sport: str) -> bool:
+    """Check if a ticker sport and sportsbook sport are compatible."""
+    if ticker_sport == row_sport:
+        return True
+    # Soccer leagues are all compatible with each other
+    if ticker_sport.startswith("soccer") and row_sport.startswith("soccer"):
+        return True
+    return False
+
+
 def _to_utc(value: datetime | str | None) -> datetime | None:
     if value is None:
         return None
@@ -55,7 +98,7 @@ def _to_utc(value: datetime | str | None) -> datetime | None:
 
 
 def _normalize_team_name(value: str) -> str:
-    cleaned = value.lower().replace("&", " and ")
+    cleaned = value.lower().replace("&", " and ").replace(".", "")
     replacements = {
         "los angeles": "la",
         "new york": "ny",
@@ -64,6 +107,18 @@ def _normalize_team_name(value: str) -> str:
     for old, new in replacements.items():
         cleaned = cleaned.replace(old, new)
     return _NON_ALNUM_RE.sub("", cleaned)
+
+
+_TEAM_ABBREVIATIONS: dict[str, list[str]] = {
+    "white sox": ["cws", "chicagows", "whitesox"],
+    "red sox": ["bos", "bostonredsox", "redsox"],
+    "blue jays": ["tor", "torontobluejays", "bluejays"],
+    "athletics": ["ath", "oaklandathletics"],
+    "diamondbacks": ["ari", "arizonadiamondbacks", "dbacks"],
+    "trail blazers": ["por", "portlandtrailblazers", "blazers"],
+    "golden knights": ["vgk", "vegasgoldenknights"],
+    "maple leafs": ["tor", "torontomapleleafs", "leafs"],
+}
 
 
 def _team_aliases(value: str) -> set[str]:
@@ -86,17 +141,91 @@ def _team_aliases(value: str) -> set[str]:
             aliases.add(city)
     elif words:
         aliases.add(words[0])
+
+    # Add common abbreviation aliases
+    value_lower = value.lower()
+    for pattern, extra in _TEAM_ABBREVIATIONS.items():
+        if pattern in value_lower:
+            aliases.update(extra)
+
     return {alias for alias in aliases if len(alias) >= 3}
 
 
 def _matches_alias(value: str, aliases: set[str]) -> bool:
-    if not value:
+    if not value or len(value) < 2:
         return False
-    return any(value == alias or (len(value) >= 4 and value in alias) for alias in aliases)
+    return any(
+        value == alias
+        or (len(value) >= 4 and value in alias)
+        or (len(alias) >= 4 and alias in value)
+        for alias in aliases
+    )
 
 
 def _contains_alias(text: str, aliases: set[str]) -> bool:
     return any(alias in text for alias in aliases)
+
+
+# Common MLB/NBA/NHL/soccer ticker abbreviations → full team name fragments
+_TICKER_TEAM_MAP: dict[str, str] = {
+    # MLB
+    "ari": "arizona", "az": "arizona", "atl": "atlanta", "bal": "baltimore",
+    "bos": "boston", "chc": "cubs", "cws": "white sox", "cin": "cincinnati",
+    "cle": "cleveland", "col": "colorado", "det": "detroit", "hou": "houston",
+    "kc": "kansas city", "laa": "angels", "lad": "dodgers", "mia": "miami",
+    "mil": "milwaukee", "min": "minnesota", "nym": "mets", "nyy": "yankees",
+    "ath": "athletics", "phi": "philadelphia", "pit": "pittsburgh",
+    "sd": "san diego", "sf": "san francisco", "sea": "seattle",
+    "stl": "st louis", "tb": "tampa bay", "tex": "texas", "tor": "toronto",
+    "wsh": "washington",
+    # NBA
+    "bkn": "brooklyn", "dal": "dallas", "den": "denver", "gsw": "warriors",
+    "ind": "indiana", "lac": "clippers", "lal": "lakers", "mem": "memphis",
+    "nop": "pelicans", "nyk": "knicks", "okc": "thunder", "orl": "orlando",
+    "phx": "phoenix", "por": "portland", "sac": "sacramento", "sas": "spurs",
+    "uta": "utah",
+    # NHL
+    "ana": "anaheim", "buf": "buffalo", "car": "carolina", "cbj": "columbus",
+    "chi": "chicago", "edm": "edmonton", "fla": "florida", "lak": "kings",
+    "njd": "devils", "nsh": "nashville", "nyr": "rangers", "ott": "ottawa",
+    "pit": "pittsburgh", "sjk": "san jose", "stl": "st louis",
+    "tbl": "tampa bay", "van": "vancouver", "vgk": "vegas", "wpg": "winnipeg",
+    "wsh": "washington",
+}
+
+
+def _orient_from_ticker(
+    ticker: str, home_team: str, away_team: str,
+) -> str | None:
+    """Try to determine home/away from the ticker's team code suffix.
+
+    Kalshi tickers end with the YES team code, e.g.
+    ``KXMLBGAME-26APR121340ATHNYM-NYM`` → YES = NYM (Mets).
+    """
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    team_code = parts[-1].lower()
+
+    # Check if ticker code maps to a known team fragment
+    fragment = _TICKER_TEAM_MAP.get(team_code, team_code)
+    home_lower = home_team.lower()
+    away_lower = away_team.lower()
+
+    if fragment in home_lower or team_code in _normalize_team_name(home_team):
+        return "home"
+    if fragment in away_lower or team_code in _normalize_team_name(away_team):
+        return "away"
+
+    # Try the team code as an alias prefix
+    home_aliases = _team_aliases(home_team)
+    away_aliases = _team_aliases(away_team)
+    if any(team_code == a[:len(team_code)] for a in home_aliases if len(a) >= len(team_code)):
+        return "home"
+    if any(team_code == a[:len(team_code)] for a in away_aliases if len(a) >= len(team_code)):
+        return "away"
+
+    return None
 
 
 def _extract_priced_team(
@@ -312,14 +441,24 @@ class StoreBackedSportsSnapshotProvider:
         elif _contains_alias(market_text, away_aliases) and not _contains_alias(market_text, home_aliases):
             is_home_team = False
         else:
-            logger.debug(
-                "sports_snapshots.unoriented_market",
-                ticker=market.ticker,
-                title=market.title,
-                home_team=home_team,
-                away_team=away_team,
+            # Fallback: use the ticker suffix as team code
+            # e.g. KXMLBGAME-26APR121340ATHNYM-NYM → "nym"
+            ticker_team = _orient_from_ticker(
+                market.ticker, home_team, away_team,
             )
-            return None, "unoriented"
+            if ticker_team == "home":
+                is_home_team = True
+            elif ticker_team == "away":
+                is_home_team = False
+            else:
+                logger.debug(
+                    "sports_snapshots.unoriented_market",
+                    ticker=market.ticker,
+                    title=market.title,
+                    home_team=home_team,
+                    away_team=away_team,
+                )
+                return None, "unoriented"
 
         opening = opening_by_event.get(str(match.get("event_id", "")), {})
         ratings = ratings_by_league.get(league, {})
@@ -451,7 +590,16 @@ class StoreBackedSportsSnapshotProvider:
         best_score = -1
         best_time_delta = float("inf")
 
+        # Extract sport hint from ticker to avoid cross-sport false matches
+        ticker_sport = _sport_from_ticker(market.ticker)
+
         for row in latest_rows:
+            row_sport = str(row.get("sport", "")).lower()
+
+            # Skip cross-sport rows (e.g., don't match cricket to soccer)
+            if ticker_sport and row_sport and not _sports_compatible(ticker_sport, row_sport):
+                continue
+
             home_team = str(row.get("home_team", ""))
             away_team = str(row.get("away_team", ""))
             home_aliases = _team_aliases(home_team)
@@ -520,6 +668,9 @@ class StoreBackedSportsSnapshotProvider:
             "2h",
             "first half",
             "second half",
+            "first 5",
+            "f5",
+            "kxmlbf5",
             "spread",
             "total",
             "teamtotal",

@@ -77,6 +77,72 @@ async def _league_has_games_within_window(
         return True  # Default to fetching on failure
 
 
+async def collect_once(
+    config,
+    store: DataStore,
+    data_dir: Path,
+    *,
+    odds_feed: OddsAPIFeed,
+    stats_feed: PlayerStatsFeed,
+    reference_time: datetime | None = None,
+) -> None:
+    """Run a single sportsbook collection pass."""
+    leagues = [league.lower() for league in config.sportsbook.leagues]
+    reserve = config.sportsbook.min_requests_remaining
+
+    remaining = odds_feed.requests_remaining
+    if remaining is not None and remaining <= reserve:
+        log.warning("collector.quota_reserve", remaining=remaining, reserve=reserve)
+        return
+
+    now = reference_time or datetime.now(timezone.utc)
+    for league in leagues:
+        remaining = odds_feed.requests_remaining
+        if remaining is not None and remaining <= reserve:
+            log.warning("collector.stop_for_quota", league=league, remaining=remaining)
+            break
+
+        try:
+            has_games = await asyncio.wait_for(
+                _league_has_games_within_window(
+                    stats_feed,
+                    league,
+                    config.sportsbook.lookahead_hours,
+                    reference_time=now,
+                ),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning("collector.espn_check_timeout", league=league)
+            has_games = True
+
+        if not has_games:
+            log.info("collector.skip_no_games", league=league)
+            continue
+
+        games = await odds_feed.get_upcoming_games(
+            league,
+            bookmakers=list(config.sportsbook.bookmakers),
+            markets=list(config.sportsbook.markets),
+        )
+        rows = odds_feed.build_line_history_rows(league, games, captured_at=now)
+        store.insert_sportsbook_game_lines(rows)
+        log.info(
+            "collector.recorded",
+            league=league,
+            games=len(games),
+            rows=len(rows),
+            remaining=odds_feed.requests_remaining,
+        )
+
+    try:
+        parquet_path = data_dir / "sportsbook_lines.parquet"
+        store.export_table_to_parquet("sportsbook_game_lines", parquet_path)
+        log.debug("collector.parquet_exported", path=str(parquet_path))
+    except Exception:
+        log.debug("collector.parquet_export_failed", exc_info=True)
+
+
 async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
     """Main collection loop — fetches sportsbook lines on interval."""
     interval = max(1, config.sportsbook.fetch_interval_minutes) * 60
@@ -99,69 +165,22 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
         bookmakers=config.sportsbook.bookmakers,
     )
 
-    first_run = True
     try:
         while True:
             try:
-                remaining = odds_feed.requests_remaining
-                reserve = config.sportsbook.min_requests_remaining
-                if remaining is not None and remaining <= reserve:
-                    log.warning("collector.quota_reserve", remaining=remaining, reserve=reserve)
-                    await asyncio.sleep(interval)
-                    continue
-
-                now = datetime.now(timezone.utc)
-                for league in leagues:
-                    remaining = odds_feed.requests_remaining
-                    if remaining is not None and remaining <= reserve:
-                        log.warning("collector.stop_for_quota", league=league, remaining=remaining)
-                        break
-
-                    # Skip ESPN check on first run — always fetch initial lines
-                    if not first_run:
-                        try:
-                            has_games = await asyncio.wait_for(
-                                _league_has_games_within_window(
-                                    stats_feed, league, config.sportsbook.lookahead_hours, reference_time=now,
-                                ),
-                                timeout=15.0,
-                            )
-                        except asyncio.TimeoutError:
-                            log.warning("collector.espn_check_timeout", league=league)
-                            has_games = True
-                        if not has_games:
-                            log.info("collector.skip_no_games", league=league)
-                            continue
-
-                    games = await odds_feed.get_upcoming_games(
-                        league,
-                        bookmakers=list(config.sportsbook.bookmakers),
-                        markets=list(config.sportsbook.markets),
-                    )
-                    rows = odds_feed.build_line_history_rows(league, games, captured_at=now)
-                    store.insert_sportsbook_game_lines(rows)
-                    log.info(
-                        "collector.recorded",
-                        league=league,
-                        games=len(games),
-                        rows=len(rows),
-                        remaining=odds_feed.requests_remaining,
-                    )
-
-                # Export sportsbook data to parquet for cross-process access
-                try:
-                    parquet_path = data_dir / "sportsbook_lines.parquet"
-                    store.export_table_to_parquet("sportsbook_game_lines", parquet_path)
-                    log.debug("collector.parquet_exported", path=str(parquet_path))
-                except Exception:
-                    log.debug("collector.parquet_export_failed", exc_info=True)
+                await collect_once(
+                    config,
+                    store,
+                    data_dir,
+                    odds_feed=odds_feed,
+                    stats_feed=stats_feed,
+                )
 
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("collector.error")
 
-            first_run = False
             await asyncio.sleep(interval)
     finally:
         await odds_feed.close()

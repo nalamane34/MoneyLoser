@@ -161,16 +161,16 @@ class PortfolioTracker:
     def on_settlement(self, settlement: Settlement) -> None:
         """Update realized PnL when a market settles.
 
-        Settlement payout is added to cash; cost basis is written off.
+        Revenue (cents) is the net settlement P&L from the API.
         """
         pos = self._positions.get(settlement.ticker)
-        payout = settlement.payout
+        revenue_dollars = _dec(settlement.revenue) / 100  # API revenue is in cents
 
-        self._cash += payout
-        self._realized_pnl += settlement.revenue
+        self._cash += revenue_dollars
+        self._realized_pnl += revenue_dollars
 
         if pos is not None:
-            pos.realized_pnl += settlement.revenue
+            pos.realized_pnl += revenue_dollars
             pos.yes_count = 0
             pos.no_count = 0
             pos.yes_cost_basis = _ZERO
@@ -180,8 +180,7 @@ class PortfolioTracker:
             "settlement",
             ticker=settlement.ticker,
             result=settlement.market_result.value,
-            payout=str(payout),
-            revenue=str(settlement.revenue),
+            revenue=str(revenue_dollars),
         )
 
     # ------------------------------------------------------------------

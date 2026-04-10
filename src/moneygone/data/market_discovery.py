@@ -22,7 +22,7 @@ import json
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -69,12 +69,12 @@ _ECONOMICS_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _SPORTS_PATTERNS = re.compile(
-    r"nba|nfl|mlb|nhl|ncaa|game|winner|moneyline|"
-    r"championship|playoff|series|lakers|celtics|warriors|"
-    r"yankees|dodgers|chiefs|eagles|soccer|mls|epl|"
-    r"tennis|boxing|mma|ufc|golf|pga|lpga|esports|"
-    r"bundesliga|serie a|la liga|ligue 1|premier league|"
-    r"kbo|npb|total runs|spread|team total",
+    r"\b(?:nba|nfl|mlb|nhl|ncaa|moneyline|championship|playoff|soccer|mls|epl|"
+    r"tennis|boxing|mma|ufc|golf|pga|lpga|esports|bundesliga|serie a|la liga|"
+    r"ligue 1|premier league|kbo|npb|total runs|spread|team total)\b|"
+    r"\b(?:vs\.?|at)\b|"
+    r"\bkx(?:nba|mlb|nhl|nfl|ncaa|epl|mls|laliga|bundesliga|seriea|ligue1|ucl|"
+    r"kbo|npb|elh|pga|lpga|tennis|esports)",
     re.IGNORECASE,
 )
 _POLITICS_PATTERNS = re.compile(
@@ -103,9 +103,38 @@ _COMPANIES_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_CATEGORY_ALIASES: tuple[tuple[str, MarketCategory], ...] = (
+    ("crypto", MarketCategory.CRYPTO),
+    ("weather", MarketCategory.WEATHER),
+    ("climate", MarketCategory.WEATHER),
+    ("econom", MarketCategory.ECONOMICS),
+    ("politic", MarketCategory.POLITICS),
+    ("election", MarketCategory.POLITICS),
+    ("financial", MarketCategory.FINANCIALS),
+    ("stock", MarketCategory.FINANCIALS),
+    ("compan", MarketCategory.COMPANIES),
+    ("business", MarketCategory.COMPANIES),
+    ("tech", MarketCategory.COMPANIES),
+    ("sport", MarketCategory.SPORTS),
+)
+
+
+def _classify_explicit_category(raw_category: str) -> MarketCategory | None:
+    normalized = raw_category.strip().lower()
+    if not normalized:
+        return None
+    for token, category in _EXPLICIT_CATEGORY_ALIASES:
+        if token in normalized:
+            return category
+    return None
+
 
 def classify_market(market: Market) -> MarketCategory:
     """Classify a Kalshi market into a trading category."""
+    explicit = _classify_explicit_category(getattr(market, "category", ""))
+    if explicit is not None:
+        return explicit
+
     text = " ".join(
         v for v in [
             market.ticker,
@@ -114,7 +143,6 @@ def classify_market(market: Market) -> MarketCategory:
             market.title,
             market.subtitle,
             market.yes_sub_title,
-            getattr(market, "category", ""),
         ]
         if v
     )
@@ -122,16 +150,16 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.CRYPTO
     if _WEATHER_PATTERNS.search(text):
         return MarketCategory.WEATHER
-    if _SPORTS_PATTERNS.search(text):
-        return MarketCategory.SPORTS
     if _POLITICS_PATTERNS.search(text):
         return MarketCategory.POLITICS
-    if _FINANCIALS_PATTERNS.search(text):
-        return MarketCategory.FINANCIALS
-    if _COMPANIES_PATTERNS.search(text):
-        return MarketCategory.COMPANIES
     if _ECONOMICS_PATTERNS.search(text):
         return MarketCategory.ECONOMICS
+    if _COMPANIES_PATTERNS.search(text):
+        return MarketCategory.COMPANIES
+    if _FINANCIALS_PATTERNS.search(text):
+        return MarketCategory.FINANCIALS
+    if _SPORTS_PATTERNS.search(text):
+        return MarketCategory.SPORTS
     return MarketCategory.UNKNOWN
 
 
@@ -160,6 +188,14 @@ def _market_to_dict(market: Market, category: MarketCategory) -> dict[str, Any]:
         "result": market.result.value,
         "category": market.category,
         "market_category": category.value,
+        "created_time": market.created_time.isoformat() if market.created_time else None,
+        "open_time": market.open_time.isoformat() if market.open_time else None,
+        "previous_price": str(market.previous_price),
+        "liquidity_dollars": str(market.liquidity_dollars),
+        "strike_type": market.strike_type,
+        "floor_strike": str(market.floor_strike) if market.floor_strike is not None else None,
+        "cap_strike": str(market.cap_strike) if market.cap_strike is not None else None,
+        "mve_selected_legs": list(market.mve_selected_legs),
     }
 
 
@@ -182,6 +218,30 @@ def _dict_to_market(d: dict[str, Any]) -> tuple[Market, MarketCategory]:
         close_time=datetime.fromisoformat(d["close_time"]),
         result=MarketResult(d["result"]),
         category=d.get("category", ""),
+        created_time=(
+            datetime.fromisoformat(d["created_time"])
+            if d.get("created_time")
+            else None
+        ),
+        open_time=(
+            datetime.fromisoformat(d["open_time"])
+            if d.get("open_time")
+            else None
+        ),
+        previous_price=Decimal(d.get("previous_price", "0")),
+        liquidity_dollars=Decimal(d.get("liquidity_dollars", "0")),
+        strike_type=d.get("strike_type", ""),
+        floor_strike=(
+            Decimal(d["floor_strike"])
+            if d.get("floor_strike") is not None
+            else None
+        ),
+        cap_strike=(
+            Decimal(d["cap_strike"])
+            if d.get("cap_strike") is not None
+            else None
+        ),
+        mve_selected_legs=tuple(d.get("mve_selected_legs", []) or []),
     )
     cat = MarketCategory(d["market_category"])
     return market, cat
@@ -204,12 +264,12 @@ class MarketDiscoveryService:
         rest_client: KalshiRestClient,
         cache_path: Path,
         refresh_interval: float = 120.0,
-        max_pages: int = 20,
+        max_pages: int = 0,
     ) -> None:
         self._rest = rest_client
         self._cache_path = cache_path
         self._refresh_interval = refresh_interval
-        self._max_pages = max_pages  # 20 pages × 1000 = up to 20k markets
+        self._max_pages = max_pages
         self._markets: list[tuple[Market, MarketCategory]] = []
         self._task: asyncio.Task | None = None
         self._refreshed_at: datetime | None = None
@@ -241,69 +301,18 @@ class MarketDiscoveryService:
 
     # -- core --
 
-    # Sports series that the paginated bulk fetch often misses because
-    # they sort beyond the ``max_pages`` window.
-    _SPORTS_SERIES: list[str] = [
-        # US major leagues — game winners
-        "KXNBAGAME", "KXMLBGAME", "KXNHLGAME", "KXNFLGAME",
-        "KXNCAABBGAME", "KXNCAAFBGAME",
-        # US major leagues — totals, spreads, team totals
-        "KXNBATOTAL", "KXMLBTOTAL", "KXNHLTOTAL", "KXNFLTOTAL",
-        "KXNBASPREAD", "KXMLBSPREAD", "KXNHLSPREAD", "KXNFLSPREAD",
-        "KXNBATEAMTOTAL", "KXMLBTEAMTOTAL",
-        # Soccer
-        "KXEPLGAME", "KXMLSGAME", "KXLALIGAGAME",
-        "KXBUNDESLIGAGAME", "KXSERIEAGAME", "KXLIGUE1GAME", "KXUCLGAME",
-        # International baseball / hockey
-        "KXKBOGAME", "KXNPBGAME", "KXELHGAME",
-        # Golf, tennis, esports
-        "KXPGA", "KXLPGA", "KXTENNIS", "KXESPORTS",
-    ]
-
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
-        """Fetch near-term open markets from Kalshi, classify, write cache.
-
-        Uses ``max_close_ts`` to only fetch markets closing within 72h.
-        The Kalshi API doesn't allow combining close_ts with status=open,
-        so we filter out non-open markets client-side.
-
-        Also fetches sports game-winner series explicitly since they often
-        fall outside the first ``max_pages`` of the bulk endpoint.
-        """
+        """Fetch all open markets from Kalshi, classify, and write cache."""
         now = datetime.now(timezone.utc)
-        # 7 days: sports markets close 2-3 days after the event, so
-        # 72h misses games more than 1-2 days out.
-        max_close = int((now + timedelta(days=7)).timestamp())
-
         markets = await self._rest.get_all_markets(
-            limit=1000,
+            limit=1_000,
             max_pages=self._max_pages,
-            max_close_ts=max_close,
+            status="open",
             mve_filter="exclude",  # Skip multivariate combos (KXMVE*)
         )
 
-        # Targeted fetch for sports series that may be beyond the page window
-        seen_tickers = {m.ticker for m in markets}
-        for series in self._SPORTS_SERIES:
-            try:
-                sports_batch = await self._rest.get_all_markets(
-                    limit=1000,
-                    max_pages=3,
-                    max_close_ts=max_close,
-                    series_ticker=series,
-                )
-                added = 0
-                for m in sports_batch:
-                    if m.ticker not in seen_tickers:
-                        markets.append(m)
-                        seen_tickers.add(m.ticker)
-                        added += 1
-                if added:
-                    log.debug("market_discovery.sports_series_added", series=series, added=added)
-            except Exception:
-                log.debug("market_discovery.sports_series_failed", series=series, exc_info=True)
-
-        # Filter to only open/active markets (API can't combine close_ts + status)
+        # Guard against aliasing bugs or stale cached payloads by keeping
+        # only currently tradeable markets here as well.
         classified: list[tuple[Market, MarketCategory]] = []
         category_counts: dict[str, int] = {}
         skipped_closed = 0

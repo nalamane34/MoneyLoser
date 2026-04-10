@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import pickle
 import signal
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +31,10 @@ from moneygone.config import AppConfig
 from moneygone.data.crypto.ccxt_feed import CryptoDataFeed
 from moneygone.data.market_data import MarketDataRecorder
 from moneygone.data.sports.espn import ESPNLiveFeed
-from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvider
+from moneygone.data.sports.live_snapshots import (
+    StoreBackedSportsSnapshotProvider,
+    recommended_max_line_age,
+)
 from moneygone.data.sports.live_weather import LiveWeatherFeed
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
@@ -518,11 +520,8 @@ def build_app(config: AppConfig) -> Application:
             store,
             leagues=config.sportsbook.leagues,
             rest_client=rest_client,
-            max_line_age=timedelta(
-                hours=max(
-                    config.sportsbook.lookahead_hours,
-                    max(2, config.sportsbook.fetch_interval_minutes // 60 + 1),
-                )
+            max_line_age=recommended_max_line_age(
+                config.sportsbook.fetch_interval_minutes,
             ),
         )
         async_closeables.append(sports_provider)

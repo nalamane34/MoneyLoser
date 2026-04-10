@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import signal
 import sys
-from datetime import timedelta
 from pathlib import Path
 
 import structlog
@@ -27,11 +26,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from moneygone.config import load_config
 from moneygone.data.schemas import EXECUTION_TABLES
-from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvider
+from moneygone.data.sports.live_snapshots import (
+    StoreBackedSportsSnapshotProvider,
+    recommended_max_line_age,
+)
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.data.market_discovery import MarketCategory
+from moneygone.execution.artifact_runtime import (
+    ArtifactFeaturePipeline,
+    load_default_artifact_model,
+    universal_category_id,
+)
 from moneygone.execution.category_providers import CryptoDataProvider, WeatherDataProvider
 from moneygone.execution.engine import (
     CategoryProvider,
@@ -179,8 +186,8 @@ async def main() -> None:
         store,
         leagues=config.sportsbook.leagues,
         rest_client=rest_client,
-        max_line_age=timedelta(
-            hours=max(config.sportsbook.lookahead_hours, 2),
+        max_line_age=recommended_max_line_age(
+            config.sportsbook.fetch_interval_minutes,
         ),
     )
 
@@ -290,6 +297,51 @@ async def main() -> None:
             log.warning("execution.weather_provider_unavailable")
         except Exception:
             log.warning("execution.weather_provider_failed", exc_info=True)
+
+    model_root = Path(config.model.model_dir)
+    universal_model = load_default_artifact_model(
+        model_root,
+        [
+            "trained/gbm_universal/model.pkl",
+            "trained/logistic_universal/model.pkl",
+        ],
+        model_name="market_universal",
+    )
+    if universal_model is not None:
+        for category in (
+            MarketCategory.FINANCIALS,
+            MarketCategory.ECONOMICS,
+            MarketCategory.POLITICS,
+            MarketCategory.COMPANIES,
+            MarketCategory.UNKNOWN,
+        ):
+            category_providers[category] = CategoryProvider(
+                category=category,
+                model=universal_model,
+                pipeline=ArtifactFeaturePipeline(
+                    universal_model.feature_names,
+                    category_id=(
+                        universal_category_id(category)
+                        if "category_id" in universal_model.feature_names
+                        else None
+                    ),
+                ),
+                get_context_data=None,
+            )
+        log.info(
+            "execution.universal_market_provider_enabled",
+            categories=[
+                MarketCategory.FINANCIALS.value,
+                MarketCategory.ECONOMICS.value,
+                MarketCategory.POLITICS.value,
+                MarketCategory.COMPANIES.value,
+                MarketCategory.UNKNOWN.value,
+            ],
+            model=universal_model.name,
+            version=universal_model.version,
+        )
+    else:
+        log.warning("execution.universal_market_provider_unavailable", model_dir=str(model_root))
 
     log.info(
         "execution.category_providers",

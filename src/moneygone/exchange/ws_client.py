@@ -440,12 +440,73 @@ class KalshiWebSocket:
             "id": sid,
             "cmd": "subscribe",
             "params": {
-                "channels": ["market_position"],
+                "channels": ["market_positions"],
             },
         }
         self._subscriptions[sid] = cmd
         await self._send(cmd)
         log.info("ws_client.subscribed_positions", sid=sid)
+        return sid
+
+    async def subscribe_market_lifecycle(self, tickers: list[str]) -> int:
+        """Subscribe to market lifecycle events (status changes, settlements)."""
+        sid = self._alloc_sid()
+        cmd: dict[str, Any] = {
+            "id": sid,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["market_lifecycle_v2"],
+                "market_tickers": tickers,
+            },
+        }
+        self._subscriptions[sid] = cmd
+        await self._send(cmd)
+        log.info("ws_client.subscribed_lifecycle", tickers=tickers, sid=sid)
+        return sid
+
+    async def subscribe_user_orders(self) -> int:
+        """Subscribe to user order updates (new, filled, cancelled)."""
+        sid = self._alloc_sid()
+        cmd: dict[str, Any] = {
+            "id": sid,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["user_orders"],
+            },
+        }
+        self._subscriptions[sid] = cmd
+        await self._send(cmd)
+        log.info("ws_client.subscribed_user_orders", sid=sid)
+        return sid
+
+    async def subscribe_order_group_updates(self) -> int:
+        """Subscribe to order group lifecycle events."""
+        sid = self._alloc_sid()
+        cmd: dict[str, Any] = {
+            "id": sid,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["order_group_updates"],
+            },
+        }
+        self._subscriptions[sid] = cmd
+        await self._send(cmd)
+        log.info("ws_client.subscribed_order_group_updates", sid=sid)
+        return sid
+
+    async def subscribe_communications(self) -> int:
+        """Subscribe to exchange announcements and communications."""
+        sid = self._alloc_sid()
+        cmd: dict[str, Any] = {
+            "id": sid,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["communications"],
+            },
+        }
+        self._subscriptions[sid] = cmd
+        await self._send(cmd)
+        log.info("ws_client.subscribed_communications", sid=sid)
         return sid
 
     async def unsubscribe(self, sid: int) -> None:

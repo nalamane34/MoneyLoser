@@ -24,12 +24,14 @@ def _fill(
     price: str,
 ) -> Fill:
     return Fill(
-        trade_id=trade_id,
+        fill_id=trade_id,
         ticker=ticker,
         side=side,
         action=action,
         count=count,
         price=Decimal(price),
+        no_price=Decimal("1") - Decimal(price),
+        fee_cost=Decimal("0"),
         is_taker=True,
         created_time=datetime(2026, 4, 9, tzinfo=timezone.utc),
     )

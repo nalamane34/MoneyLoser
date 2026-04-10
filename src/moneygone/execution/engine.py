@@ -169,6 +169,7 @@ class ExecutionEngine:
         self._decision_context: dict[str, TradeDecision] = {}
         self._decision_context_by_client_order_id: dict[str, TradeDecision] = {}
         self._last_universe_refresh: datetime | None = None
+        self._last_order_reconcile: datetime | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -199,18 +200,18 @@ class ExecutionEngine:
         except Exception:
             logger.warning("engine.portfolio_sync_failed", exc_info=True)
 
+        await self._maybe_reconcile_open_orders(force=True)
+
         self._ws.set_on_event(self.on_event)
         await self._refresh_market_universe(force=True)
 
-        # Connect WebSocket and subscribe to channels
+        # Connect WebSocket and subscribe to essential channels only.
+        # Subscribing to orderbook/ticker/trades for 10K+ tickers hangs
+        # the connection — we fetch orderbooks on-demand via REST instead.
         await self._ws.connect()
         await self._ws.wait_connected()
-
-        if self._watched:
-            await self._ws.subscribe_orderbook(self._watched)
-            await self._ws.subscribe_ticker(self._watched)
-            await self._ws.subscribe_trades(self._watched)
         await self._ws.subscribe_fills()
+        await self._ws.subscribe_positions()
 
         # Launch periodic evaluation
         self._eval_task = asyncio.create_task(self._periodic_evaluation_loop())
@@ -275,17 +276,22 @@ class ExecutionEngine:
     async def _handle_fill_event(self, event: WSEvent) -> None:
         """Process a fill notification from the WebSocket."""
         data = event.data
+        fill_id = data.get("fill_id", data.get("trade_id", ""))
+        count_raw = data.get("count_fp", data.get("count", 0))
         fill = Fill(
-            trade_id=data.get("trade_id", ""),
+            fill_id=fill_id,
             ticker=data.get("market_ticker", data.get("ticker", "")),
             side=Side(data.get("side", "yes")),
             action=Action(data.get("action", "buy")),
-            count=int(data.get("count", 0)),
+            count=int(float(str(count_raw))),
             price=Decimal(str(data.get("yes_price_dollars", data.get("yes_price", 0)))),
+            no_price=Decimal(str(data.get("no_price_dollars", 0))),
+            fee_cost=Decimal(str(data.get("fee_cost", 0))),
             is_taker=bool(data.get("is_taker", False)),
             created_time=event.timestamp or datetime.now(timezone.utc),
             order_id=data.get("order_id"),
             client_order_id=data.get("client_order_id"),
+            trade_id=data.get("trade_id", fill_id),
         )
 
         # Update order manager
@@ -299,7 +305,7 @@ class ExecutionEngine:
 
         logger.info(
             "engine.fill_received",
-            trade_id=fill.trade_id,
+            fill_id=fill.fill_id,
             ticker=fill.ticker,
             count=fill.count,
             price=str(fill.price),
@@ -374,6 +380,10 @@ class ExecutionEngine:
         """
         now = datetime.now(timezone.utc)
 
+        if any(order.ticker == ticker for order in self._orders.get_open_orders()):
+            logger.debug("engine.open_order_exists", ticker=ticker)
+            return None
+
         # 1. Get current orderbook (try WS first, fall back to REST)
         orderbook = self._ws.get_orderbook(ticker)
         if orderbook is None:
@@ -400,6 +410,7 @@ class ExecutionEngine:
         # 2. Determine market category and get the right model/pipeline
         category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
         provider = self._category_providers.get(category)
+        sports_snapshot: dict[str, Any] | None = None
 
         if provider is not None:
             # Use category-specific model + pipeline + data provider
@@ -480,6 +491,24 @@ class ExecutionEngine:
                 "engine.edge_not_actionable",
                 ticker=ticker,
                 net_edge=edge.fee_adjusted_edge,
+            )
+            return None
+
+        duplicate = await self._find_duplicate_exposure(
+            ticker,
+            edge.side,
+            action=edge.action,
+            sports_snapshot=sports_snapshot,
+        )
+        if duplicate is not None:
+            logger.info(
+                "engine.duplicate_exposure_blocked",
+                ticker=ticker,
+                side=edge.side,
+                conflict_kind=duplicate["kind"],
+                conflict_ticker=duplicate["ticker"],
+                conflict_side=duplicate.get("side"),
+                conflict_contracts=duplicate.get("contracts"),
             )
             return None
 
@@ -609,6 +638,7 @@ class ExecutionEngine:
             try:
                 await asyncio.sleep(interval)
                 await self._refresh_market_universe()
+                await self._maybe_reconcile_open_orders()
 
                 for ticker in self._watched:
                     if not self._running:
@@ -682,12 +712,11 @@ class ExecutionEngine:
                     cache_used = True
                     logger.debug("engine.using_discovery_cache", age_s=int(age), markets=len(markets))
 
-        # Fallback: fetch directly via REST — only markets closing within 72h
+        # Fallback: fetch directly via REST for all open markets
         if not markets:
-            from datetime import timedelta
-            max_close = int((now + timedelta(hours=72)).timestamp())
             all_fetched = await self._rest.get_all_markets(
-                limit=1000, max_pages=20, max_close_ts=max_close,
+                limit=1_000,
+                status="open",
                 mve_filter="exclude",
             )
             markets = [m for m in all_fetched if m.status == MarketStatus.OPEN]
@@ -730,8 +759,6 @@ class ExecutionEngine:
             if market.ticker in self._market_cache:
                 continue  # Already matched as sports
 
-            if category == MarketCategory.UNKNOWN:
-                continue
             if category not in self._category_providers:
                 continue
 
@@ -747,10 +774,9 @@ class ExecutionEngine:
                 new_tickers.append(market.ticker)
             category_counts[category.value] = category_counts.get(category.value, 0) + 1
 
-        if self._ws.is_connected and new_tickers:
-            await self._ws.subscribe_orderbook(new_tickers)
-            await self._ws.subscribe_ticker(new_tickers)
-            await self._ws.subscribe_trades(new_tickers)
+        # NOTE: We do NOT subscribe to WS orderbook/ticker/trades for all
+        # watched tickers — subscribing to 10K+ tickers is infeasible.
+        # The eval loop fetches orderbooks via REST on-demand instead.
 
         self._last_universe_refresh = now
         logger.info(
@@ -769,6 +795,242 @@ class ExecutionEngine:
         if market is None:
             return None
         return await self._sports.get_snapshot(market)
+
+    async def _find_duplicate_exposure(
+        self,
+        ticker: str,
+        side: str,
+        *,
+        action: str = "buy",
+        sports_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Block same-ticker resting orders and equivalent event exposure."""
+        for order in self._orders.get_open_orders():
+            if order.ticker == ticker:
+                return {
+                    "kind": "open_order_same_ticker",
+                    "ticker": order.ticker,
+                    "side": order.side.value,
+                    "action": order.action.value,
+                }
+
+        outcome_key = await self._outcome_key_for_trade(
+            ticker,
+            side,
+            action=action,
+            sports_snapshot=sports_snapshot,
+        )
+        if outcome_key is None:
+            return None
+
+        for order in self._orders.get_open_orders():
+            if order.ticker == ticker:
+                continue
+            other_key = await self._outcome_key_for_trade(
+                order.ticker,
+                order.side.value,
+                action=order.action.value,
+            )
+            if other_key == outcome_key:
+                return {
+                    "kind": "equivalent_open_order",
+                    "ticker": order.ticker,
+                    "side": order.side.value,
+                    "action": order.action.value,
+                }
+
+        for other_ticker, position in self._risk._portfolio.positions.items():
+            if other_ticker == ticker:
+                continue
+            if position.yes_count > 0:
+                other_key = await self._outcome_key_for_trade(
+                    other_ticker,
+                    "yes",
+                    action="buy",
+                )
+                if other_key == outcome_key:
+                    return {
+                        "kind": "equivalent_position",
+                        "ticker": other_ticker,
+                        "side": "yes",
+                        "contracts": position.yes_count,
+                    }
+            if position.no_count > 0:
+                other_key = await self._outcome_key_for_trade(
+                    other_ticker,
+                    "no",
+                    action="buy",
+                )
+                if other_key == outcome_key:
+                    return {
+                        "kind": "equivalent_position",
+                        "ticker": other_ticker,
+                        "side": "no",
+                        "contracts": position.no_count,
+                    }
+
+        return None
+
+    async def _outcome_key_for_trade(
+        self,
+        ticker: str,
+        side: str,
+        *,
+        action: str = "buy",
+        sports_snapshot: dict[str, Any] | None = None,
+    ) -> tuple[str, str, str] | None:
+        market = await self._get_market(ticker)
+        if market is None:
+            return None
+
+        event_key = await self._event_outcome_key(
+            market,
+            side,
+            action=action,
+        )
+        if event_key is not None:
+            return event_key
+
+        if sports_snapshot is None:
+            sports_snapshot = await self._get_sports_snapshot(ticker)
+        return self._sports_outcome_key(
+            ticker,
+            side,
+            sports_snapshot,
+            action=action,
+        )
+
+    async def _get_market(self, ticker: str) -> Market | None:
+        market = self._market_cache.get(ticker)
+        if market is not None:
+            return market
+
+        try:
+            market = await self._rest.get_market(ticker)
+        except Exception:
+            logger.debug("engine.market_lookup_failed", ticker=ticker, exc_info=True)
+            return None
+
+        self._market_cache[ticker] = market
+        return market
+
+    async def _event_outcome_key(
+        self,
+        market: Market,
+        side: str,
+        *,
+        action: str,
+    ) -> tuple[str, str, str] | None:
+        event_ticker = (market.event_ticker or "").strip()
+        own_label = self._normalize_outcome_label(market.yes_sub_title)
+        if not event_ticker or not own_label:
+            return None
+
+        event_markets = await self._get_event_markets(event_ticker)
+        labels = {
+            self._normalize_outcome_label(candidate.yes_sub_title)
+            for candidate in event_markets
+            if self._normalize_outcome_label(candidate.yes_sub_title)
+        }
+        if len(labels) != 2:
+            return None
+
+        wants_yes_outcome = (side == "yes" and action == "buy") or (
+            side == "no" and action == "sell"
+        )
+        if wants_yes_outcome:
+            return ("event_outcome", event_ticker, own_label)
+
+        other_labels = sorted(label for label in labels if label != own_label)
+        if len(other_labels) != 1:
+            return None
+        return ("event_outcome", event_ticker, other_labels[0])
+
+    async def _get_event_markets(self, event_ticker: str) -> list[Market]:
+        cached = {
+            market.ticker: market
+            for market in self._market_cache.values()
+            if market.event_ticker == event_ticker
+        }
+        if len(cached) >= 2:
+            return list(cached.values())
+
+        try:
+            fetched = await self._rest.get_markets(event_ticker=event_ticker)
+        except Exception:
+            logger.debug(
+                "engine.event_markets_lookup_failed",
+                event_ticker=event_ticker,
+                exc_info=True,
+            )
+            return list(cached.values())
+
+        for market in fetched:
+            self._market_cache[market.ticker] = market
+            cached[market.ticker] = market
+
+        return list(cached.values())
+
+    @staticmethod
+    def _normalize_outcome_label(label: str | None) -> str:
+        if not label:
+            return ""
+        return " ".join(label.strip().lower().split())
+
+    def _sports_outcome_key(
+        self,
+        ticker: str,
+        side: str,
+        sports_snapshot: dict[str, Any] | None,
+        *,
+        action: str = "buy",
+    ) -> tuple[str, str, str] | None:
+        if sports_snapshot is None:
+            return None
+
+        market = self._market_cache.get(ticker)
+        if market is None:
+            return None
+
+        event_id = str(sports_snapshot.get("event_id") or market.event_ticker or "")
+        if not event_id:
+            return None
+
+        try:
+            is_home_team = bool(int(sports_snapshot.get("is_home_team", 0)))
+        except (TypeError, ValueError):
+            return None
+
+        longs_yes_side = (side == "yes" and action == "buy") or (
+            side == "no" and action == "sell"
+        )
+        chosen_home = longs_yes_side == is_home_team
+        winner = "home" if chosen_home else "away"
+        return ("sports_game_winner", event_id, winner)
+
+    async def _maybe_reconcile_open_orders(
+        self,
+        *,
+        force: bool = False,
+        min_interval_seconds: int = 60,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        if (
+            not force
+            and self._last_order_reconcile is not None
+            and (now - self._last_order_reconcile).total_seconds() < min_interval_seconds
+        ):
+            return
+
+        try:
+            await self._orders.reconcile()
+            self._last_order_reconcile = now
+            logger.info(
+                "engine.orders_reconciled",
+                open_orders=self._orders.open_order_count,
+            )
+        except Exception:
+            logger.warning("engine.orders_reconcile_failed", exc_info=True)
 
     def _resolve_decision_context(self, fill: Fill) -> TradeDecision | None:
         decision = None
@@ -856,6 +1118,54 @@ class ExecutionEngine:
                 subtitle=data.get("subtitle", existing.subtitle if existing is not None else ""),
                 yes_sub_title=data.get("yes_sub_title", existing.yes_sub_title if existing is not None else ""),
                 no_sub_title=data.get("no_sub_title", existing.no_sub_title if existing is not None else ""),
+                created_time=self._parse_timestamp(
+                    data.get("created_time"),
+                    fallback=existing.created_time if existing is not None else None,
+                ),
+                open_time=self._parse_timestamp(
+                    data.get("open_time"),
+                    fallback=existing.open_time if existing is not None else None,
+                ),
+                previous_price=self._decimal_field(
+                    data,
+                    "previous_price_dollars",
+                    "previous_price",
+                    fallback=existing.previous_price if existing is not None else _ZERO,
+                ),
+                liquidity_dollars=self._decimal_field(
+                    data,
+                    "liquidity_dollars",
+                    "liquidity",
+                    fallback=existing.liquidity_dollars if existing is not None else _ZERO,
+                ),
+                strike_type=str(data.get("strike_type", existing.strike_type if existing is not None else "") or ""),
+                floor_strike=(
+                    self._decimal_field(
+                        data,
+                        "floor_strike",
+                        "floor_strike",
+                        fallback=existing.floor_strike if existing is not None and existing.floor_strike is not None else _ZERO,
+                    )
+                    if data.get("floor_strike") is not None or (existing is not None and existing.floor_strike is not None)
+                    else None
+                ),
+                cap_strike=(
+                    self._decimal_field(
+                        data,
+                        "cap_strike",
+                        "cap_strike",
+                        fallback=existing.cap_strike if existing is not None and existing.cap_strike is not None else _ZERO,
+                    )
+                    if data.get("cap_strike") is not None or (existing is not None and existing.cap_strike is not None)
+                    else None
+                ),
+                mve_selected_legs=tuple(
+                    data.get(
+                        "mve_selected_legs",
+                        existing.mve_selected_legs if existing is not None else (),
+                    )
+                    or ()
+                ),
             )
         except Exception:
             logger.warning("engine.market_cache_update_failed", ticker=ticker, exc_info=True)

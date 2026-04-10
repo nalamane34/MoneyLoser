@@ -33,11 +33,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import structlog
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("supervisor")
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPTS_DIR.parent
 PYTHON = sys.executable
 
 # Worker definitions: (name, script, is_writer)
@@ -220,7 +222,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    loaded_env = load_repo_env(REPO_ROOT)
     setup_logging("INFO")
+    if loaded_env:
+        log.info(
+            "supervisor.repo_env_loaded",
+            path=str(REPO_ROOT / ".env"),
+            keys=sorted(loaded_env),
+        )
 
     workers_to_run = [w.strip() for w in args.workers.split(",")]
     valid_names = {name for name, _, _ in WORKER_DEFS}

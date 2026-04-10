@@ -45,12 +45,14 @@ def _make_fill(
     client_order_id: str | None = None,
 ) -> Fill:
     return Fill(
-        trade_id=trade_id,
+        fill_id=trade_id,
         ticker="TEST",
         side=Side.YES,
         action=Action.BUY,
         count=count,
         price=Decimal("0.50"),
+        no_price=Decimal("0.50"),
+        fee_cost=Decimal("0"),
         is_taker=True,
         created_time=_NOW,
         order_id=order_id,

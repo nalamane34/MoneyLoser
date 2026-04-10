@@ -32,6 +32,38 @@ def test_parse_market_maps_active_status_to_open() -> None:
     assert market.status is MarketStatus.OPEN
 
 
+def test_parse_market_maps_non_tradeable_statuses_conservatively() -> None:
+    closed_market = KalshiRestClient._parse_market(
+        {
+            "ticker": "KXINIT-TEST",
+            "title": "Initialized market",
+            "status": "initialized",
+            "yes_bid_dollars": "0.00",
+            "yes_ask_dollars": "0.00",
+            "last_price_dollars": "0.00",
+            "volume": 0,
+            "open_interest": 0,
+            "close_time": "2026-04-09T18:00:00Z",
+        }
+    )
+    settled_market = KalshiRestClient._parse_market(
+        {
+            "ticker": "KXDET-TEST",
+            "title": "Determined market",
+            "status": "determined",
+            "yes_bid_dollars": "0.00",
+            "yes_ask_dollars": "0.00",
+            "last_price_dollars": "0.00",
+            "volume": 0,
+            "open_interest": 0,
+            "close_time": "2026-04-09T18:00:00Z",
+        }
+    )
+
+    assert closed_market.status is MarketStatus.CLOSED
+    assert settled_market.status is MarketStatus.SETTLED
+
+
 def test_get_balance_parses_cent_denominated_demo_response(monkeypatch) -> None:
     client = KalshiRestClient.__new__(KalshiRestClient)
 
@@ -129,6 +161,27 @@ def test_parse_market_keeps_market_subtitles() -> None:
 
     assert market.yes_sub_title == "Los Angeles L"
     assert market.no_sub_title == "Phoenix"
+
+
+def test_parse_order_uses_fixed_point_count_fields() -> None:
+    order = KalshiRestClient._parse_order(
+        {
+            "order_id": "ord-1",
+            "ticker": "KXTEST-1",
+            "side": "no",
+            "action": "buy",
+            "status": "resting",
+            "initial_count_fp": "2.00",
+            "remaining_count_fp": "2.00",
+            "yes_price_dollars": "0.7900",
+            "taker_fees_dollars": "0.0000",
+            "maker_fees_dollars": "0.0000",
+            "created_time": "2026-04-10T03:21:26.0969Z",
+        }
+    )
+
+    assert order.count == 2
+    assert order.remaining_count == 2
 
 
 def test_create_order_serializes_fixed_point_strings_and_current_tif() -> None:

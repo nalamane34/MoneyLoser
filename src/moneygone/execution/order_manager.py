@@ -185,7 +185,7 @@ class OrderManager:
             if order is None:
                 logger.warning(
                     "order_manager.fill_unknown_order_id",
-                    trade_id=fill.trade_id,
+                    fill_id=fill.fill_id,
                     order_id=fill.order_id,
                     ticker=fill.ticker,
                 )
@@ -193,7 +193,7 @@ class OrderManager:
             if not self._order_matches_fill(order, fill):
                 logger.error(
                     "order_manager.fill_identifier_mismatch",
-                    trade_id=fill.trade_id,
+                    fill_id=fill.fill_id,
                     order_id=fill.order_id,
                     ticker=fill.ticker,
                     order_ticker=order.ticker,
@@ -206,7 +206,7 @@ class OrderManager:
             if order_id is None:
                 logger.warning(
                     "order_manager.fill_unknown_client_order_id",
-                    trade_id=fill.trade_id,
+                    fill_id=fill.fill_id,
                     client_order_id=fill.client_order_id,
                     ticker=fill.ticker,
                 )
@@ -215,7 +215,7 @@ class OrderManager:
             if order is None:
                 logger.warning(
                     "order_manager.fill_stale_client_order_id",
-                    trade_id=fill.trade_id,
+                    fill_id=fill.fill_id,
                     client_order_id=fill.client_order_id,
                     order_id=order_id,
                     ticker=fill.ticker,
@@ -224,7 +224,7 @@ class OrderManager:
             if not self._order_matches_fill(order, fill):
                 logger.error(
                     "order_manager.fill_identifier_mismatch",
-                    trade_id=fill.trade_id,
+                    fill_id=fill.fill_id,
                     client_order_id=fill.client_order_id,
                     order_id=order_id,
                     ticker=fill.ticker,
@@ -243,7 +243,7 @@ class OrderManager:
 
         logger.warning(
             "order_manager.fill_ambiguous",
-            trade_id=fill.trade_id,
+            fill_id=fill.fill_id,
             ticker=fill.ticker,
             candidate_count=len(candidates),
             candidate_order_ids=[order.order_id for order in candidates],
@@ -268,7 +268,7 @@ class OrderManager:
         if matching_order is None:
             logger.warning(
                 "order_manager.fill_no_match",
-                trade_id=fill.trade_id,
+                fill_id=fill.fill_id,
                 ticker=fill.ticker,
             )
             return

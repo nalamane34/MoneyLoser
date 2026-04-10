@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from moneygone.exchange.types import Action, Market, MarketResult, MarketStatus, Order, OrderStatus, Side
+from moneygone.execution.engine import ExecutionEngine
+from moneygone.risk.portfolio import LocalPosition
+
+
+def _market(ticker: str, *, event_ticker: str, yes_sub_title: str) -> Market:
+    return Market(
+        ticker=ticker,
+        event_ticker=event_ticker,
+        series_ticker="KXMLBGAME",
+        title="Arizona vs Philadelphia",
+        subtitle="",
+        yes_sub_title=yes_sub_title,
+        no_sub_title="",
+        status=MarketStatus.OPEN,
+        yes_bid=Decimal("0.53"),
+        yes_ask=Decimal("0.55"),
+        last_price=Decimal("0.54"),
+        volume=100,
+        open_interest=10,
+        close_time=datetime.now(timezone.utc),
+        result=MarketResult.NOT_SETTLED,
+        category="sports",
+    )
+
+
+class _FakeOrders:
+    def __init__(self, orders: list[Order]) -> None:
+        self._orders = orders
+        self.reconcile_calls = 0
+
+    def get_open_orders(self) -> list[Order]:
+        return list(self._orders)
+
+    async def reconcile(self) -> None:
+        self.reconcile_calls += 1
+
+    async def cancel_all(self, ticker: str | None = None) -> int:
+        return 0
+
+    @property
+    def open_order_count(self) -> int:
+        return len(self._orders)
+
+
+class _FakeSports:
+    def __init__(self, snapshots: dict[str, dict[str, int | str]]) -> None:
+        self._snapshots = snapshots
+
+    async def get_snapshot(self, market: Market) -> dict[str, int | str] | None:
+        return self._snapshots.get(market.ticker)
+
+
+def _engine_with_context(
+    *,
+    orders: list[Order] | None = None,
+    positions: dict[str, LocalPosition] | None = None,
+) -> ExecutionEngine:
+    engine = object.__new__(ExecutionEngine)
+    engine._market_cache = {
+        "KXMLBGAME-ARI": _market(
+            "KXMLBGAME-ARI",
+            event_ticker="KXMLBGAME-ARIPHI",
+            yes_sub_title="Arizona",
+        ),
+        "KXMLBGAME-PHI": _market(
+            "KXMLBGAME-PHI",
+            event_ticker="KXMLBGAME-ARIPHI",
+            yes_sub_title="Philadelphia",
+        ),
+    }
+    engine._orders = _FakeOrders(orders or [])
+    engine._risk = SimpleNamespace(
+        _portfolio=SimpleNamespace(positions=positions or {}),
+    )
+    engine._sports = _FakeSports(
+        {
+            "KXMLBGAME-ARI": {"event_id": "game-1", "is_home_team": 1},
+            "KXMLBGAME-PHI": {"event_id": "game-1", "is_home_team": 0},
+        }
+    )
+    return engine
+
+
+def test_sports_outcome_key_treats_yes_away_and_no_home_as_same_view() -> None:
+    engine = _engine_with_context()
+
+    home_no = engine._sports_outcome_key(
+        "KXMLBGAME-ARI",
+        "no",
+        {"event_id": "game-1", "is_home_team": 1},
+    )
+    away_yes = engine._sports_outcome_key(
+        "KXMLBGAME-PHI",
+        "yes",
+        {"event_id": "game-1", "is_home_team": 0},
+    )
+
+    assert home_no == away_yes == ("sports_game_winner", "game-1", "away")
+
+
+@pytest.mark.asyncio
+async def test_event_outcome_key_treats_yes_away_and_no_home_as_same_view() -> None:
+    engine = _engine_with_context()
+
+    away_yes = await engine._outcome_key_for_trade(
+        "KXMLBGAME-PHI",
+        "yes",
+        action="buy",
+    )
+    home_no = await engine._outcome_key_for_trade(
+        "KXMLBGAME-ARI",
+        "no",
+        action="buy",
+    )
+
+    assert away_yes == home_no == (
+        "event_outcome",
+        "KXMLBGAME-ARIPHI",
+        "philadelphia",
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_equivalent_resting_order_is_blocked() -> None:
+    engine = _engine_with_context(
+        orders=[
+            Order(
+                order_id="order-1",
+                ticker="KXMLBGAME-PHI",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=3,
+                remaining_count=3,
+                price=Decimal("0.55"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=datetime.now(timezone.utc),
+            )
+        ]
+    )
+
+    conflict = await engine._find_duplicate_exposure(
+        "KXMLBGAME-ARI",
+        "no",
+        action="buy",
+        sports_snapshot={"event_id": "game-1", "is_home_team": 1},
+    )
+
+    assert conflict == {
+        "kind": "equivalent_open_order",
+        "ticker": "KXMLBGAME-PHI",
+        "side": "yes",
+        "action": "buy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_equivalent_position_is_blocked() -> None:
+    engine = _engine_with_context(
+        positions={
+            "KXMLBGAME-PHI": LocalPosition(
+                ticker="KXMLBGAME-PHI",
+                yes_count=3,
+            )
+        }
+    )
+
+    conflict = await engine._find_duplicate_exposure(
+        "KXMLBGAME-ARI",
+        "no",
+        action="buy",
+        sports_snapshot={"event_id": "game-1", "is_home_team": 1},
+    )
+
+    assert conflict == {
+        "kind": "equivalent_position",
+        "ticker": "KXMLBGAME-PHI",
+        "side": "yes",
+        "contracts": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_runs_on_startup() -> None:
+    orders = _FakeOrders([])
+    engine = object.__new__(ExecutionEngine)
+    engine._watched = []
+    engine._config = SimpleNamespace(evaluation_interval_seconds=30)
+    engine._running = False
+    engine._eval_task = None
+    engine._market_cache = {}
+    engine._market_categories = {}
+    engine._last_eval = {}
+    engine._decision_context = {}
+    engine._decision_context_by_client_order_id = {}
+    engine._last_universe_refresh = None
+    engine._last_order_reconcile = None
+    engine._sportsbook_parquet_path = None
+    engine._store = None
+    engine._sports = None
+    engine._category_providers = {}
+    engine._rest = SimpleNamespace()
+    engine._fills = SimpleNamespace()
+    engine._strategy = SimpleNamespace()
+    engine._recorder = None
+    engine._pipeline = SimpleNamespace()
+    engine._model = SimpleNamespace()
+    engine._edge_calc = SimpleNamespace()
+    engine._sizer = SimpleNamespace()
+    engine._orders = orders
+    engine._risk = SimpleNamespace(
+        _portfolio=SimpleNamespace(
+            cash=Decimal("10"),
+            positions={},
+            sync_with_exchange=lambda _rest: None,
+        )
+    )
+
+    class _FakeWS:
+        def set_on_event(self, _cb) -> None:
+            return None
+
+        async def connect(self) -> None:
+            return None
+
+        async def wait_connected(self) -> None:
+            return None
+
+        async def subscribe_orderbook(self, _tickers) -> None:
+            return None
+
+        async def subscribe_ticker(self, _tickers) -> None:
+            return None
+
+        async def subscribe_trades(self, _tickers) -> None:
+            return None
+
+        async def subscribe_fills(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    engine._ws = _FakeWS()
+
+    async def _sync_with_exchange(_rest) -> None:
+        return None
+
+    engine._risk._portfolio.sync_with_exchange = _sync_with_exchange
+
+    async def _refresh_market_universe(*, force: bool = False) -> None:
+        return None
+
+    engine._refresh_market_universe = _refresh_market_universe
+
+    await engine.start()
+    await engine.stop()
+
+    assert orders.reconcile_calls >= 1

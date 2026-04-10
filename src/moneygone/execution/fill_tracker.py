@@ -122,7 +122,7 @@ class FillTracker:
             try:
                 self._store.insert_fills([
                     {
-                        "trade_id": fill.trade_id,
+                        "trade_id": fill.fill_id,
                         "ticker": fill.ticker,
                         "side": fill.side.value,
                         "action": fill.action.value,
@@ -135,13 +135,13 @@ class FillTracker:
             except Exception:
                 logger.warning(
                     "fill_tracker.persist_failed",
-                    trade_id=fill.trade_id,
+                    trade_id=fill.fill_id,
                     exc_info=True,
                 )
 
         logger.info(
             "fill_tracker.recorded",
-            trade_id=fill.trade_id,
+            trade_id=fill.fill_id,
             ticker=fill.ticker,
             price=str(fill.price),
             slippage=round(slippage, 4),

@@ -7,7 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvider
+from moneygone.data.sports.live_snapshots import (
+    StoreBackedSportsSnapshotProvider,
+    recommended_max_line_age,
+)
 from moneygone.data.sports.power_ratings import TeamRating
 from moneygone.data.sports.stats import TeamInjurySummary
 from moneygone.exchange.types import Market, MarketResult, MarketStatus
@@ -152,6 +155,12 @@ class _FakeRestClient:
         assert with_nested_markets is False
         self.calls.append(event_ticker)
         return {"title": self._event_titles[event_ticker]}
+
+
+def test_recommended_max_line_age_tracks_collection_interval() -> None:
+    assert recommended_max_line_age(15) == timedelta(minutes=35)
+    assert recommended_max_line_age(30) == timedelta(minutes=65)
+    assert recommended_max_line_age(180) == timedelta(minutes=120)
 
 
 @pytest.mark.asyncio
@@ -333,6 +342,54 @@ async def test_provider_uses_event_title_fallback_for_ambiguous_market_titles(da
     assert snapshot["event_id"] == "evt-mia-tor"
     assert snapshot["is_home_team"] == 0
     assert rest_client.calls == ["EVT-MIA-TOR"]
+
+
+@pytest.mark.asyncio
+async def test_provider_skips_stale_lines(data_store) -> None:
+    now = datetime.now(timezone.utc)
+    data_store.insert_sportsbook_game_lines(
+        [
+            {
+                "event_id": "evt-stale",
+                "sport": "nba",
+                "home_team": "Los Angeles Lakers",
+                "away_team": "Boston Celtics",
+                "bookmaker": "pinnacle",
+                "commence_time": now + timedelta(hours=2),
+                "home_price": 1.80,
+                "away_price": 2.10,
+                "captured_at": now - timedelta(hours=3),
+            }
+        ]
+    )
+    market = Market(
+        ticker="KXNBAGAME-LALBOS-LAL",
+        event_ticker="EVT-STALE",
+        series_ticker="NBA",
+        title="NBA: Los Angeles Lakers vs Boston Celtics - Los Angeles Lakers to win",
+        status=MarketStatus.OPEN,
+        yes_bid=Decimal("0.57"),
+        yes_ask=Decimal("0.59"),
+        last_price=Decimal("0.58"),
+        volume=1000,
+        open_interest=250,
+        close_time=now + timedelta(hours=2),
+        result=MarketResult.NOT_SETTLED,
+        category="sports",
+    )
+    provider = StoreBackedSportsSnapshotProvider(
+        data_store,
+        leagues=["nba"],
+        stats_feed=_FakeStatsFeed(),
+        power_ratings=_FakePowerRatings(),
+        max_line_age=timedelta(minutes=45),
+    )
+
+    matched = await provider.refresh([market])
+    snapshot = await provider.get_snapshot(market)
+
+    assert matched == []
+    assert snapshot is None
 
 
 @pytest.mark.asyncio
