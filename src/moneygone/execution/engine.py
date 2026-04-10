@@ -184,6 +184,18 @@ class ExecutionEngine:
         )
 
         self._running = True
+
+        # Sync portfolio with exchange to get current balance + positions
+        try:
+            await self._risk._portfolio.sync_with_exchange(self._rest)
+            logger.info(
+                "engine.portfolio_synced",
+                cash=str(self._risk._portfolio.cash),
+                positions=len(self._risk._portfolio.positions),
+            )
+        except Exception:
+            logger.warning("engine.portfolio_sync_failed", exc_info=True)
+
         self._ws.set_on_event(self.on_event)
         await self._refresh_market_universe(force=True)
 
