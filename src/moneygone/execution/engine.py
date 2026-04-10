@@ -359,11 +359,28 @@ class ExecutionEngine:
         """
         now = datetime.now(timezone.utc)
 
-        # 1. Get current orderbook
+        # 1. Get current orderbook (try WS first, fall back to REST)
         orderbook = self._ws.get_orderbook(ticker)
         if orderbook is None:
-            logger.debug("engine.no_orderbook", ticker=ticker)
-            return None
+            try:
+                orderbook = await self._rest.get_orderbook(ticker)
+            except Exception:
+                pass
+        if orderbook is None:
+            # Synthesize minimal orderbook from market state bid/ask
+            market = self._market_cache.get(ticker)
+            if market is not None and market.yes_bid > 0 and market.yes_ask > 0:
+                from moneygone.exchange.types import OrderbookLevel
+                orderbook = OrderbookSnapshot(
+                    ticker=ticker,
+                    yes_bids=(OrderbookLevel(price=market.yes_bid, contracts=Decimal("100")),),
+                    no_bids=(),
+                    seq=0,
+                    timestamp=now,
+                )
+            else:
+                logger.debug("engine.no_orderbook", ticker=ticker)
+                return None
 
         # 2. Determine market category and get the right model/pipeline
         category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
