@@ -14,6 +14,9 @@ sportsbook:
   enabled: true
   leagues:
     - "nba"
+    - "mlb"
+    - "soccer_epl"
+    - "soccer_usa_mls"
   bookmakers:
     - "pinnacle"
     - "fanduel"

@@ -29,6 +29,8 @@ _LEAGUE_MARKERS = {
     "mlb": ("mlb", "baseball"),
     "ncaab": ("ncaab", "ncaa", "college basketball"),
     "ncaaf": ("ncaaf", "ncaa", "college football"),
+    "soccer_epl": ("epl", "premier league", "soccer"),
+    "soccer_usa_mls": ("mls", "major league soccer", "soccer"),
 }
 
 

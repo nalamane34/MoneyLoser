@@ -205,12 +205,30 @@ class MarketDiscoveryService:
 
     # -- core --
 
+    # Sports series that the paginated bulk fetch often misses because
+    # they sort beyond the ``max_pages`` window.
+    _SPORTS_SERIES: list[str] = [
+        "KXNBAGAME",
+        "KXMLBGAME",
+        "KXNHLGAME",
+        "KXNFLGAME",
+        "KXNCAAFBGAME",
+        "KXNCAABBGAME",
+        "KXSOCCERGAME",
+        "KXMLSGAME",
+        "KXEPLGAME",
+        "KXUCL",
+    ]
+
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
         """Fetch near-term open markets from Kalshi, classify, write cache.
 
         Uses ``max_close_ts`` to only fetch markets closing within 72h.
         The Kalshi API doesn't allow combining close_ts with status=open,
         so we filter out non-open markets client-side.
+
+        Also fetches sports game-winner series explicitly since they often
+        fall outside the first ``max_pages`` of the bulk endpoint.
         """
         now = datetime.now(timezone.utc)
         max_close = int((now + timedelta(hours=72)).timestamp())
@@ -221,6 +239,27 @@ class MarketDiscoveryService:
             max_close_ts=max_close,
             mve_filter="exclude",  # Skip multivariate combos (KXMVE*)
         )
+
+        # Targeted fetch for sports series that may be beyond the page window
+        seen_tickers = {m.ticker for m in markets}
+        for series in self._SPORTS_SERIES:
+            try:
+                sports_batch = await self._rest.get_all_markets(
+                    limit=1000,
+                    max_pages=3,
+                    max_close_ts=max_close,
+                    series_ticker=series,
+                )
+                added = 0
+                for m in sports_batch:
+                    if m.ticker not in seen_tickers:
+                        markets.append(m)
+                        seen_tickers.add(m.ticker)
+                        added += 1
+                if added:
+                    log.debug("market_discovery.sports_series_added", series=series, added=added)
+            except Exception:
+                log.debug("market_discovery.sports_series_failed", series=series, exc_info=True)
 
         # Filter to only open/active markets (API can't combine close_ts + status)
         classified: list[tuple[Market, MarketCategory]] = []
