@@ -56,7 +56,8 @@ class MarketCategory(str, Enum):
 _CRYPTO_PATTERNS = re.compile(
     r"bitcoin|\bbtc\b|ethereum|\beth\b|solana|\bsol\b|crypto|\bdoge\b|\bxrp\b|"
     r"coin price|\bbnb\b|\bada\b|\bavax\b|litecoin|\bltc\b|"
-    r"kxhyped\b|kxhypemaxmon\b|kxhype\d",
+    r"kxhyped\b|kxhypemaxmon\b|kxhype\d|"
+    r"kxshiba|shiba",
     re.IGNORECASE,
 )
 _WEATHER_PATTERNS = re.compile(
@@ -71,7 +72,7 @@ _ECONOMICS_PATTERNS = re.compile(
     r"jobs report|nonfarm|payroll|fomc|treasury|yield curve|"
     r"recession|economic|consumer price|"
     r"mortgage rate|retail sales|kxmortgagerate|kxusretail|"
-    r"kxusdebt|us debt|debt ceiling",
+    r"kxusdebt|us debt|debt ceiling|national debt",
     re.IGNORECASE,
 )
 _SPORTS_PATTERNS = re.compile(
@@ -83,7 +84,8 @@ _SPORTS_PATTERNS = re.compile(
     r"\bkx(?:nba|mlb|nhl|nfl|ncaa|epl|mls|laliga|bundesliga|seriea|ligue1|ucl|"
     r"kbo|npb|elh|pga|lpga|tennis|esports|"
     r"f1|nascar|brasileiro|ligamx|wcsquad|wbc|ipl|nextteam|heisman|"
-    r"mlbhr|mlbk|mlbhits|mlbrbi)",
+    r"mlbhr|mlbk|mlbhits|mlbrbi|"
+    r"euroleaguespread|aleaguespread|uelspread)",
     re.IGNORECASE,
 )
 _POLITICS_PATTERNS = re.compile(
@@ -93,7 +95,10 @@ _POLITICS_PATTERNS = re.compile(
     r"executive order|legislation|bill sign|veto|"
     r"primary|caucus|nominee|approval rating|poll|"
     r"kxpoliticsmention|kxkamalamention|kxhegsethout|kxbillscount|kxchcuts|"
-    r"kamala|hegseth|bernie sanders|secretary of defense|bills.*become law",
+    r"kxgabbardout|kxdotplot|kxfedcombo|kxdhsfund|kxfederalcharge|kxrbwstrike|"
+    r"kxusairanagreement|"
+    r"kamala|hegseth|bernie sanders|secretary of defense|bills.*become law|"
+    r"gabbard|dot plot|federal charge|dhs fund|iran.*agreement",
     re.IGNORECASE,
 )
 _FINANCIALS_PATTERNS = re.compile(
@@ -115,19 +120,20 @@ _COMPANIES_PATTERNS = re.compile(
     r"spacex|starlink|neuralink|"
     r"earnings|revenue|market cap|ipo|stock split|"
     r"ceo|layoff|merger|acquisition|antitrust|"
-    r"kxabnb|kxpm\b|kxmtch|kxmusknw|kxagico|"
+    r"kxabnb|kxpm\b|kxmtch|kxmusknw|kxagico|kxrblx|kxcost|kxpsky|"
     r"airbnb|match group|philip morris|musk.*net worth|"
-    r"payers|shipment volume|nights.*booked",
+    r"payers|shipment volume|nights.*booked|"
+    r"roblox|costco|paramount|peacock",
     re.IGNORECASE,
 )
 
 _ENTERTAINMENT_PATTERNS = re.compile(
-    r"kxalbumstream|kxartiststream|kxbbchartposition|kxranklistsong|"
-    r"kxnetflixrank|kxcannespalmedor|kxanime|kxsnlmention|kxsnlhost|"
+    r"kxalbumstream|kxartiststream|kxbbchartposition|kxranklistsong|kxranklist1song|"
+    r"kxnetflixrank|kxcannespalmedor|kxcannesjuryprize|kxanime|kxsnlmention|kxsnlhost|"
     r"kxsurvivormention|kxmrbeastmention|kxberniemention|"
     r"kxfestivalevent|kxmcmmen|kxsongrelease|kxfeature[a-z]|"
-    r"kxoscarnompic|kxoscarnomact|kxrockandrollhalloffame|"
-    r"kxrt\b|kxtechranklistaicode|"
+    r"kxoscarnom|kxrockandrollhalloffame|"
+    r"kxrt\b|kxtechranklist|kxchristaylorcounties|"
     r"billboard|spotify|luminate|streams|"
     r"rotten tomatoes|oscar|grammy|emmy|golden globe|"
     r"crunchyroll|anime award|snl|saturday night live|"
