@@ -135,6 +135,31 @@ class DataStore:
                 except Exception:
                     logger.debug("datastore.view_skipped", schema=schema, table=table, exc_info=True)
 
+    def export_table_to_parquet(self, table: str, path: Path | str) -> None:
+        """Export a table to a parquet file for cross-process sharing."""
+        p = Path(path)
+        tmp = p.with_suffix(".parquet.tmp")
+        self._conn.execute(f"COPY {table} TO '{tmp}' (FORMAT PARQUET)")
+        tmp.rename(p)  # atomic rename
+        logger.debug("datastore.exported_parquet", table=table, path=str(p))
+
+    def load_parquet_into_table(self, table: str, path: Path | str) -> int:
+        """Replace a table's contents with data from a parquet file.
+
+        Returns the number of rows loaded.
+        """
+        p = Path(path)
+        if not p.exists():
+            return 0
+        self._conn.execute(f"DELETE FROM {table}")
+        self._conn.execute(
+            f"INSERT INTO {table} SELECT * FROM read_parquet('{p}')"
+        )
+        result = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        count = result[0] if result else 0
+        logger.debug("datastore.loaded_parquet", table=table, path=str(p), rows=count)
+        return count
+
     def close(self) -> None:
         """Close the underlying DuckDB connection."""
         self._conn.close()

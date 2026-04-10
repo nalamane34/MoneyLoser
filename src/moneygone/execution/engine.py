@@ -139,6 +139,7 @@ class ExecutionEngine:
         recorder: MarketDataRecorder | None = None,
         category_providers: dict[MarketCategory, CategoryProvider] | None = None,
         discovery_cache_path: Path | None = None,
+        sportsbook_parquet_path: Path | None = None,
     ) -> None:
         self._rest = rest_client
         self._ws = ws_client
@@ -157,6 +158,8 @@ class ExecutionEngine:
         self._recorder = recorder
         self._category_providers = category_providers or {}
         self._discovery_cache_path = discovery_cache_path
+        self._sportsbook_parquet_path = sportsbook_parquet_path
+        self._last_parquet_mtime: float = 0.0
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
@@ -693,6 +696,21 @@ class ExecutionEngine:
 
         new_tickers: list[str] = []
         category_counts: dict[str, int] = {}
+
+        # Reload sportsbook data from parquet if collector has updated it
+        if self._sportsbook_parquet_path is not None and self._store is not None:
+            try:
+                p = self._sportsbook_parquet_path
+                if p.exists():
+                    mtime = p.stat().st_mtime
+                    if mtime > self._last_parquet_mtime:
+                        count = self._store.load_parquet_into_table(
+                            "sportsbook_game_lines", p,
+                        )
+                        self._last_parquet_mtime = mtime
+                        logger.info("engine.sportsbook_parquet_reloaded", rows=count)
+            except Exception:
+                logger.debug("engine.parquet_reload_failed", exc_info=True)
 
         # Phase 1: Sports markets via sports snapshot provider
         if self._sports is not None:

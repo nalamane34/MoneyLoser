@@ -77,7 +77,7 @@ async def _league_has_games_within_window(
         return True  # Default to fetching on failure
 
 
-async def collector_loop(config, store: DataStore) -> None:
+async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
     """Main collection loop — fetches sportsbook lines on interval."""
     interval = max(1, config.sportsbook.fetch_interval_minutes) * 60
     leagues = [league.lower() for league in config.sportsbook.leagues]
@@ -138,6 +138,14 @@ async def collector_loop(config, store: DataStore) -> None:
                         remaining=odds_feed.requests_remaining,
                     )
 
+                # Export sportsbook data to parquet for cross-process access
+                try:
+                    parquet_path = data_dir / "sportsbook_lines.parquet"
+                    store.export_table_to_parquet("sportsbook_game_lines", parquet_path)
+                    log.debug("collector.parquet_exported", path=str(parquet_path))
+                except Exception:
+                    log.debug("collector.parquet_export_failed", exc_info=True)
+
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -176,7 +184,7 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    task = asyncio.create_task(collector_loop(config, store))
+    task = asyncio.create_task(collector_loop(config, store, data_dir))
 
     try:
         await shutdown.wait()

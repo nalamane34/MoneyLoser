@@ -117,28 +117,18 @@ async def main() -> None:
     store = DataStore(data_dir / "execution.duckdb")
     store.initialize_schema(EXECUTION_TABLES)
 
-    # Cross-DB reads: DuckDB doesn't allow ATTACH when another process holds a
-    # write lock. Open a separate read-only DataStore for the collector DB.
-    # Retry with backoff since the collector may hold the lock briefly during writes.
-    collector_db_path = data_dir / "collector.duckdb"
-    collector_store: DataStore | None = None
-    if collector_db_path.exists():
-        for attempt in range(5):
-            try:
-                collector_store = DataStore(collector_db_path, read_only=True)
-                log.info("execution.collector_db_opened", path=str(collector_db_path))
-                break
-            except Exception:
-                if attempt < 4:
-                    wait = 2.0 * (attempt + 1)
-                    log.warning(
-                        "execution.collector_db_retry",
-                        attempt=attempt + 1,
-                        wait=wait,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    log.warning("execution.collector_db_unavailable", exc_info=True)
+    # Cross-DB reads: DuckDB doesn't support cross-process concurrent access.
+    # The collector exports sportsbook data to a parquet file; we load it
+    # into our own execution.duckdb on startup and periodically.
+    sportsbook_parquet = data_dir / "sportsbook_lines.parquet"
+    if sportsbook_parquet.exists():
+        try:
+            count = store.load_parquet_into_table("sportsbook_game_lines", sportsbook_parquet)
+            log.info("execution.sportsbook_loaded_from_parquet", rows=count)
+        except Exception:
+            log.warning("execution.sportsbook_parquet_load_failed", exc_info=True)
+    else:
+        log.info("execution.no_sportsbook_parquet", msg="waiting for collector to export")
 
     # Build pipeline components
     model = SharpSportsbookModel()
@@ -184,11 +174,9 @@ async def main() -> None:
         exposure_calculator=exposure_calculator,
     )
 
-    # Use collector_store for sportsbook data (separate read-only connection),
-    # fall back to execution store if collector DB isn't available yet
-    sports_store = collector_store if collector_store is not None else store
+    # Sportsbook data is loaded into execution.duckdb from parquet (see above).
     sports_provider = StoreBackedSportsSnapshotProvider(
-        sports_store,
+        store,
         leagues=config.sportsbook.leagues,
         rest_client=rest_client,
         max_line_age=timedelta(
@@ -329,6 +317,7 @@ async def main() -> None:
         recorder=None,  # Market data worker handles recording
         category_providers=category_providers,
         discovery_cache_path=discovery_cache_path,
+        sportsbook_parquet_path=sportsbook_parquet,
     )
 
     shutdown = asyncio.Event()
@@ -359,8 +348,6 @@ async def main() -> None:
         if weather_provider is not None:
             await weather_provider.close()
         await rest_client.close()
-        if collector_store is not None:
-            collector_store.close()
         store.close()
         log.info("execution.stopped")
 
