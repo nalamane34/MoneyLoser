@@ -29,9 +29,10 @@ class WeatherConfig(BaseModel):
 
 class CryptoConfig(BaseModel):
     enabled: bool = True
-    exchanges: list[str] = Field(default_factory=lambda: ["binance"])
+    exchanges: list[str] = Field(default_factory=lambda: ["binanceus"])
     symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
     fetch_interval_seconds: int = 30
+    coinalyze_api_key: str = ""
 
 
 class SportsbookConfig(BaseModel):

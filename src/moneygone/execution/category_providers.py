@@ -111,11 +111,28 @@ def _hours_to_expiry(market: Market) -> float | None:
 
 
 class CryptoDataProvider:
-    """Fetches real-time crypto data and builds a feature-ready snapshot."""
+    """Fetches real-time crypto data and builds a feature-ready snapshot.
 
-    def __init__(self, crypto_feed: Any, volatility_feed: Any) -> None:
+    Parameters
+    ----------
+    crypto_feed:
+        ccxt-based feed for spot data (orderbook, trades, OHLCV).
+    volatility_feed:
+        Volatility feed for realized vol, ATR, trend, price.
+    futures_feed:
+        Optional Coinalyze (or similar) feed for funding rates and OI.
+        When provided, funding/OI queries go here instead of crypto_feed.
+    """
+
+    def __init__(
+        self,
+        crypto_feed: Any,
+        volatility_feed: Any,
+        futures_feed: Any | None = None,
+    ) -> None:
         self._feed = crypto_feed
         self._vol_feed = volatility_feed
+        self._futures_feed = futures_feed
         self._vol_cache: dict[str, Any] = {}
         self._vol_cache_time: dict[str, datetime] = {}
 
@@ -173,18 +190,19 @@ class CryptoDataProvider:
         else:
             return None  # Can't price without vol data
 
-        # Fetch funding rate
+        # Fetch funding rate (prefer futures feed, fallback to ccxt)
+        feed = self._futures_feed or self._feed
         try:
-            rates = await self._feed.get_funding_rates([symbol])
+            rates = await feed.get_funding_rates([symbol])
             if rates:
                 snapshot["funding_rate"] = rates[0].rate
                 snapshot["funding_rate_signal"] = rates[0].rate
         except Exception:
             logger.debug("crypto_provider.funding_fetch_failed", symbol=symbol, exc_info=True)
 
-        # Fetch open interest
+        # Fetch open interest (prefer futures feed, fallback to ccxt)
         try:
-            oi_snaps = await self._feed.get_open_interest([symbol])
+            oi_snaps = await feed.get_open_interest([symbol])
             if oi_snaps:
                 snapshot["open_interest"] = oi_snaps[0].value
         except Exception:
@@ -205,6 +223,8 @@ class CryptoDataProvider:
             await self._feed.close()
         if self._vol_feed is not None:
             await self._vol_feed.close()
+        if self._futures_feed is not None:
+            await self._futures_feed.close()
 
 
 # ---------------------------------------------------------------------------

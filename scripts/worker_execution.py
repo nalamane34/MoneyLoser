@@ -119,15 +119,26 @@ async def main() -> None:
 
     # Cross-DB reads: DuckDB doesn't allow ATTACH when another process holds a
     # write lock. Open a separate read-only DataStore for the collector DB.
-    # This uses a snapshot read and doesn't block the collector writer.
+    # Retry with backoff since the collector may hold the lock briefly during writes.
     collector_db_path = data_dir / "collector.duckdb"
     collector_store: DataStore | None = None
     if collector_db_path.exists():
-        try:
-            collector_store = DataStore(collector_db_path, read_only=True)
-            log.info("execution.collector_db_opened", path=str(collector_db_path))
-        except Exception:
-            log.warning("execution.collector_db_unavailable", exc_info=True)
+        for attempt in range(5):
+            try:
+                collector_store = DataStore(collector_db_path, read_only=True)
+                log.info("execution.collector_db_opened", path=str(collector_db_path))
+                break
+            except Exception:
+                if attempt < 4:
+                    wait = 2.0 * (attempt + 1)
+                    log.warning(
+                        "execution.collector_db_retry",
+                        attempt=attempt + 1,
+                        wait=wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    log.warning("execution.collector_db_unavailable", exc_info=True)
 
     # Build pipeline components
     model = SharpSportsbookModel()
@@ -207,7 +218,17 @@ async def main() -> None:
             vol_feed = CryptoVolatilityFeed(
                 exchange_id=config.crypto.exchanges[0] if config.crypto.exchanges else "binanceus",
             )
-            crypto_provider = CryptoDataProvider(crypto_feed, vol_feed)
+
+            # Coinalyze for futures data (funding rates, OI) — works from US
+            futures_feed = None
+            import os
+            coinalyze_key = config.crypto.coinalyze_api_key or os.environ.get("COINALYZE_API_KEY", "")
+            if coinalyze_key:
+                from moneygone.data.crypto.coinalyze_feed import CoinalyzeFeed
+                futures_feed = CoinalyzeFeed(api_key=coinalyze_key)
+                log.info("execution.coinalyze_feed_enabled")
+
+            crypto_provider = CryptoDataProvider(crypto_feed, vol_feed, futures_feed=futures_feed)
             crypto_model = CryptoVolModel()
             crypto_pipeline = FeaturePipeline(
                 [

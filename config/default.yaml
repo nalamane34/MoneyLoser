@@ -28,6 +28,7 @@ crypto:
     - "BTC/USDT"
     - "ETH/USDT"
   fetch_interval_seconds: 30
+  coinalyze_api_key: ""  # Set via COINALYZE_API_KEY env var or here
 
 sportsbook:
   enabled: false
