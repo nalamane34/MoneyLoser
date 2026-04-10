@@ -116,11 +116,18 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
                         log.warning("collector.stop_for_quota", league=league, remaining=remaining)
                         break
 
-                    has_games = await _league_has_games_within_window(
-                        stats_feed, league, config.sportsbook.lookahead_hours, reference_time=now,
-                    )
+                    try:
+                        has_games = await asyncio.wait_for(
+                            _league_has_games_within_window(
+                                stats_feed, league, config.sportsbook.lookahead_hours, reference_time=now,
+                            ),
+                            timeout=15.0,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("collector.espn_check_timeout", league=league)
+                        has_games = True  # Fetch anyway if ESPN check hangs
                     if not has_games:
-                        log.debug("collector.skip_no_games", league=league)
+                        log.info("collector.skip_no_games", league=league)
                         continue
 
                     games = await odds_feed.get_upcoming_games(
