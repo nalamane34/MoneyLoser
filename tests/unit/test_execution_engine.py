@@ -87,6 +87,8 @@ def _engine_with_context(
             "KXMLBGAME-PHI": {"event_id": "game-1", "is_home_team": 0},
         }
     )
+    engine._decision_context = {}
+    engine._decision_context_by_client_order_id = {}
     return engine
 
 

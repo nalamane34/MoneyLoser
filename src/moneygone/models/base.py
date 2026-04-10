@@ -53,6 +53,9 @@ class ProbabilityModel(ABC):
     name: str
     version: str
     trained_at: datetime | None = None
+    # Models with demo_only=True will be blocked from placing real orders.
+    # Set this on any model that has no informational edge.
+    demo_only: bool = False
 
     @abstractmethod
     def predict_proba(self, features: dict[str, float]) -> ModelPrediction:

@@ -300,47 +300,56 @@ async def main() -> None:
         except Exception:
             log.warning("execution.weather_provider_failed", exc_info=True)
 
-    baseline_model = MarketBaselineModel()
-    baseline_pipeline = FeaturePipeline(
-        [
-            BidAskSpread(),
-            MidPrice(),
-            OrderbookImbalance(),
-            WeightedMidPrice(),
-            DepthRatio(),
-            TimeToExpiry(),
-        ],
-        store=store,
-    )
-    baseline_categories = (
-        MarketCategory.ECONOMICS,
-        MarketCategory.POLITICS,
-        MarketCategory.FINANCIALS,
-        MarketCategory.COMPANIES,
-        MarketCategory.CRYPTO,
-        MarketCategory.ENTERTAINMENT,
-        MarketCategory.UNKNOWN,
-    )
-    for category in baseline_categories:
-        if category in category_providers:
-            continue
-        category_providers[category] = CategoryProvider(
-            category=category,
-            model=baseline_model,
-            pipeline=baseline_pipeline,
-            get_context_data=None,
+    # ---- Baseline model: ONLY in demo mode (stress testing) ----
+    # The MarketBaselineModel has NO informational edge — it just mirrors
+    # market pricing.  It must NEVER trade with real money.
+    if config.exchange.demo_mode:
+        baseline_model = MarketBaselineModel()
+        baseline_pipeline = FeaturePipeline(
+            [
+                BidAskSpread(),
+                MidPrice(),
+                OrderbookImbalance(),
+                WeightedMidPrice(),
+                DepthRatio(),
+                TimeToExpiry(),
+            ],
+            store=store,
         )
-    log.info(
-        "execution.market_baseline_provider_enabled",
-        categories=[
-            category.value
-            for category in baseline_categories
-            if category in category_providers
-            and category_providers[category].model is baseline_model
-        ],
-        model=baseline_model.name,
-        version=baseline_model.version,
-    )
+        baseline_categories = (
+            MarketCategory.ECONOMICS,
+            MarketCategory.POLITICS,
+            MarketCategory.FINANCIALS,
+            MarketCategory.COMPANIES,
+            MarketCategory.CRYPTO,
+            MarketCategory.ENTERTAINMENT,
+            MarketCategory.UNKNOWN,
+        )
+        for category in baseline_categories:
+            if category in category_providers:
+                continue
+            category_providers[category] = CategoryProvider(
+                category=category,
+                model=baseline_model,
+                pipeline=baseline_pipeline,
+                get_context_data=None,
+            )
+        log.info(
+            "execution.market_baseline_provider_enabled",
+            categories=[
+                category.value
+                for category in baseline_categories
+                if category in category_providers
+                and category_providers[category].model is baseline_model
+            ],
+            model=baseline_model.name,
+            version=baseline_model.version,
+        )
+    else:
+        log.warning(
+            "execution.baseline_model_skipped_live_mode",
+            msg="MarketBaselineModel is disabled in live mode — no informational edge",
+        )
 
     log.info(
         "execution.category_providers",
@@ -369,6 +378,7 @@ async def main() -> None:
         category_providers=category_providers,
         discovery_cache_path=discovery_cache_path,
         sportsbook_parquet_path=sportsbook_parquet,
+        demo_mode=config.exchange.demo_mode,
     )
 
     shutdown = asyncio.Event()

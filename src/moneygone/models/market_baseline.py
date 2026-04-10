@@ -47,6 +47,7 @@ class MarketBaselineModel(ProbabilityModel):
 
     name = "market_baseline"
     version = "v1"
+    demo_only = True  # NO informational edge — mirrors market pricing only
 
     def predict_proba(self, features: dict[str, float]) -> ModelPrediction:
         mid = features.get("mid_price")

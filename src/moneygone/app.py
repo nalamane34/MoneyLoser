@@ -602,42 +602,47 @@ def build_app(config: AppConfig) -> Application:
             )
 
         # Register market-baseline model for all categories that lack a
-        # specialised data feed (politics, economics, financials, companies,
-        # crypto-without-feed, unknown).  The baseline model uses only
-        # orderbook microstructure features and needs no external data.
-        baseline_model = MarketBaselineModel()
-        baseline_pipeline = FeaturePipeline(
-            [
-                BidAskSpread(),
-                MidPrice(),
-                OrderbookImbalance(),
-                WeightedMidPrice(),
-                DepthRatio(),
-                TimeToExpiry(),
-            ],
-            store=store,
-        )
-        _baseline_cats = [
-            MarketCategory.ECONOMICS,
-            MarketCategory.POLITICS,
-            MarketCategory.FINANCIALS,
-            MarketCategory.COMPANIES,
-            MarketCategory.CRYPTO,
-            MarketCategory.ENTERTAINMENT,
-            MarketCategory.UNKNOWN,
-        ]
-        for cat in _baseline_cats:
-            if cat not in category_providers:
-                category_providers[cat] = CategoryProvider(
-                    category=cat,
-                    model=baseline_model,
-                    pipeline=baseline_pipeline,
-                    get_context_data=None,  # No external data needed
-                )
-        log.info(
-            "build_app.baseline_categories_ready",
-            categories=[c.value for c in _baseline_cats if c in category_providers and category_providers[c].model is baseline_model],
-        )
+        # specialised data feed — ONLY in demo mode.  The baseline model
+        # has NO informational edge and must never trade with real money.
+        if config.exchange.demo_mode:
+            baseline_model = MarketBaselineModel()
+            baseline_pipeline = FeaturePipeline(
+                [
+                    BidAskSpread(),
+                    MidPrice(),
+                    OrderbookImbalance(),
+                    WeightedMidPrice(),
+                    DepthRatio(),
+                    TimeToExpiry(),
+                ],
+                store=store,
+            )
+            _baseline_cats = [
+                MarketCategory.ECONOMICS,
+                MarketCategory.POLITICS,
+                MarketCategory.FINANCIALS,
+                MarketCategory.COMPANIES,
+                MarketCategory.CRYPTO,
+                MarketCategory.ENTERTAINMENT,
+                MarketCategory.UNKNOWN,
+            ]
+            for cat in _baseline_cats:
+                if cat not in category_providers:
+                    category_providers[cat] = CategoryProvider(
+                        category=cat,
+                        model=baseline_model,
+                        pipeline=baseline_pipeline,
+                        get_context_data=None,  # No external data needed
+                    )
+            log.info(
+                "build_app.baseline_categories_ready",
+                categories=[c.value for c in _baseline_cats if c in category_providers and category_providers[c].model is baseline_model],
+            )
+        else:
+            log.warning(
+                "build_app.baseline_model_skipped",
+                msg="MarketBaselineModel disabled in live mode — no informational edge",
+            )
 
         # Load sportsbook data from parquet (written by collector worker)
         data_dir = Path(config.data_dir)
@@ -674,6 +679,7 @@ def build_app(config: AppConfig) -> Application:
             recorder=recorder,
             category_providers=category_providers,
             sportsbook_parquet_path=sportsbook_parquet,
+            demo_mode=config.exchange.demo_mode,
         )
         log.info(
             "build_app.sports_execution_ready",

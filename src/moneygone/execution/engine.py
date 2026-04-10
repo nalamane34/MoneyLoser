@@ -142,9 +142,11 @@ class ExecutionEngine:
         category_providers: dict[MarketCategory, CategoryProvider] | None = None,
         discovery_cache_path: Path | None = None,
         sportsbook_parquet_path: Path | None = None,
+        demo_mode: bool = False,
     ) -> None:
         self._rest = rest_client
         self._ws = ws_client
+        self._demo_mode = demo_mode
         self._pipeline = feature_pipeline
         self._model = model
         self._edge_calc = edge_calculator
@@ -899,6 +901,16 @@ class ExecutionEngine:
         Uses the configured execution strategy to place the order.
         Records the fill with prediction context in the fill tracker.
         """
+        # SAFETY: Block demo_only models from placing real orders
+        if not self._demo_mode and decision.prediction.model_name == "market_baseline":
+            logger.error(
+                "engine.BLOCKED_demo_only_model_in_live",
+                ticker=decision.ticker,
+                model=decision.prediction.model_name,
+                msg="MarketBaselineModel has no edge — refusing to trade with real money",
+            )
+            return
+
         orderbook = self._ws.get_orderbook(decision.ticker)
         if orderbook is None:
             try:
