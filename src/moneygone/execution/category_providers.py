@@ -376,14 +376,17 @@ class WeatherDataProvider:
         lat, lon = matched_loc["lat"], matched_loc["lon"]
         loc_name = matched_loc["name"]
 
-        # Fetch ensemble (cache for 15 min)
-        cache_key = f"{loc_name}_{variable}_{market.ticker}"
+        # Fetch ensemble (cache for 30 min per location+variable).
+        # The ensemble data is the SAME for all contracts in an event — only
+        # the threshold differs.  Keying on ticker caused hundreds of redundant
+        # API calls, burning through Open-Meteo's free-tier rate limit.
+        cache_key = f"{loc_name}_{variable}"
         now = datetime.now(timezone.utc)
         cache_age = (
             now - self._cache_time.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
         ).total_seconds()
 
-        if cache_age > 900 or cache_key not in self._ensemble_cache:
+        if cache_age > 1800 or cache_key not in self._ensemble_cache:
             ensemble = None
 
             # Primary: NOAA GEFS ensemble (probabilistic spread for calibration)
