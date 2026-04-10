@@ -54,6 +54,42 @@ class WeatherEnsembleModel(ProbabilityModel):
 
         raw_prob = float(exceedance)
 
+        # ------- Safety: detect degenerate ensemble (single member) ---------
+        # If ensemble_spread is exactly 0.0, we likely have a single
+        # deterministic forecast pretending to be an ensemble.  In that case
+        # the exceedance probability is binary (0 or 1) with no uncertainty.
+        # Apply aggressive shrinkage toward 0.5 and heavily reduce confidence
+        # to prevent overconfident bets on essentially a point forecast.
+        ensemble_spread = features.get("ensemble_spread", 0.0)
+
+        if ensemble_spread < 1e-9 and raw_prob in (0.0, 1.0):
+            # Degenerate ensemble — shrink 30% toward 0.5
+            logger.warning(
+                "weather_model.degenerate_ensemble",
+                exceedance=raw_prob,
+                spread=ensemble_spread,
+                msg="Single-member ensemble detected, applying heavy shrinkage",
+            )
+            shrink_pct = 0.30
+            probability = raw_prob * (1.0 - shrink_pct) + 0.5 * shrink_pct
+            probability = _clip(probability, 0.15, 0.85)
+
+            # Very low confidence for a point forecast
+            confidence = 0.30
+            horizon = features.get("forecast_horizon", 48.0)
+            if horizon > 72:
+                confidence = 0.20
+
+            return ModelPrediction(
+                probability=probability,
+                raw_probability=raw_prob,
+                confidence=confidence,
+                model_name=self.name,
+                model_version=self.version,
+                features_used=dict(features),
+                prediction_time=datetime.now(timezone.utc),
+            )
+
         # ------- Calibration: shrink toward 0.5 for model limitations -------
         # Weather ensembles have systematic biases (e.g., cold bias in NOAA
         # GEFS, convective undersampling). Regress all probabilities toward
@@ -62,7 +98,6 @@ class WeatherEnsembleModel(ProbabilityModel):
         # The exceedance prob now comes from parametric fitting when the
         # ensemble is unanimous, so it's already more nuanced than 0/1.
         # Apply a mild universal shrinkage to account for model limitations.
-        ensemble_spread = features.get("ensemble_spread", 0.0)
 
         # Shrinkage strength: higher when spread is low (less member diversity)
         if ensemble_spread < 0.5:

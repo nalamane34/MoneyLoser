@@ -123,7 +123,7 @@ class NOAAEnsembleFetcher:
             "longitude": lon,
             "hourly": om_var,
             "forecast_days": min(forecast_days, 16),
-            "models": "gfs_seamless",
+            "models": "gfs025",
         }
 
         client = await self._get_client()
@@ -159,7 +159,15 @@ class NOAAEnsembleFetcher:
                 )
 
         # If no per-member columns, fall back to the mean column.
+        # This is a DEGRADED mode — the ensemble endpoint should return
+        # 31 GEFS members.  Log a warning so we notice immediately.
         if not member_columns and om_var in hourly:
+            logger.warning(
+                "noaa.no_ensemble_members",
+                variable=om_var,
+                available_keys=[k for k in hourly.keys() if k != "time"],
+                msg="Falling back to single deterministic column — ensemble data missing",
+            )
             member_columns = [
                 [float(v) if v is not None else 0.0 for v in hourly[om_var]]
             ]
