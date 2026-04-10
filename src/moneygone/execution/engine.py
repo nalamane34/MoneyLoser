@@ -19,17 +19,17 @@ Also runs periodic re-evaluation of watched markets on a timer.
 from __future__ import annotations
 
 import asyncio
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import structlog
 
 from moneygone.config import ExecutionConfig
 from moneygone.data.market_data import MarketDataRecorder
+from moneygone.data.market_discovery import MarketCategory, classify_market, MarketDiscoveryService
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.types import (
     Action,
@@ -54,70 +54,6 @@ from moneygone.sizing.kelly import KellySizer, SizeResult
 from moneygone.sizing.risk_limits import ProposedTrade, RiskCheckResult
 
 logger = structlog.get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Market category classification
-# ---------------------------------------------------------------------------
-
-
-class MarketCategory(str, Enum):
-    SPORTS = "sports"
-    CRYPTO = "crypto"
-    WEATHER = "weather"
-    ECONOMICS = "economics"
-    UNKNOWN = "unknown"
-
-
-# Patterns for classifying Kalshi markets by category
-_CRYPTO_PATTERNS = re.compile(
-    r"bitcoin|btc|ethereum|eth|solana|sol|crypto|doge|xrp|hype|"
-    r"coin price|token|bnb|ada|avax|matic|litecoin|ltc",
-    re.IGNORECASE,
-)
-_WEATHER_PATTERNS = re.compile(
-    r"temperature|degrees|weather|rain|snow|hurricane|tornado|"
-    r"heat wave|cold snap|precipitation|wind speed|forecast",
-    re.IGNORECASE,
-)
-_ECONOMICS_PATTERNS = re.compile(
-    r"fed fund|interest rate|cpi|inflation|gdp|unemployment|"
-    r"jobs report|nonfarm|payroll|fomc|treasury|yield curve|"
-    r"recession|economic|consumer price",
-    re.IGNORECASE,
-)
-_SPORTS_PATTERNS = re.compile(
-    r"nba|nfl|mlb|nhl|ncaa|game|winner|moneyline|"
-    r"championship|playoff|series|lakers|celtics|warriors|"
-    r"yankees|dodgers|chiefs|eagles|soccer|mls|epl|"
-    r"tennis|boxing|mma|ufc",
-    re.IGNORECASE,
-)
-
-
-def classify_market(market: Market) -> MarketCategory:
-    """Classify a Kalshi market into a trading category."""
-    text = " ".join(
-        v for v in [
-            market.ticker,
-            market.event_ticker,
-            market.series_ticker,
-            market.title,
-            market.subtitle,
-            market.yes_sub_title,
-            getattr(market, "category", ""),
-        ]
-        if v
-    )
-    if _CRYPTO_PATTERNS.search(text):
-        return MarketCategory.CRYPTO
-    if _WEATHER_PATTERNS.search(text):
-        return MarketCategory.WEATHER
-    if _ECONOMICS_PATTERNS.search(text):
-        return MarketCategory.ECONOMICS
-    if _SPORTS_PATTERNS.search(text):
-        return MarketCategory.SPORTS
-    return MarketCategory.UNKNOWN
 
 
 @dataclass
@@ -202,6 +138,7 @@ class ExecutionEngine:
         sports_snapshot_provider: Any | None = None,
         recorder: MarketDataRecorder | None = None,
         category_providers: dict[MarketCategory, CategoryProvider] | None = None,
+        discovery_cache_path: Path | None = None,
     ) -> None:
         self._rest = rest_client
         self._ws = ws_client
@@ -219,6 +156,7 @@ class ExecutionEngine:
         self._sports = sports_snapshot_provider
         self._recorder = recorder
         self._category_providers = category_providers or {}
+        self._discovery_cache_path = discovery_cache_path
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
@@ -676,7 +614,12 @@ class ExecutionEngine:
             logger.info("engine.ticker_removed", ticker=ticker)
 
     async def _refresh_market_universe(self, *, force: bool = False) -> None:
-        """Refresh watched markets across all enabled categories."""
+        """Refresh watched markets across all enabled categories.
+
+        Reads from the shared discovery cache (written by market_data worker)
+        instead of calling get_all_markets directly.  Falls back to REST if
+        the cache is missing or stale (> 5 min).
+        """
         now = datetime.now(timezone.utc)
         if (
             not force
@@ -685,7 +628,28 @@ class ExecutionEngine:
         ):
             return
 
-        markets = await self._rest.get_all_markets(status="open", limit=1000)
+        # Try reading from shared discovery cache first
+        markets: list[Market] = []
+        classified: list[tuple[Market, MarketCategory]] = []
+        cache_used = False
+
+        if self._discovery_cache_path is not None:
+            classified, refreshed_at = MarketDiscoveryService.load_cache(
+                self._discovery_cache_path,
+            )
+            if classified and refreshed_at is not None:
+                age = (now - refreshed_at).total_seconds()
+                if age < 300:  # Cache valid for 5 minutes
+                    markets = [m for m, _ in classified]
+                    cache_used = True
+                    logger.debug("engine.using_discovery_cache", age_s=int(age), markets=len(markets))
+
+        # Fallback: fetch directly via REST
+        if not markets:
+            markets = await self._rest.get_all_markets(status="open", limit=1000)
+            classified = [(m, classify_market(m)) for m in markets]
+            logger.debug("engine.direct_rest_fetch", markets=len(markets))
+
         new_tickers: list[str] = []
         category_counts: dict[str, int] = {}
 
@@ -700,15 +664,21 @@ class ExecutionEngine:
                     new_tickers.append(market.ticker)
             category_counts["sports"] = len(matched)
 
-        # Phase 2: Other categories via category providers
-        for market in markets:
+        # Phase 2: Other categories — use pre-classified data
+        # Only watch markets with minimum liquidity (volume > 0, has bid/ask)
+        skipped = 0
+        for market, category in classified:
             if market.ticker in self._market_cache:
                 continue  # Already matched as sports
 
-            category = classify_market(market)
             if category == MarketCategory.UNKNOWN:
                 continue
             if category not in self._category_providers:
+                continue
+
+            # Skip illiquid/empty markets — no point evaluating them
+            if market.volume < 10 or market.yes_bid <= 0 or market.yes_ask <= 0:
+                skipped += 1
                 continue
 
             self._market_cache[market.ticker] = market
@@ -728,7 +698,9 @@ class ExecutionEngine:
             "engine.market_universe_refreshed",
             watched=len(self._watched),
             new=len(new_tickers),
+            skipped_illiquid=skipped,
             categories=category_counts,
+            cache_used=cache_used,
         )
 
     async def _get_sports_snapshot(self, ticker: str) -> dict[str, Any] | None:

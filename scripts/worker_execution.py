@@ -31,11 +31,11 @@ from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvid
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
+from moneygone.data.market_discovery import MarketCategory
 from moneygone.execution.category_providers import CryptoDataProvider, WeatherDataProvider
 from moneygone.execution.engine import (
     CategoryProvider,
     ExecutionEngine,
-    MarketCategory,
 )
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
@@ -287,6 +287,9 @@ async def main() -> None:
         enabled=[c.value for c in category_providers.keys()],
     )
 
+    # Shared discovery cache written by market_data worker
+    discovery_cache_path = data_dir / "discovered_markets.json"
+
     engine = ExecutionEngine(
         rest_client=rest_client,
         ws_client=ws_client,
@@ -304,6 +307,7 @@ async def main() -> None:
         sports_snapshot_provider=sports_provider,
         recorder=None,  # Market data worker handles recording
         category_providers=category_providers,
+        discovery_cache_path=discovery_cache_path,
     )
 
     shutdown = asyncio.Event()

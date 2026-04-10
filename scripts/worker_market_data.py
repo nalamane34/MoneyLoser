@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from moneygone.config import load_config
 from moneygone.data.market_data import MarketDataRecorder
+from moneygone.data.market_discovery import MarketDiscoveryService
 from moneygone.data.schemas import MARKET_DATA_TABLES
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
@@ -86,18 +87,17 @@ async def _ws_event_handler(
 
 async def _ws_loop(
     ws_client: KalshiWebSocket,
-    rest_client: KalshiRestClient,
+    discovery: MarketDiscoveryService,
     recorder: MarketDataRecorder,
     refresh_interval: float = 120.0,
 ) -> None:
-    """Maintain WebSocket subscriptions and periodically refresh market list."""
+    """Maintain WebSocket subscriptions using the shared discovery cache."""
     subscribed_tickers: set[str] = set()
 
     while True:
         try:
-            # Discover all open markets via REST
-            markets = await rest_client.get_all_markets(status="open", limit=1000)
-            current_tickers = {m.ticker for m in markets}
+            # Read from shared discovery service (already refreshed on its own timer)
+            current_tickers = discovery.get_tickers()
 
             # Subscribe to new tickers
             new_tickers = current_tickers - subscribed_tickers
@@ -124,19 +124,21 @@ async def _ws_loop(
 
 async def _rest_sweep_loop(
     rest_client: KalshiRestClient,
+    discovery: MarketDiscoveryService,
     recorder: MarketDataRecorder,
     poll_interval: float = 60.0,
 ) -> None:
     """Periodic REST sweep to catch any data the WebSocket might miss.
 
-    Runs at a slower interval than pure-REST mode since WS handles
-    real-time updates.
+    Reads the market list from the shared discovery cache instead of
+    fetching it again.  Only fetches orderbooks via REST for top markets.
     """
     log.info("market_data.rest_sweep_started", interval=poll_interval)
 
     while True:
         try:
-            markets = await rest_client.get_all_markets(status="open", limit=1000)
+            # Read from shared discovery cache (no extra API call)
+            markets = discovery.get_markets()
             if markets:
                 for m in markets:
                     row = {
@@ -211,6 +213,16 @@ async def main() -> None:
     recorder = MarketDataRecorder(store)
     await recorder.start()
 
+    # Shared market discovery — fetches all markets once and caches to JSON
+    cache_path = data_dir / "discovered_markets.json"
+    discovery = MarketDiscoveryService(
+        rest_client=rest_client,
+        cache_path=cache_path,
+        refresh_interval=120.0,  # re-discover every 2 min
+    )
+    await discovery.start()
+    log.info("market_data.discovery_started", cache_path=str(cache_path))
+
     shutdown = asyncio.Event()
 
     def _signal_handler() -> None:
@@ -235,19 +247,19 @@ async def main() -> None:
             await ws_client.subscribe_fills()
             log.info("market_data.ws_connected")
 
-            # WS subscription manager
+            # WS subscription manager — reads tickers from discovery cache
             tasks.append(asyncio.create_task(
-                _ws_loop(ws_client, rest_client, recorder),
+                _ws_loop(ws_client, discovery, recorder),
                 name="ws_loop",
             ))
         except Exception:
             log.warning("market_data.ws_connect_failed, falling back to REST-only", exc_info=True)
             ws_client = None
 
-    # REST sweep (slower interval when WS is active)
+    # REST sweep — reads market list from discovery cache, only fetches orderbooks
     sweep_interval = args.poll_interval if ws_client is None else max(args.poll_interval, 60.0)
     tasks.append(asyncio.create_task(
-        _rest_sweep_loop(rest_client, recorder, sweep_interval),
+        _rest_sweep_loop(rest_client, discovery, recorder, sweep_interval),
         name="rest_sweep",
     ))
 
@@ -259,6 +271,7 @@ async def main() -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await discovery.stop()
         if ws_client:
             await ws_client.disconnect()
         await recorder.stop()
