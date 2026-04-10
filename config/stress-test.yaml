@@ -1,14 +1,12 @@
-# Stress test config — wide-open filters for evaluating trade decisions.
-# MUST be run with demo_mode: true (DryRunStrategy) so no real orders are placed.
-# Purpose: let every plausible trade through to dry_run.would_trade so we can
-# judge whether the model's decisions are good or bad.
+# Live trading config — wide-open filters, real orders on production Kalshi.
+# Risk controls (kelly_fraction, max_position_per_market) provide safety.
 
 exchange:
-  base_url: "https://demo-api.kalshi.co/trade-api/v2"
-  ws_url: "wss://demo-api.kalshi.co/trade-api/ws/v2"
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   api_key_id: "1883dced-c29c-45ce-b4ae-86489918843e"
   private_key_path: "kalshi_key.pem"
-  demo_mode: true  # CRITICAL: DryRunStrategy — no real orders
+  demo_mode: false
 
 weather:
   enabled: true
