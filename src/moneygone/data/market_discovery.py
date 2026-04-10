@@ -85,7 +85,7 @@ _SPORTS_PATTERNS = re.compile(
     r"kbo|npb|elh|pga|lpga|tennis|esports|"
     r"f1|nascar|brasileiro|ligamx|wcsquad|wbc|ipl|nextteam|heisman|"
     r"mlbhr|mlbk|mlbhits|mlbrbi|"
-    r"euroleaguespread|aleaguespread|uelspread)",
+    r"euroleaguespread|aleaguespread|uelspread|race)",
     re.IGNORECASE,
 )
 _POLITICS_PATTERNS = re.compile(
@@ -95,7 +95,7 @@ _POLITICS_PATTERNS = re.compile(
     r"executive order|legislation|bill sign|veto|"
     r"primary|caucus|nominee|approval rating|poll|"
     r"kxpoliticsmention|kxkamalamention|kxhegsethout|kxbillscount|kxchcuts|"
-    r"kxgabbardout|kxdotplot|kxfedcombo|kxdhsfund|kxfederalcharge|kxrbwstrike|"
+    r"kxgabbardout|kxdotplot|kxfedcombo|kxdhsfund|kxfederalcharge|kxrbwstrike|kxdeifo|"
     r"kxusairanagreement|"
     r"kamala|hegseth|bernie sanders|secretary of defense|bills.*become law|"
     r"gabbard|dot plot|federal charge|dhs fund|iran.*agreement",
@@ -121,6 +121,7 @@ _COMPANIES_PATTERNS = re.compile(
     r"earnings|revenue|market cap|ipo|stock split|"
     r"ceo|layoff|merger|acquisition|antitrust|"
     r"kxabnb|kxpm\b|kxmtch|kxmusknw|kxagico|kxrblx|kxcost|kxpsky|"
+    r"kxhood\b|kxpltr|kxlyft|kxsecquarterly|"
     r"airbnb|match group|philip morris|musk.*net worth|"
     r"payers|shipment volume|nights.*booked|"
     r"roblox|costco|paramount|peacock",
@@ -133,7 +134,8 @@ _ENTERTAINMENT_PATTERNS = re.compile(
     r"kxsurvivormention|kxmrbeastmention|kxberniemention|"
     r"kxfestivalevent|kxmcmmen|kxsongrelease|kxfeature[a-z]|"
     r"kxoscarnom|kxrockandrollhalloffame|"
-    r"kxrt\b|kxtechranklist|kxchristaylorcounties|"
+    r"kxrt\b|kxtechranklist|kxchristaylorcounties|kxtopsong|kxalbumreleasedate|"
+    r"kxmovvare|kxwildsht|"
     r"billboard|spotify|luminate|streams|"
     r"rotten tomatoes|oscar|grammy|emmy|golden globe|"
     r"crunchyroll|anime award|snl|saturday night live|"
