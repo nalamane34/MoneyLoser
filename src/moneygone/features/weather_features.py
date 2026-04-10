@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import numpy as np
+from scipy import stats
 import structlog
 
 from moneygone.features.base import Feature, FeatureContext
@@ -202,7 +203,47 @@ class EnsembleExceedanceProb(Feature):
             threshold = self._default_threshold
 
         arr = np.array(members)
-        exceedance = float(np.mean(arr >= threshold))
+        n = len(arr)
+        empirical = float(np.mean(arr >= threshold))
+
+        # When ensemble is unanimous (0/N or N/N), the empirical fraction
+        # (0.0 or 1.0) overstates certainty.  Use parametric estimation:
+        # fit N(mean, std) to members and compute exceedance analytically.
+        # This gives tail probabilities that respect the ensemble spread
+        # rather than jumping to 0 or 1.
+        if n >= 3 and empirical in (0.0, 1.0):
+            mean = float(np.mean(arr))
+            std = float(np.std(arr, ddof=1))
+            # Apply minimum spread floor — ensembles systematically
+            # underestimate uncertainty (underdispersion), especially
+            # NOAA GEFS near surface.  Use at least 1°C (~1.8°F) for
+            # temperature or 0.5 for other variables.
+            ticker_upper = (context.ticker or "").upper()
+            if "TEMP" in ticker_upper or "LOWT" in ticker_upper or "HIGHT" in ticker_upper:
+                min_std = 1.0  # 1°C minimum spread for temperature
+            else:
+                min_std = 0.5  # generic minimum for other variables
+            effective_std = max(std, min_std)
+            if effective_std > 1e-9:
+                # P(X >= threshold) via normal CDF
+                exceedance = float(1.0 - stats.norm.cdf(threshold, loc=mean, scale=effective_std))
+                # Clip to [0.02, 0.98] — parametric tails can be extreme
+                exceedance = max(0.02, min(0.98, exceedance))
+                log.debug(
+                    "exceedance_parametric",
+                    ticker=context.ticker,
+                    mean=round(mean, 2),
+                    raw_std=round(std, 2),
+                    effective_std=round(effective_std, 2),
+                    threshold=round(threshold, 2),
+                    empirical=empirical,
+                    parametric=round(exceedance, 4),
+                )
+            else:
+                # All members identical — use empirical with shrinkage
+                exceedance = empirical
+        else:
+            exceedance = empirical
 
         # Direction: 1.0 = "above" market (YES if value >= threshold)
         #           -1.0 = "below" market (YES if value < threshold)

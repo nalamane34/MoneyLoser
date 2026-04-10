@@ -36,7 +36,7 @@ class WeatherEnsembleModel(ProbabilityModel):
     """
 
     name = "weather_ensemble"
-    version = "v2"  # v2: direction-aware + calibration shrinkage
+    version = "v3"  # v3: parametric exceedance + refined calibration
 
     def predict_proba(self, features: dict[str, float]) -> ModelPrediction:
         exceedance = features.get("ensemble_exceedance_prob")
@@ -54,22 +54,27 @@ class WeatherEnsembleModel(ProbabilityModel):
 
         raw_prob = float(exceedance)
 
-        # ------- Calibration: shrink extreme ensemble fractions -------
-        # Raw ensemble fractions (0/30=0.0, 30/30=1.0) overstate certainty
-        # because ensembles have finite resolution and common biases.
-        # Apply Laplace-style smoothing: treat each extreme like we've
-        # seen 1 additional "opposite" member.  For a 30-member ensemble:
-        #   0/30 → 1/32 ≈ 0.03,   30/30 → 31/32 ≈ 0.97
-        #   1/30 → 2/32 ≈ 0.06,   29/30 → 30/32 ≈ 0.94
+        # ------- Calibration: shrink toward 0.5 for model limitations -------
+        # Weather ensembles have systematic biases (e.g., cold bias in NOAA
+        # GEFS, convective undersampling). Regress all probabilities toward
+        # 0.5 by a small amount proportional to how extreme the prediction is.
+        #
+        # The exceedance prob now comes from parametric fitting when the
+        # ensemble is unanimous, so it's already more nuanced than 0/1.
+        # Apply a mild universal shrinkage to account for model limitations.
         ensemble_spread = features.get("ensemble_spread", 0.0)
-        # Estimate member count from spread — if spread=0, all members agree
-        # Use a stronger shrinkage when ensemble is unanimous (spread ~0)
+
+        # Shrinkage strength: higher when spread is low (less member diversity)
         if ensemble_spread < 0.5:
-            # Unanimous or near-unanimous ensemble — apply heavier shrinkage
-            # Regress toward 0.5 by 5% to account for model limitations
-            probability = raw_prob * 0.95 + 0.5 * 0.05
+            # Tight ensemble — apply moderate shrinkage (8% toward 0.5)
+            shrink_pct = 0.08
+        elif ensemble_spread < 2.0:
+            # Normal spread — light shrinkage (3% toward 0.5)
+            shrink_pct = 0.03
         else:
-            probability = raw_prob
+            # Wide spread — minimal shrinkage (1%)
+            shrink_pct = 0.01
+        probability = raw_prob * (1.0 - shrink_pct) + 0.5 * shrink_pct
 
         # Model disagreement: high disagreement → regress toward 0.5
         disagreement = abs(features.get("model_disagreement", 0.0))
