@@ -279,6 +279,42 @@ class AggressiveStrategy(ExecutionStrategy):
 # ---------------------------------------------------------------------------
 
 
+class DryRunStrategy(ExecutionStrategy):
+    """Logs trade decisions without placing any orders.
+
+    Used for testing the full evaluation pipeline (data → features →
+    model → edge → sizing) without risking real money.  Wraps an
+    inner strategy for price computation but skips submission.
+    """
+
+    def __init__(self, inner: ExecutionStrategy | None = None) -> None:
+        self._inner = inner or PassiveStrategy()
+
+    async def execute(
+        self,
+        edge_result: EdgeResult,
+        size_result: SizeResult,
+        order_manager: OrderManager,
+        orderbook: OrderbookSnapshot,
+    ) -> Order | None:
+        if size_result.contracts <= 0:
+            return None
+
+        logger.info(
+            "dry_run.would_trade",
+            ticker=orderbook.ticker,
+            side=edge_result.side,
+            action=edge_result.action,
+            contracts=size_result.contracts,
+            target_price=str(edge_result.target_price),
+            edge=round(float(edge_result.fee_adjusted_edge), 4),
+            model_prob=round(float(edge_result.model_probability), 4),
+            raw_edge=round(float(edge_result.raw_edge), 4),
+            implied_prob=round(float(edge_result.implied_probability), 4),
+        )
+        return None
+
+
 class AdaptiveStrategy(ExecutionStrategy):
     """Start passive, switch to aggressive if not filled within timeout.
 

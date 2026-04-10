@@ -70,6 +70,7 @@ class FeatureContext:
     orderbook: OrderbookSnapshot | None = None
     weather_ensemble: Any | None = None  # ForecastEnsemble when available
     weather_threshold: float | None = None  # Market threshold for weather (e.g., 36°F)
+    weather_direction: float | None = None  # 1.0 = above threshold, -1.0 = below threshold
     crypto_snapshot: dict[str, Any] | None = None
     sports_snapshot: dict[str, Any] | None = None
     store: Any | None = None  # DataStore when available

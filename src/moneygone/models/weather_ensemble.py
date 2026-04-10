@@ -36,7 +36,7 @@ class WeatherEnsembleModel(ProbabilityModel):
     """
 
     name = "weather_ensemble"
-    version = "v1"
+    version = "v2"  # v2: direction-aware + calibration shrinkage
 
     def predict_proba(self, features: dict[str, float]) -> ModelPrediction:
         exceedance = features.get("ensemble_exceedance_prob")
@@ -54,13 +54,27 @@ class WeatherEnsembleModel(ProbabilityModel):
 
         raw_prob = float(exceedance)
 
-        # Adjustments based on forecast quality signals
-        probability = raw_prob
+        # ------- Calibration: shrink extreme ensemble fractions -------
+        # Raw ensemble fractions (0/30=0.0, 30/30=1.0) overstate certainty
+        # because ensembles have finite resolution and common biases.
+        # Apply Laplace-style smoothing: treat each extreme like we've
+        # seen 1 additional "opposite" member.  For a 30-member ensemble:
+        #   0/30 → 1/32 ≈ 0.03,   30/30 → 31/32 ≈ 0.97
+        #   1/30 → 2/32 ≈ 0.06,   29/30 → 30/32 ≈ 0.94
+        ensemble_spread = features.get("ensemble_spread", 0.0)
+        # Estimate member count from spread — if spread=0, all members agree
+        # Use a stronger shrinkage when ensemble is unanimous (spread ~0)
+        if ensemble_spread < 0.5:
+            # Unanimous or near-unanimous ensemble — apply heavier shrinkage
+            # Regress toward 0.5 by 5% to account for model limitations
+            probability = raw_prob * 0.95 + 0.5 * 0.05
+        else:
+            probability = raw_prob
 
         # Model disagreement: high disagreement → regress toward 0.5
         disagreement = abs(features.get("model_disagreement", 0.0))
         if disagreement > 2.0:
-            shrink = _clip(disagreement * 0.01, 0.0, 0.05)
+            shrink = _clip(disagreement * 0.01, 0.0, 0.10)
             probability = probability * (1.0 - shrink) + 0.5 * shrink
 
         # Forecast revisions: if forecasts are trending toward threshold, adjust
@@ -75,7 +89,8 @@ class WeatherEnsembleModel(ProbabilityModel):
             regress = _clip((horizon - 120) / 240.0, 0.0, 0.3)
             probability = probability * (1.0 - regress) + 0.5 * regress
 
-        probability = _clip(probability, 0.01, 0.99)
+        # Final clip: never allow absolute certainty
+        probability = _clip(probability, 0.03, 0.97)
 
         # Confidence: ensemble-based with quality modifiers
         spread = features.get("ensemble_spread", 5.0)

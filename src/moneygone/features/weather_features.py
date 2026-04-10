@@ -63,12 +63,29 @@ def _get_ensemble_mean_scalar(context: FeatureContext) -> float | None:
     return None
 
 
-def _get_members(context: FeatureContext) -> list[float] | None:
-    """Extract ensemble member values at the forecast timestep closest to market close.
+def _detect_minmax_mode(context: FeatureContext) -> str:
+    """Detect whether this market asks about daily min, max, or instantaneous temp.
 
-    ``member_values`` is shaped ``[n_members][n_timesteps]``.  We pick the
-    timestep nearest to the market's close time (or the last timestep if
-    no market state is available) and return one value per member.
+    Returns 'min' for KXLOWT, 'max' for KXHIGHT, 'instant' for everything else.
+    """
+    ticker = context.ticker or ""
+    if "KXLOWT" in ticker.upper():
+        return "min"
+    if "KXHIGHT" in ticker.upper():
+        return "max"
+    return "instant"
+
+
+def _get_members(context: FeatureContext) -> list[float] | None:
+    """Extract ensemble member values for the market's question.
+
+    ``member_values`` is shaped ``[n_members][n_timesteps]``.
+
+    For min-temperature markets (KXLOWT): returns the MINIMUM value
+    across all timesteps up to market close for each member.
+    For max-temperature markets (KXHIGHT): returns the MAXIMUM value.
+    For all other markets: returns the value at the timestep closest
+    to market close.
     """
     ens = context.weather_ensemble
     if ens is None:
@@ -82,15 +99,36 @@ def _get_members(context: FeatureContext) -> list[float] | None:
     if n_timesteps == 0:
         return None
 
-    # Find timestep closest to market close time
     valid_times = getattr(ens, "valid_times", None)
     target_time = None
     if context.market_state is not None:
         target_time = getattr(context.market_state, "close_time", None)
 
-    idx = n_timesteps - 1  # default: last timestep
+    mode = _detect_minmax_mode(context)
+
+    if mode in ("min", "max") and n_timesteps > 1:
+        # For daily min/max markets: aggregate across all timesteps up
+        # to market close, taking min or max per member.
+        # This correctly answers "what is the lowest/highest temp today?"
+        end_idx = n_timesteps  # default: use all timesteps
+        if valid_times and target_time is not None and len(valid_times) == n_timesteps:
+            # Only include timesteps up to (and slightly past) market close
+            for i, vt in enumerate(valid_times):
+                if vt > target_time:
+                    end_idx = max(i, 1)  # at least 1 timestep
+                    break
+
+        results = []
+        agg_fn = min if mode == "min" else max
+        for member in member_values:
+            vals = [float(member[i]) for i in range(min(end_idx, len(member)))]
+            if vals:
+                results.append(agg_fn(vals))
+        return results if results else None
+
+    # Default: single timestep closest to market close
+    idx = n_timesteps - 1
     if valid_times and target_time is not None and len(valid_times) == n_timesteps:
-        # Pick closest valid time to market close
         best_delta = abs((valid_times[0] - target_time).total_seconds())
         for i, vt in enumerate(valid_times):
             delta = abs((vt - target_time).total_seconds())
@@ -164,7 +202,15 @@ class EnsembleExceedanceProb(Feature):
             threshold = self._default_threshold
 
         arr = np.array(members)
-        return float(np.mean(arr > threshold))
+        exceedance = float(np.mean(arr >= threshold))
+
+        # Direction: 1.0 = "above" market (YES if value >= threshold)
+        #           -1.0 = "below" market (YES if value < threshold)
+        direction = getattr(context, "weather_direction", None)
+        if direction is not None and direction < 0:
+            # "Below X" market: P(YES) = P(value < threshold) = 1 - P(value >= threshold)
+            return 1.0 - exceedance
+        return exceedance
 
 
 class ForecastRevisionMagnitude(Feature):

@@ -26,8 +26,8 @@ _PRICE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_ABOVE_PATTERN = re.compile(r"above|over|higher|more than|at least|reach|exceed", re.IGNORECASE)
-_BELOW_PATTERN = re.compile(r"below|under|lower|less than|at most|drop", re.IGNORECASE)
+_ABOVE_PATTERN = re.compile(r"above|over|higher|more than|at least|reach|exceed|or above|>\d", re.IGNORECASE)
+_BELOW_PATTERN = re.compile(r"below|under|lower|less than|at most|drop|or below|<\d", re.IGNORECASE)
 
 _SYMBOL_MAP = {
     "bitcoin": "BTC/USDT",
@@ -52,8 +52,31 @@ _SYMBOL_MAP = {
 }
 
 
+# Ticker suffix patterns for weather thresholds:
+#   -T47.99  → threshold 47.99 (temperature or amount)
+#   -B40.5   → below 40.5
+#   -A80     → above 80
+#   -T0      → threshold 0 (any rain/snow)
+#   -3       → threshold 3 (e.g., KXRAINNYCM-26APR-3 = 3 inches)
+_TICKER_THRESHOLD_RE = re.compile(
+    r"-[TBA]?(\d+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _extract_threshold(market: Market) -> float | None:
-    """Extract the price/value threshold from a market title."""
+    """Extract the numeric threshold from a market title or ticker suffix.
+
+    Checks ticker suffix first (more reliable), then falls back to
+    parsing dollar amounts from the title text.
+    """
+    # Try ticker suffix first — e.g., KXLOWTNYC-26APR10-B40.5 → 40.5
+    if market.ticker:
+        m = _TICKER_THRESHOLD_RE.search(market.ticker)
+        if m:
+            return float(m.group(1))
+
+    # Fallback: parse from title text
     text = " ".join(
         v for v in [market.title, market.subtitle, market.yes_sub_title] if v
     )
@@ -303,6 +326,19 @@ class WeatherDataProvider:
         if not _WEATHER_TICKER_RE.search(market.ticker or ""):
             return None
 
+        # Skip monthly accumulation markets — they tie up capital for weeks
+        # and our ensemble model only has hourly precip, not monthly totals.
+        # Monthly rain/snow tickers have "M" before the date segment:
+        #   KXRAINSEAM-26APR, KXRAINCHIM-26APR, etc.
+        ticker_upper = (market.ticker or "").upper()
+        if re.search(r"KX(?:RAIN|SNOW|PRECIP)\w*M-\d", ticker_upper):
+            logger.debug(
+                "weather_provider.monthly_market_skipped",
+                ticker=market.ticker,
+                msg="Monthly accumulation market — too much capital lockup",
+            )
+            return None
+
         # Match market to a location
         text = " ".join(
             v for v in [
@@ -315,8 +351,28 @@ class WeatherDataProvider:
             return None
 
         threshold = _extract_threshold(market)
+        if threshold is None:
+            logger.debug(
+                "weather_provider.no_threshold",
+                ticker=market.ticker,
+                msg="Cannot extract threshold — skipping to avoid blind trades",
+            )
+            return None
+
         hours = _hours_to_expiry(market)
         variable = self._detect_variable(text)
+
+        # Unit conversion: Kalshi uses °F and inches; NOAA uses °C and mm
+        if variable == "temperature_2m":
+            # Convert threshold from °F to °C for ensemble comparison
+            threshold = (threshold - 32.0) * 5.0 / 9.0
+        elif variable == "precipitation":
+            if threshold == 0:
+                # "Any rain" = use NWS trace cutoff to avoid ensemble noise
+                threshold = 0.254  # 0.01 inches in mm
+            else:
+                # Convert inches → mm for NOAA ensemble data
+                threshold = threshold * 25.4
         lat, lon = matched_loc["lat"], matched_loc["lon"]
         loc_name = matched_loc["name"]
 
@@ -359,7 +415,8 @@ class WeatherDataProvider:
         if ensemble is None:
             return None
 
-        snapshot: dict[str, Any] = {"ensemble": ensemble}
+        direction = _extract_direction(market)
+        snapshot: dict[str, Any] = {"ensemble": ensemble, "direction": direction}
         if threshold is not None:
             snapshot["threshold"] = threshold
         if hours is not None:

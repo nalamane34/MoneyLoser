@@ -46,7 +46,7 @@ from moneygone.execution.category_providers import WeatherDataProvider
 from moneygone.execution.engine import CategoryProvider, ExecutionEngine
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
-from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
+from moneygone.execution.strategies import AggressiveStrategy, DryRunStrategy, PassiveStrategy
 from moneygone.features import (
     ClimatologicalAnomaly,
     EnsembleExceedanceProb,
@@ -538,10 +538,14 @@ def build_app(config: AppConfig) -> Application:
             ),
         )
         async_closeables.append(sports_provider)
-        strategy = (
+        inner_strategy = (
             PassiveStrategy(timeout_seconds=30.0)
             if config.execution.prefer_maker
             else AggressiveStrategy()
+        )
+        strategy = (
+            DryRunStrategy(inner_strategy) if config.exchange.demo_mode
+            else inner_strategy
         )
 
         # Weather category provider — NWS + NOAA + ECMWF

@@ -1,0 +1,80 @@
+# Stress test config — wide-open filters for evaluating trade decisions.
+# MUST be run with demo_mode: true (DryRunStrategy) so no real orders are placed.
+# Purpose: let every plausible trade through to dry_run.would_trade so we can
+# judge whether the model's decisions are good or bad.
+
+exchange:
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  api_key_id: "1883dced-c29c-45ce-b4ae-86489918843e"
+  private_key_path: "kalshi_key.pem"
+  demo_mode: true  # CRITICAL: DryRunStrategy — no real orders
+
+weather:
+  enabled: true
+  locations:
+    - name: "New York"
+      lat: 40.7128
+      lon: -74.0060
+    - name: "Chicago"
+      lat: 41.8781
+      lon: -87.6298
+    - name: "Los Angeles"
+      lat: 34.0522
+      lon: -118.2437
+    - name: "Miami"
+      lat: 25.7617
+      lon: -80.1918
+    - name: "Dallas"
+      lat: 32.7767
+      lon: -96.7970
+    - name: "Denver"
+      lat: 39.7392
+      lon: -104.9903
+    - name: "Seattle"
+      lat: 47.6062
+      lon: -122.3321
+    - name: "Atlanta"
+      lat: 33.7490
+      lon: -84.3880
+
+crypto:
+  enabled: false
+
+sportsbook:
+  enabled: true
+  leagues:
+    - "nba"
+    - "nhl"
+    - "mlb"
+  bookmakers:
+    - "pinnacle"
+    - "fanduel"
+    - "draftkings"
+    - "betmgm"
+  markets:
+    - "h2h"
+  fetch_interval_minutes: 30
+  lookahead_hours: 24
+  min_requests_remaining: 250
+
+execution:
+  min_edge_threshold: 0.01       # Very low — let marginal edges through for review
+  max_edge_sanity: 0.95          # Wide open — we WANT to see extreme weather edges
+  prefer_maker: true
+  max_order_staleness_seconds: 120
+  evaluation_interval_seconds: 10.0
+  max_model_market_disagreement: 0.50  # Wide open for stress test
+
+risk:
+  kelly_fraction: 0.05
+  max_position_per_market: 10
+  max_position_per_category_pct: 0.50   # Wide for stress test
+  max_total_exposure_pct: 0.80          # Wide for stress test
+  daily_loss_limit_pct: 0.50            # Wide for stress test
+  max_drawdown_pct: 0.50               # Wide for stress test
+  min_contract_price: 0.02              # Allow extreme prices through
+  max_contract_price: 0.98              # Allow extreme prices through
+  max_tail_exposure_pct: 0.50           # Wide for stress test
+
+log_level: "INFO"
