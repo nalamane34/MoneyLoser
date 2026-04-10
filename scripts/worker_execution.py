@@ -31,7 +31,12 @@ from moneygone.data.sports.live_snapshots import StoreBackedSportsSnapshotProvid
 from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
-from moneygone.execution.engine import ExecutionEngine
+from moneygone.execution.category_providers import CryptoDataProvider, WeatherDataProvider
+from moneygone.execution.engine import (
+    CategoryProvider,
+    ExecutionEngine,
+    MarketCategory,
+)
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
 from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
@@ -46,8 +51,40 @@ from moneygone.features import (
     SportsbookWinProbability,
     TeamInjuryImpact,
 )
+from moneygone.features.crypto_features import (
+    ATR14,
+    ATR24,
+    BRTIDistanceToThreshold,
+    BRTIPrice,
+    BasisSpread,
+    CryptoOrderbookImbalance,
+    FundingRateSignal,
+    FundingRateZScore,
+    ImpliedVolatility,
+    OpenInterestChange,
+    RealizedVol7d,
+    RealizedVol24h,
+    RealizedVol30d,
+    TrendRegime,
+    TrendStrength,
+    VolSpread,
+    VolatilityRegime,
+    WhaleFlowIndicator,
+)
 from moneygone.features.pipeline import FeaturePipeline
+from moneygone.features.weather_features import (
+    ClimatologicalAnomaly,
+    EnsembleExceedanceProb,
+    EnsembleMean,
+    EnsembleSpread,
+    ForecastHorizon,
+    ForecastRevisionDirection,
+    ForecastRevisionMagnitude,
+    ModelDisagreement,
+)
+from moneygone.models.crypto_vol import CryptoVolModel
 from moneygone.models.sharp_sportsbook import SharpSportsbookModel
+from moneygone.models.weather_ensemble import WeatherEnsembleModel
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
 from moneygone.risk.manager import RiskManager
@@ -154,6 +191,102 @@ async def main() -> None:
         else AggressiveStrategy()
     )
 
+    # ---- Category providers: crypto, weather ----
+    category_providers: dict[MarketCategory, CategoryProvider] = {}
+    crypto_provider: CryptoDataProvider | None = None
+    weather_provider: WeatherDataProvider | None = None
+
+    if config.crypto.enabled:
+        try:
+            from moneygone.data.crypto.ccxt_feed import CryptoDataFeed
+            from moneygone.data.crypto.volatility import CryptoVolatilityFeed
+
+            crypto_feed = CryptoDataFeed(
+                exchange_ids=config.crypto.exchanges,
+            )
+            vol_feed = CryptoVolatilityFeed(
+                exchange_id=config.crypto.exchanges[0] if config.crypto.exchanges else "binance",
+            )
+            crypto_provider = CryptoDataProvider(crypto_feed, vol_feed)
+            crypto_model = CryptoVolModel()
+            crypto_pipeline = FeaturePipeline(
+                [
+                    FundingRateSignal(),
+                    FundingRateZScore(),
+                    OpenInterestChange(),
+                    CryptoOrderbookImbalance(),
+                    WhaleFlowIndicator(),
+                    VolatilityRegime(),
+                    BasisSpread(),
+                    ATR14(),
+                    ATR24(),
+                    RealizedVol24h(),
+                    RealizedVol7d(),
+                    RealizedVol30d(),
+                    ImpliedVolatility(),
+                    VolSpread(),
+                    TrendRegime(),
+                    TrendStrength(),
+                    BRTIPrice(),
+                    BRTIDistanceToThreshold(),
+                ],
+                store=store,
+            )
+            category_providers[MarketCategory.CRYPTO] = CategoryProvider(
+                category=MarketCategory.CRYPTO,
+                model=crypto_model,
+                pipeline=crypto_pipeline,
+                get_context_data=crypto_provider.get_context,
+            )
+            log.info("execution.crypto_provider_enabled", symbols=config.crypto.symbols)
+        except ImportError:
+            log.warning("execution.crypto_provider_unavailable", msg="ccxt not installed")
+        except Exception:
+            log.warning("execution.crypto_provider_failed", exc_info=True)
+
+    if config.weather.enabled:
+        try:
+            from moneygone.data.weather.noaa import NOAAEnsembleFetcher
+            from moneygone.data.weather.ecmwf import ECMWFOpenDataFetcher
+
+            noaa_fetcher = NOAAEnsembleFetcher()
+            ecmwf_fetcher = ECMWFOpenDataFetcher()
+            weather_locations = [
+                {"name": loc["name"], "lat": loc["lat"], "lon": loc["lon"]}
+                for loc in config.weather.locations
+            ]
+            weather_provider = WeatherDataProvider(noaa_fetcher, ecmwf_fetcher, weather_locations)
+            weather_model = WeatherEnsembleModel()
+            weather_pipeline = FeaturePipeline(
+                [
+                    EnsembleMean(),
+                    EnsembleSpread(),
+                    EnsembleExceedanceProb(),
+                    ForecastRevisionMagnitude(),
+                    ForecastRevisionDirection(),
+                    ModelDisagreement(),
+                    ForecastHorizon(),
+                    ClimatologicalAnomaly(),
+                ],
+                store=store,
+            )
+            category_providers[MarketCategory.WEATHER] = CategoryProvider(
+                category=MarketCategory.WEATHER,
+                model=weather_model,
+                pipeline=weather_pipeline,
+                get_context_data=weather_provider.get_context,
+            )
+            log.info("execution.weather_provider_enabled", locations=[l["name"] for l in weather_locations])
+        except ImportError:
+            log.warning("execution.weather_provider_unavailable")
+        except Exception:
+            log.warning("execution.weather_provider_failed", exc_info=True)
+
+    log.info(
+        "execution.category_providers",
+        enabled=[c.value for c in category_providers.keys()],
+    )
+
     engine = ExecutionEngine(
         rest_client=rest_client,
         ws_client=ws_client,
@@ -170,6 +303,7 @@ async def main() -> None:
         store=store,
         sports_snapshot_provider=sports_provider,
         recorder=None,  # Market data worker handles recording
+        category_providers=category_providers,
     )
 
     shutdown = asyncio.Event()
@@ -195,6 +329,10 @@ async def main() -> None:
     finally:
         await engine.stop()
         await sports_provider.close()
+        if crypto_provider is not None:
+            await crypto_provider.close()
+        if weather_provider is not None:
+            await weather_provider.close()
         await rest_client.close()
         if collector_store is not None:
             collector_store.close()

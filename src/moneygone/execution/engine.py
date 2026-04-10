@@ -10,15 +10,20 @@ Orchestrates the full decision pipeline:
   7. Validate against risk limits
   8. Execute the trade via the chosen strategy
 
+Supports multiple market categories (sports, crypto, weather, economics)
+with category-specific models, feature pipelines, and data providers.
+
 Also runs periodic re-evaluation of watched markets on a timer.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any
 
 import structlog
@@ -49,6 +54,79 @@ from moneygone.sizing.kelly import KellySizer, SizeResult
 from moneygone.sizing.risk_limits import ProposedTrade, RiskCheckResult
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Market category classification
+# ---------------------------------------------------------------------------
+
+
+class MarketCategory(str, Enum):
+    SPORTS = "sports"
+    CRYPTO = "crypto"
+    WEATHER = "weather"
+    ECONOMICS = "economics"
+    UNKNOWN = "unknown"
+
+
+# Patterns for classifying Kalshi markets by category
+_CRYPTO_PATTERNS = re.compile(
+    r"bitcoin|btc|ethereum|eth|solana|sol|crypto|doge|xrp|hype|"
+    r"coin price|token|bnb|ada|avax|matic|litecoin|ltc",
+    re.IGNORECASE,
+)
+_WEATHER_PATTERNS = re.compile(
+    r"temperature|degrees|weather|rain|snow|hurricane|tornado|"
+    r"heat wave|cold snap|precipitation|wind speed|forecast",
+    re.IGNORECASE,
+)
+_ECONOMICS_PATTERNS = re.compile(
+    r"fed fund|interest rate|cpi|inflation|gdp|unemployment|"
+    r"jobs report|nonfarm|payroll|fomc|treasury|yield curve|"
+    r"recession|economic|consumer price",
+    re.IGNORECASE,
+)
+_SPORTS_PATTERNS = re.compile(
+    r"nba|nfl|mlb|nhl|ncaa|game|winner|moneyline|"
+    r"championship|playoff|series|lakers|celtics|warriors|"
+    r"yankees|dodgers|chiefs|eagles|soccer|mls|epl|"
+    r"tennis|boxing|mma|ufc",
+    re.IGNORECASE,
+)
+
+
+def classify_market(market: Market) -> MarketCategory:
+    """Classify a Kalshi market into a trading category."""
+    text = " ".join(
+        v for v in [
+            market.ticker,
+            market.event_ticker,
+            market.series_ticker,
+            market.title,
+            market.subtitle,
+            market.yes_sub_title,
+            getattr(market, "category", ""),
+        ]
+        if v
+    )
+    if _CRYPTO_PATTERNS.search(text):
+        return MarketCategory.CRYPTO
+    if _WEATHER_PATTERNS.search(text):
+        return MarketCategory.WEATHER
+    if _ECONOMICS_PATTERNS.search(text):
+        return MarketCategory.ECONOMICS
+    if _SPORTS_PATTERNS.search(text):
+        return MarketCategory.SPORTS
+    return MarketCategory.UNKNOWN
+
+
+@dataclass
+class CategoryProvider:
+    """Model + pipeline + data provider for a market category."""
+    category: MarketCategory
+    model: ProbabilityModel
+    pipeline: FeaturePipeline
+    get_context_data: Any = None  # async callable(market) -> dict for FeatureContext
 
 _ZERO = Decimal("0")
 
@@ -123,6 +201,7 @@ class ExecutionEngine:
         store: Any | None = None,
         sports_snapshot_provider: Any | None = None,
         recorder: MarketDataRecorder | None = None,
+        category_providers: dict[MarketCategory, CategoryProvider] | None = None,
     ) -> None:
         self._rest = rest_client
         self._ws = ws_client
@@ -139,10 +218,12 @@ class ExecutionEngine:
         self._store = store
         self._sports = sports_snapshot_provider
         self._recorder = recorder
+        self._category_providers = category_providers or {}
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
         self._market_cache: dict[str, Market] = {}
+        self._market_categories: dict[str, MarketCategory] = {}
         self._last_eval: dict[str, datetime] = {}
         self._decision_context: dict[str, TradeDecision] = {}
         self._decision_context_by_client_order_id: dict[str, TradeDecision] = {}
@@ -346,33 +427,67 @@ class ExecutionEngine:
             logger.debug("engine.no_orderbook", ticker=ticker)
             return None
 
-        # 2. Build feature context — require sports snapshot
-        sports_snapshot = await self._get_sports_snapshot(ticker)
-        if sports_snapshot is None:
-            logger.debug(
-                "engine.no_sports_snapshot",
+        # 2. Determine market category and get the right model/pipeline
+        category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
+        provider = self._category_providers.get(category)
+
+        if provider is not None:
+            # Use category-specific model + pipeline + data provider
+            context_data: dict[str, Any] = {}
+            if provider.get_context_data is not None:
+                context_data = await provider.get_context_data(
+                    self._market_cache.get(ticker),
+                ) or {}
+            if not context_data:
+                logger.debug(
+                    "engine.no_category_data",
+                    ticker=ticker,
+                    category=category.value,
+                )
+                return None
+
+            context = FeatureContext(
                 ticker=ticker,
-                msg="Skipping — no sportsbook data for this market",
+                observation_time=now,
+                orderbook=orderbook,
+                market_state=self._market_cache.get(ticker),
+                sports_snapshot=context_data if category == MarketCategory.SPORTS else None,
+                crypto_snapshot=context_data if category == MarketCategory.CRYPTO else None,
+                weather_ensemble=context_data.get("ensemble") if category == MarketCategory.WEATHER else None,
+                store=self._store,
             )
-            return None
+            features = provider.pipeline.compute(context)
+            if not features:
+                logger.debug("engine.no_features", ticker=ticker, category=category.value)
+                return None
+            prediction = provider.model.predict_proba(features)
+        else:
+            # Legacy path: sports-only via sports_snapshot_provider
+            sports_snapshot = await self._get_sports_snapshot(ticker)
+            if sports_snapshot is None:
+                logger.debug(
+                    "engine.no_data_for_category",
+                    ticker=ticker,
+                    category=category.value,
+                    msg="No provider and no sports snapshot — skipping",
+                )
+                return None
 
-        context = FeatureContext(
-            ticker=ticker,
-            observation_time=now,
-            orderbook=orderbook,
-            market_state=self._market_cache.get(ticker),
-            sports_snapshot=sports_snapshot,
-            store=self._store,
-        )
+            context = FeatureContext(
+                ticker=ticker,
+                observation_time=now,
+                orderbook=orderbook,
+                market_state=self._market_cache.get(ticker),
+                sports_snapshot=sports_snapshot,
+                store=self._store,
+            )
+            features = self._pipeline.compute(context)
+            if not features:
+                logger.debug("engine.no_features", ticker=ticker)
+                return None
+            prediction = self._model.predict_proba(features)
 
-        # 3. Run feature pipeline
-        features = self._pipeline.compute(context)
-        if not features:
-            logger.debug("engine.no_features", ticker=ticker)
-            return None
-
-        # 4. Run model — reject low-confidence predictions
-        prediction = self._model.predict_proba(features)
+        # 3. Reject low-confidence predictions
         if prediction.confidence < 0.30:
             logger.debug(
                 "engine.low_confidence",
@@ -561,10 +676,7 @@ class ExecutionEngine:
             logger.info("engine.ticker_removed", ticker=ticker)
 
     async def _refresh_market_universe(self, *, force: bool = False) -> None:
-        """Refresh watched sports markets from the store-backed snapshot provider."""
-        if self._sports is None:
-            return
-
+        """Refresh watched markets across all enabled categories."""
         now = datetime.now(timezone.utc)
         if (
             not force
@@ -574,19 +686,50 @@ class ExecutionEngine:
             return
 
         markets = await self._rest.get_all_markets(status="open", limit=1000)
-        matched = await self._sports.refresh(markets)
         new_tickers: list[str] = []
-        for market in matched:
+        category_counts: dict[str, int] = {}
+
+        # Phase 1: Sports markets via sports snapshot provider
+        if self._sports is not None:
+            matched = await self._sports.refresh(markets)
+            for market in matched:
+                self._market_cache[market.ticker] = market
+                self._market_categories[market.ticker] = MarketCategory.SPORTS
+                if market.ticker not in self._watched:
+                    self._watched.append(market.ticker)
+                    new_tickers.append(market.ticker)
+            category_counts["sports"] = len(matched)
+
+        # Phase 2: Other categories via category providers
+        for market in markets:
+            if market.ticker in self._market_cache:
+                continue  # Already matched as sports
+
+            category = classify_market(market)
+            if category == MarketCategory.UNKNOWN:
+                continue
+            if category not in self._category_providers:
+                continue
+
             self._market_cache[market.ticker] = market
+            self._market_categories[market.ticker] = category
             if market.ticker not in self._watched:
                 self._watched.append(market.ticker)
                 new_tickers.append(market.ticker)
+            category_counts[category.value] = category_counts.get(category.value, 0) + 1
+
         if self._ws.is_connected and new_tickers:
             await self._ws.subscribe_orderbook(new_tickers)
             await self._ws.subscribe_ticker(new_tickers)
             await self._ws.subscribe_trades(new_tickers)
+
         self._last_universe_refresh = now
-        logger.info("engine.market_universe_refreshed", watched=len(self._watched))
+        logger.info(
+            "engine.market_universe_refreshed",
+            watched=len(self._watched),
+            new=len(new_tickers),
+            categories=category_counts,
+        )
 
     async def _get_sports_snapshot(self, ticker: str) -> dict[str, Any] | None:
         if self._sports is None:

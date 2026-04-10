@@ -5,10 +5,10 @@ exchange:
   demo_mode: false
 
 weather:
-  enabled: false
+  enabled: true
 
 crypto:
-  enabled: false
+  enabled: true
 
 sportsbook:
   enabled: true
