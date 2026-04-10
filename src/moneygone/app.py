@@ -43,6 +43,7 @@ from moneygone.data.weather.nws import NWSFetcher
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.execution.category_providers import WeatherDataProvider
+from moneygone.execution.artifact_runtime import build_universal_artifact_fallbacks
 from moneygone.execution.engine import CategoryProvider, ExecutionEngine
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
@@ -399,6 +400,9 @@ def build_app(config: AppConfig) -> Application:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = DataStore(db_path)
     store.initialize_schema()
+    model_dir = Path(config.model.model_dir)
+    if not model_dir.is_absolute():
+        model_dir = Path(__file__).resolve().parents[2] / model_dir
     log.info("build_app.store_ready", path=str(db_path))
 
     # 4. Data recorder
@@ -567,7 +571,9 @@ def build_app(config: AppConfig) -> Application:
                 {"name": "Denver", "lat": 39.7392, "lon": -104.9903},
             ]
             nws_fetcher = NWSFetcher()
-            noaa_fetcher = NOAAEnsembleFetcher()
+            noaa_fetcher = NOAAEnsembleFetcher(
+                api_key=config.weather.open_meteo_api_key,
+            )
             ecmwf_fetcher = ECMWFOpenDataFetcher()
             weather_provider = WeatherDataProvider(
                 noaa_fetcher=noaa_fetcher,
@@ -601,10 +607,47 @@ def build_app(config: AppConfig) -> Application:
                 locations=[loc["name"] for loc in weather_locations],
             )
 
-        # Register market-baseline model for all categories that lack a
-        # specialised data feed — ONLY in demo mode.  The baseline model
-        # has NO informational edge and must never trade with real money.
-        if config.exchange.demo_mode:
+        fallback_categories = [
+            MarketCategory.ECONOMICS,
+            MarketCategory.POLITICS,
+            MarketCategory.FINANCIALS,
+            MarketCategory.COMPANIES,
+            MarketCategory.CRYPTO,
+            MarketCategory.WEATHER,
+            MarketCategory.ENTERTAINMENT,
+            MarketCategory.UNKNOWN,
+        ]
+        missing_categories = [
+            category
+            for category in fallback_categories
+            if category not in category_providers
+        ]
+        artifact_fallbacks = build_universal_artifact_fallbacks(
+            model_dir,
+            missing_categories,
+        )
+        if artifact_fallbacks:
+            for category, (artifact_model, artifact_pipeline) in artifact_fallbacks.items():
+                category_providers[category] = CategoryProvider(
+                    category=category,
+                    model=artifact_model,
+                    pipeline=artifact_pipeline,  # type: ignore[arg-type]
+                    get_context_data=None,
+                )
+            log.info(
+                "build_app.artifact_fallback_categories_ready",
+                categories=[category.value for category in artifact_fallbacks],
+                model=next(iter(artifact_fallbacks.values()))[0].name,
+            )
+
+        remaining_categories = [
+            category
+            for category in fallback_categories
+            if category not in category_providers
+        ]
+
+        # Register market-baseline model only as a demo-only last resort.
+        if remaining_categories and config.exchange.demo_mode:
             baseline_model = MarketBaselineModel()
             baseline_pipeline = FeaturePipeline(
                 [
@@ -617,31 +660,22 @@ def build_app(config: AppConfig) -> Application:
                 ],
                 store=store,
             )
-            _baseline_cats = [
-                MarketCategory.ECONOMICS,
-                MarketCategory.POLITICS,
-                MarketCategory.FINANCIALS,
-                MarketCategory.COMPANIES,
-                MarketCategory.CRYPTO,
-                MarketCategory.ENTERTAINMENT,
-                MarketCategory.UNKNOWN,
-            ]
-            for cat in _baseline_cats:
-                if cat not in category_providers:
-                    category_providers[cat] = CategoryProvider(
-                        category=cat,
-                        model=baseline_model,
-                        pipeline=baseline_pipeline,
-                        get_context_data=None,  # No external data needed
-                    )
+            for cat in remaining_categories:
+                category_providers[cat] = CategoryProvider(
+                    category=cat,
+                    model=baseline_model,
+                    pipeline=baseline_pipeline,
+                    get_context_data=None,
+                )
             log.info(
                 "build_app.baseline_categories_ready",
-                categories=[c.value for c in _baseline_cats if c in category_providers and category_providers[c].model is baseline_model],
+                categories=[category.value for category in remaining_categories],
             )
-        else:
+        elif remaining_categories:
             log.warning(
-                "build_app.baseline_model_skipped",
-                msg="MarketBaselineModel disabled in live mode — no informational edge",
+                "build_app.artifact_fallbacks_missing",
+                categories=[category.value for category in remaining_categories],
+                msg="No live fallback model available for some categories",
             )
 
         # Load sportsbook data from parquet (written by collector worker)

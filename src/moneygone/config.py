@@ -23,6 +23,7 @@ class WeatherConfig(BaseModel):
     enabled: bool = True
     noaa_enabled: bool = True
     ecmwf_enabled: bool = True
+    open_meteo_api_key: str = ""
     locations: list[dict[str, Any]] = Field(default_factory=list)
     fetch_interval_minutes: int = 60
 

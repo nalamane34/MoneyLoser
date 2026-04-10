@@ -1,12 +1,14 @@
 """NOAA GEFS ensemble forecast fetcher using the Open-Meteo API.
 
-Open-Meteo provides free access to NOAA GEFS ensemble data without
-API keys.  This module fetches ensemble members for a given location
-and weather variable, returning a structured :class:`ForecastEnsemble`.
+Open-Meteo provides NOAA GEFS ensemble data (31 members) via their
+ensemble API.  A paid API key is required for ensemble access and
+commercial use.  This module fetches ensemble members for a given
+location and weather variable, returning a structured :class:`ForecastEnsemble`.
 """
 
 from __future__ import annotations
 
+import os
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,8 +18,9 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Open-Meteo GEFS ensemble endpoint
-_BASE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+# Open-Meteo ensemble endpoints
+_FREE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+_PAID_URL = "https://customer-ensemble-api.open-meteo.com/v1/ensemble"
 
 # Mapping from our canonical variable names to Open-Meteo parameter names.
 _VARIABLE_MAP: dict[str, str] = {
@@ -72,18 +75,37 @@ class NOAAEnsembleFetcher:
 
     Parameters
     ----------
+    api_key:
+        Open-Meteo API key for commercial/ensemble access.  If not provided,
+        falls back to the ``OPEN_METEO_API_KEY`` environment variable,
+        then to the free endpoint (which may not support ensemble data).
     client:
         Optional pre-configured :class:`httpx.AsyncClient`.  If ``None``
         a new client is created per call.
     """
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._api_key = api_key or os.environ.get("OPEN_METEO_API_KEY", "")
         self._client = client
         self._owns_client = client is None
 
+        if self._api_key:
+            self._base_url = _PAID_URL
+            logger.info("noaa.using_paid_endpoint", url=_PAID_URL)
+        else:
+            self._base_url = _FREE_URL
+            logger.warning(
+                "noaa.using_free_endpoint",
+                msg="No API key — ensemble data may be unavailable on free tier",
+            )
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=60.0)
         return self._client
 
     async def close(self) -> None:
@@ -118,13 +140,15 @@ class NOAAEnsembleFetcher:
         ForecastEnsemble
         """
         om_var = _VARIABLE_MAP.get(variable, variable)
-        params = {
+        params: dict[str, str | float | int] = {
             "latitude": lat,
             "longitude": lon,
             "hourly": om_var,
             "forecast_days": min(forecast_days, 16),
-            "models": "gfs025",
+            "models": "gfs025_ensemble",
         }
+        if self._api_key:
+            params["apikey"] = self._api_key
 
         client = await self._get_client()
         logger.info(
@@ -133,11 +157,18 @@ class NOAAEnsembleFetcher:
             lon=lon,
             variable=variable,
             forecast_days=forecast_days,
+            paid=bool(self._api_key),
         )
 
-        resp = await client.get(_BASE_URL, params=params)
+        resp = await client.get(self._base_url, params=params)
         resp.raise_for_status()
         payload = resp.json()
+
+        # Check for API errors
+        if payload.get("error"):
+            reason = payload.get("reason", "unknown")
+            logger.error("noaa.api_error", reason=reason)
+            raise RuntimeError(f"Open-Meteo API error: {reason}")
 
         hourly = payload.get("hourly", {})
         time_strings: list[str] = hourly.get("time", [])
@@ -194,6 +225,7 @@ class NOAAEnsembleFetcher:
 
         logger.info(
             "noaa.fetch_ensemble.done",
+            location=location_name,
             members=len(member_columns),
             timesteps=n_times,
         )

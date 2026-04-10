@@ -9,7 +9,8 @@ exchange:
   demo_mode: false
 
 weather:
-  enabled: false  # Disabled until ensemble data source is fixed (Open-Meteo rate limit)
+  enabled: true
+  open_meteo_api_key: ""  # Set in .env as MONEYGONE_WEATHER__OPEN_METEO_API_KEY
   locations:
     - name: "New York"
       lat: 40.7128

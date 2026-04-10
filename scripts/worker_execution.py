@@ -35,6 +35,7 @@ from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.data.market_discovery import MarketCategory
 from moneygone.execution.category_providers import CryptoDataProvider, WeatherDataProvider
+from moneygone.execution.artifact_runtime import build_universal_artifact_fallbacks
 from moneygone.execution.engine import (
     CategoryProvider,
     ExecutionEngine,
@@ -121,10 +122,25 @@ async def main() -> None:
 
     data_dir = Path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(config.model.model_dir)
+    if not model_dir.is_absolute():
+        model_dir = Path(__file__).resolve().parent.parent / model_dir
 
     # Own database for writes (features, predictions, fills)
     store = DataStore(data_dir / "execution.duckdb")
     store.initialize_schema(EXECUTION_TABLES)
+
+    collector_db = data_dir / "collector.duckdb"
+    store.attach_readonly("collector", collector_db)
+    store.create_attached_views(
+        {
+            "collector": [
+                "forecast_ensembles",
+                "funding_rates",
+                "open_interest",
+            ],
+        }
+    )
 
     # Cross-DB reads: DuckDB doesn't support cross-process concurrent access.
     # The collector exports sportsbook data to a parquet file; we load it
@@ -271,7 +287,9 @@ async def main() -> None:
             from moneygone.data.weather.noaa import NOAAEnsembleFetcher
             from moneygone.data.weather.ecmwf import ECMWFOpenDataFetcher
 
-            noaa_fetcher = NOAAEnsembleFetcher()
+            noaa_fetcher = NOAAEnsembleFetcher(
+                api_key=config.weather.open_meteo_api_key,
+            )
             ecmwf_fetcher = ECMWFOpenDataFetcher()
             weather_locations = [
                 {"name": loc["name"], "lat": loc["lat"], "lon": loc["lon"]}
@@ -304,10 +322,49 @@ async def main() -> None:
         except Exception:
             log.warning("execution.weather_provider_failed", exc_info=True)
 
-    # ---- Baseline model: ONLY in demo mode (stress testing) ----
+    fallback_categories = [
+        MarketCategory.ECONOMICS,
+        MarketCategory.POLITICS,
+        MarketCategory.FINANCIALS,
+        MarketCategory.COMPANIES,
+        MarketCategory.CRYPTO,
+        MarketCategory.WEATHER,
+        MarketCategory.ENTERTAINMENT,
+        MarketCategory.UNKNOWN,
+    ]
+    missing_categories = [
+        category
+        for category in fallback_categories
+        if category not in category_providers
+    ]
+    artifact_fallbacks = build_universal_artifact_fallbacks(
+        model_dir,
+        missing_categories,
+    )
+    if artifact_fallbacks:
+        for category, (artifact_model, artifact_pipeline) in artifact_fallbacks.items():
+            category_providers[category] = CategoryProvider(
+                category=category,
+                model=artifact_model,
+                pipeline=artifact_pipeline,  # type: ignore[arg-type]
+                get_context_data=None,
+            )
+        log.info(
+            "execution.artifact_fallback_providers_enabled",
+            categories=[category.value for category in artifact_fallbacks],
+            model=next(iter(artifact_fallbacks.values()))[0].name,
+        )
+
+    remaining_categories = [
+        category
+        for category in fallback_categories
+        if category not in category_providers
+    ]
+
+    # ---- Baseline model: ONLY in demo mode and only if artifacts are unavailable ----
     # The MarketBaselineModel has NO informational edge — it just mirrors
     # market pricing.  It must NEVER trade with real money.
-    if config.exchange.demo_mode:
+    if remaining_categories and config.exchange.demo_mode:
         baseline_model = MarketBaselineModel()
         baseline_pipeline = FeaturePipeline(
             [
@@ -320,18 +377,7 @@ async def main() -> None:
             ],
             store=store,
         )
-        baseline_categories = (
-            MarketCategory.ECONOMICS,
-            MarketCategory.POLITICS,
-            MarketCategory.FINANCIALS,
-            MarketCategory.COMPANIES,
-            MarketCategory.CRYPTO,
-            MarketCategory.ENTERTAINMENT,
-            MarketCategory.UNKNOWN,
-        )
-        for category in baseline_categories:
-            if category in category_providers:
-                continue
+        for category in remaining_categories:
             category_providers[category] = CategoryProvider(
                 category=category,
                 model=baseline_model,
@@ -340,19 +386,15 @@ async def main() -> None:
             )
         log.info(
             "execution.market_baseline_provider_enabled",
-            categories=[
-                category.value
-                for category in baseline_categories
-                if category in category_providers
-                and category_providers[category].model is baseline_model
-            ],
+            categories=[category.value for category in remaining_categories],
             model=baseline_model.name,
             version=baseline_model.version,
         )
-    else:
+    elif remaining_categories:
         log.warning(
-            "execution.baseline_model_skipped_live_mode",
-            msg="MarketBaselineModel is disabled in live mode — no informational edge",
+            "execution.artifact_fallbacks_missing",
+            categories=[category.value for category in remaining_categories],
+            msg="No artifact-backed fallback available for some live categories",
         )
 
     log.info(
