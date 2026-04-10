@@ -178,26 +178,37 @@ class StoreBackedSportsSnapshotProvider:
         consensus_by_event: dict[str, dict[str, Any]] = {}
 
         for league in self._leagues:
-            latest_by_event = self._store.get_latest_sportsbook_lines(
-                bookmaker="pinnacle",
-                sport=league,
-            )
+            try:
+                latest_by_event = self._store.get_latest_sportsbook_lines(
+                    bookmaker="pinnacle",
+                    sport=league,
+                )
+            except Exception:
+                # Table may not exist if using execution store instead of collector
+                logger.debug("sports_snapshots.no_sportsbook_table", league=league)
+                continue
             if not latest_by_event:
                 continue
             latest_rows.extend(latest_by_event.values())
-            opening_by_event.update(
-                self._store.get_opening_sportsbook_lines(
-                    bookmaker="pinnacle",
-                    sport=league,
-                    event_ids=list(latest_by_event.keys()),
+            try:
+                opening_by_event.update(
+                    self._store.get_opening_sportsbook_lines(
+                        bookmaker="pinnacle",
+                        sport=league,
+                        event_ids=list(latest_by_event.keys()),
+                    )
                 )
-            )
+            except Exception:
+                pass
             # Fetch consensus (non-Pinnacle) lines for sportsbook_home_win_prob
             for bk in ("fanduel", "draftkings", "betmgm"):
-                consensus = self._store.get_latest_sportsbook_lines(
-                    bookmaker=bk,
-                    sport=league,
-                )
+                try:
+                    consensus = self._store.get_latest_sportsbook_lines(
+                        bookmaker=bk,
+                        sport=league,
+                    )
+                except Exception:
+                    continue
                 if consensus:
                     for eid, row in consensus.items():
                         if eid not in consensus_by_event:
