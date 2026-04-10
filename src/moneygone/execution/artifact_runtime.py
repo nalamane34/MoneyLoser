@@ -55,6 +55,11 @@ _FINANCIAL_RANGE_PREFIXES = (
     "KXDOGE",
 )
 
+DEFAULT_UNIVERSAL_MODEL_CANDIDATES = (
+    "trained/gbm_universal/model.pkl",
+    "trained/logistic_universal/model.pkl",
+)
+
 
 class ArtifactBackedModel(ProbabilityModel):
     """Probability model wrapper around the joblib artifacts in ``models/trained``."""
@@ -196,6 +201,33 @@ def load_default_artifact_model(model_dir: Path, candidates: list[str], *, model
 def universal_category_id(category: MarketCategory) -> float:
     """Best-effort category hint for the universal artifact model."""
     return _UNIVERSAL_CATEGORY_HINTS.get(category, _UNIVERSAL_CATEGORY_HINTS[MarketCategory.UNKNOWN])
+
+
+def build_universal_artifact_fallbacks(
+    model_dir: Path,
+    categories: list[MarketCategory],
+    *,
+    model_name: str = "market_universal",
+) -> dict[MarketCategory, tuple[ArtifactBackedModel, ArtifactFeaturePipeline]]:
+    """Build artifact-backed fallback model/pipeline pairs for market categories."""
+    model = load_default_artifact_model(
+        model_dir,
+        list(DEFAULT_UNIVERSAL_MODEL_CANDIDATES),
+        model_name=model_name,
+    )
+    if model is None:
+        return {}
+
+    return {
+        category: (
+            model,
+            ArtifactFeaturePipeline(
+                model.feature_names,
+                category_id=universal_category_id(category),
+            ),
+        )
+        for category in categories
+    }
 
 
 def is_financial_range_market(market: Market | None) -> bool:
