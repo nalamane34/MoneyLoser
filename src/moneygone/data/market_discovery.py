@@ -49,12 +49,14 @@ class MarketCategory(str, Enum):
     POLITICS = "politics"
     FINANCIALS = "financials"
     COMPANIES = "companies"
+    ENTERTAINMENT = "entertainment"
     UNKNOWN = "unknown"
 
 
 _CRYPTO_PATTERNS = re.compile(
     r"bitcoin|\bbtc\b|ethereum|\beth\b|solana|\bsol\b|crypto|\bdoge\b|\bxrp\b|"
-    r"coin price|\bbnb\b|\bada\b|\bavax\b|litecoin|\bltc\b",
+    r"coin price|\bbnb\b|\bada\b|\bavax\b|litecoin|\bltc\b|"
+    r"kxhyped\b|kxhypemaxmon\b|kxhype\d",
     re.IGNORECASE,
 )
 _WEATHER_PATTERNS = re.compile(
@@ -67,16 +69,21 @@ _WEATHER_PATTERNS = re.compile(
 _ECONOMICS_PATTERNS = re.compile(
     r"fed fund|interest rate|cpi|inflation|gdp|unemployment|"
     r"jobs report|nonfarm|payroll|fomc|treasury|yield curve|"
-    r"recession|economic|consumer price",
+    r"recession|economic|consumer price|"
+    r"mortgage rate|retail sales|kxmortgagerate|kxusretail|"
+    r"kxusdebt|us debt|debt ceiling",
     re.IGNORECASE,
 )
 _SPORTS_PATTERNS = re.compile(
     r"\b(?:nba|nfl|mlb|nhl|ncaa|moneyline|championship|playoff|soccer|mls|epl|"
     r"tennis|boxing|mma|ufc|golf|pga|lpga|esports|bundesliga|serie a|la liga|"
-    r"ligue 1|premier league|kbo|npb|total runs|spread|team total)\b|"
+    r"ligue 1|premier league|kbo|npb|total runs|spread|team total|"
+    r"formula.?1|nascar|cricket|ipl|heavyweight|grand prix|fastest lap)\b|"
     r"\b(?:vs\.?|at)\b|"
     r"\bkx(?:nba|mlb|nhl|nfl|ncaa|epl|mls|laliga|bundesliga|seriea|ligue1|ucl|"
-    r"kbo|npb|elh|pga|lpga|tennis|esports)",
+    r"kbo|npb|elh|pga|lpga|tennis|esports|"
+    r"f1|nascar|brasileiro|ligamx|wcsquad|wbc|ipl|nextteam|heisman|"
+    r"mlbhr|mlbk|mlbhits|mlbrbi)",
     re.IGNORECASE,
 )
 _POLITICS_PATTERNS = re.compile(
@@ -84,7 +91,9 @@ _POLITICS_PATTERNS = re.compile(
     r"democrat|republican|governor|mayor|vote|ballot|"
     r"political|cabinet|supreme court|scotus|impeach|"
     r"executive order|legislation|bill sign|veto|"
-    r"primary|caucus|nominee|approval rating|poll",
+    r"primary|caucus|nominee|approval rating|poll|"
+    r"kxpoliticsmention|kxkamalamention|kxhegsethout|kxbillscount|kxchcuts|"
+    r"kamala|hegseth|bernie sanders|secretary of defense|bills.*become law",
     re.IGNORECASE,
 )
 _FINANCIALS_PATTERNS = re.compile(
@@ -93,7 +102,11 @@ _FINANCIALS_PATTERNS = re.compile(
     r"nyse|wall street|bear market|bull market|"
     r"oil price|gold price|silver price|commodity|"
     r"forex|\beur\b|\busd\b|exchange rate|bond|"
-    r"\binx\b|\binxu\b|\bkxsilver\b|\bkxgold\b|\bkxoil\b",
+    r"\binx\b|\binxu\b|\bkxsilver\b|\bkxgold\b|\bkxoil\b|"
+    r"kxh\d+w\b|kxrtx\d|kxb\d+w\b|kxa\d+w\b|"
+    r"kxaaag|kxnickel|kxtsaw|kxhormuz|kxusdx|kxwti|kxeurusd|kxusdjpy|"
+    r"nickel|natural gas|gpu price|tsa.*screen|"
+    r"close price|screened by the tsa",
     re.IGNORECASE,
 )
 _COMPANIES_PATTERNS = re.compile(
@@ -101,7 +114,25 @@ _COMPANIES_PATTERNS = re.compile(
     r"truth social|tiktok|twitter|\bx corp\b|openai|"
     r"spacex|starlink|neuralink|"
     r"earnings|revenue|market cap|ipo|stock split|"
-    r"ceo|layoff|merger|acquisition|antitrust",
+    r"ceo|layoff|merger|acquisition|antitrust|"
+    r"kxabnb|kxpm\b|kxmtch|kxmusknw|kxagico|"
+    r"airbnb|match group|philip morris|musk.*net worth|"
+    r"payers|shipment volume|nights.*booked",
+    re.IGNORECASE,
+)
+
+_ENTERTAINMENT_PATTERNS = re.compile(
+    r"kxalbumstream|kxartiststream|kxbbchartposition|kxranklistsong|"
+    r"kxnetflixrank|kxcannespalmedor|kxanime|kxsnlmention|kxsnlhost|"
+    r"kxsurvivormention|kxmrbeastmention|kxberniemention|"
+    r"kxfestivalevent|kxmcmmen|kxsongrelease|kxfeature[a-z]|"
+    r"kxoscarnompic|kxoscarnomact|kxrockandrollhalloffame|"
+    r"kxrt\b|kxtechranklistaicode|"
+    r"billboard|spotify|luminate|streams|"
+    r"rotten tomatoes|oscar|grammy|emmy|golden globe|"
+    r"crunchyroll|anime award|snl|saturday night live|"
+    r"survivor|netflix.*rank|coachella|music.*festival|"
+    r"youtube.*video|mrbeast",
     re.IGNORECASE,
 )
 
@@ -118,6 +149,11 @@ _EXPLICIT_CATEGORY_ALIASES: tuple[tuple[str, MarketCategory], ...] = (
     ("business", MarketCategory.COMPANIES),
     ("tech", MarketCategory.COMPANIES),
     ("sport", MarketCategory.SPORTS),
+    ("entertainment", MarketCategory.ENTERTAINMENT),
+    ("culture", MarketCategory.ENTERTAINMENT),
+    ("music", MarketCategory.ENTERTAINMENT),
+    ("tv", MarketCategory.ENTERTAINMENT),
+    ("film", MarketCategory.ENTERTAINMENT),
 )
 
 
@@ -152,6 +188,8 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.CRYPTO
     if _WEATHER_PATTERNS.search(text):
         return MarketCategory.WEATHER
+    if _SPORTS_PATTERNS.search(text):
+        return MarketCategory.SPORTS
     if _POLITICS_PATTERNS.search(text):
         return MarketCategory.POLITICS
     if _ECONOMICS_PATTERNS.search(text):
@@ -160,8 +198,8 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.COMPANIES
     if _FINANCIALS_PATTERNS.search(text):
         return MarketCategory.FINANCIALS
-    if _SPORTS_PATTERNS.search(text):
-        return MarketCategory.SPORTS
+    if _ENTERTAINMENT_PATTERNS.search(text):
+        return MarketCategory.ENTERTAINMENT
     return MarketCategory.UNKNOWN
 
 

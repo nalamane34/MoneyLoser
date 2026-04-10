@@ -623,6 +623,7 @@ def build_app(config: AppConfig) -> Application:
             MarketCategory.FINANCIALS,
             MarketCategory.COMPANIES,
             MarketCategory.CRYPTO,
+            MarketCategory.ENTERTAINMENT,
             MarketCategory.UNKNOWN,
         ]
         for cat in _baseline_cats:
