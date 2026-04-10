@@ -251,15 +251,37 @@ def _extract_priced_team(
     return ""
 
 
-def _implied_prob(home_price: float | None, away_price: float | None) -> float | None:
+def _implied_prob(
+    home_price: float | None,
+    away_price: float | None,
+    draw_price: float | None = None,
+) -> float | None:
+    """Convert decimal odds to implied home win probability.
+
+    For 3-way markets (soccer), the draw probability is removed and the
+    remaining home/away probabilities are renormalized so they sum to 1.
+    Without this, the draw probability gets silently redistributed to
+    both sides, inflating the underdog.
+    """
     if home_price is None or away_price is None or home_price <= 1.0 or away_price <= 1.0:
         return None
     raw_home = 1.0 / home_price
     raw_away = 1.0 / away_price
-    total = raw_home + raw_away
-    if total <= 0:
+    raw_draw = 0.0
+    if draw_price is not None and draw_price > 1.0:
+        raw_draw = 1.0 / draw_price
+    # Remove overround, then strip the draw share
+    total_vig = raw_home + raw_away + raw_draw
+    if total_vig <= 0:
         return None
-    return raw_home / total
+    # De-vig each outcome
+    home_fair = raw_home / total_vig
+    away_fair = raw_away / total_vig
+    # Renormalize home vs away only (exclude draw)
+    ha_total = home_fair + away_fair
+    if ha_total <= 0:
+        return None
+    return home_fair / ha_total
 
 
 class StoreBackedSportsSnapshotProvider:
@@ -477,9 +499,11 @@ class StoreBackedSportsSnapshotProvider:
 
         current_home = self._float_or_none(match.get("home_price"))
         current_away = self._float_or_none(match.get("away_price"))
+        current_draw = self._float_or_none(match.get("draw_price"))
         opening_home = self._float_or_none(opening.get("home_price"))
         opening_away = self._float_or_none(opening.get("away_price"))
-        pinnacle_prob = _implied_prob(current_home, current_away)
+        opening_draw = self._float_or_none(opening.get("draw_price"))
+        pinnacle_prob = _implied_prob(current_home, current_away, current_draw)
 
         # Consensus (non-Pinnacle) probability for sportsbook_home_win_prob
         event_id_str = str(match.get("event_id", ""))
@@ -487,7 +511,8 @@ class StoreBackedSportsSnapshotProvider:
         if consensus_row is not None:
             cons_home = self._float_or_none(consensus_row.get("home_price"))
             cons_away = self._float_or_none(consensus_row.get("away_price"))
-            consensus_prob = _implied_prob(cons_home, cons_away)
+            cons_draw = self._float_or_none(consensus_row.get("draw_price"))
+            consensus_prob = _implied_prob(cons_home, cons_away, cons_draw)
         else:
             consensus_prob = None
 
@@ -502,10 +527,13 @@ class StoreBackedSportsSnapshotProvider:
             "pinnacle_home_win_prob": pinnacle_prob,
             "pinnacle_moneyline_home": current_home,
             "pinnacle_moneyline_away": current_away,
+            "pinnacle_moneyline_draw": current_draw,
             "current_moneyline_home": current_home,
             "current_moneyline_away": current_away,
+            "current_moneyline_draw": current_draw,
             "opening_moneyline_home": opening_home,
             "opening_moneyline_away": opening_away,
+            "opening_moneyline_draw": opening_draw,
             "spread": self._float_or_none(match.get("spread_home")),
             "total": self._float_or_none(match.get("total")),
             "home_team_rating": home_rating.rating if home_rating is not None else None,

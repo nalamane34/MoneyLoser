@@ -125,17 +125,32 @@ def _decimal_to_implied_prob(decimal_odds: float) -> float:
     return 1.0 / decimal_odds
 
 
-def _consensus_implied_prob(home_odds: float, away_odds: float) -> tuple[float, float]:
+def _consensus_implied_prob(
+    home_odds: float,
+    away_odds: float,
+    draw_odds: float | None = None,
+) -> tuple[float, float]:
     """Normalise raw implied probabilities to remove overround.
+
+    For 3-way markets (soccer), the draw probability is removed and only
+    home/away are renormalized.  Without this correction, the draw share
+    gets redistributed equally, systematically inflating the underdog.
 
     Returns ``(home_prob, away_prob)`` that sum to 1.0.
     """
     raw_home = _decimal_to_implied_prob(home_odds)
     raw_away = _decimal_to_implied_prob(away_odds)
-    total = raw_home + raw_away
-    if total <= 0:
+    raw_draw = _decimal_to_implied_prob(draw_odds) if draw_odds is not None else 0.0
+    total_vig = raw_home + raw_away + raw_draw
+    if total_vig <= 0:
         return 0.5, 0.5
-    return raw_home / total, raw_away / total
+    # De-vig each outcome, then renormalize home vs away only
+    home_fair = raw_home / total_vig
+    away_fair = raw_away / total_vig
+    ha_total = home_fair + away_fair
+    if ha_total <= 0:
+        return 0.5, 0.5
+    return home_fair / ha_total, away_fair / ha_total
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +183,9 @@ class SportsbookWinProbability(Feature):
         away_odds = _getf(context, "current_moneyline_away")
         if home_odds is None or away_odds is None:
             return None
+        draw_odds = _getf(context, "current_moneyline_draw")
 
-        home_prob, away_prob = _consensus_implied_prob(home_odds, away_odds)
+        home_prob, away_prob = _consensus_implied_prob(home_odds, away_odds, draw_odds)
         return _team_perspective(home_prob, away_prob, context)
 
 
@@ -192,7 +208,8 @@ class PinnacleWinProbability(Feature):
             away_odds = _getf(context, "pinnacle_moneyline_away")
             if home_odds is None or away_odds is None:
                 return None
-            home_prob, away_prob = _consensus_implied_prob(home_odds, away_odds)
+            draw_odds = _getf(context, "pinnacle_moneyline_draw")
+            home_prob, away_prob = _consensus_implied_prob(home_odds, away_odds, draw_odds)
         else:
             away_prob = 1.0 - home_prob
         return _team_perspective(home_prob, away_prob, context)
@@ -273,8 +290,11 @@ class MoneylineMovement(Feature):
         if open_away is None or curr_away is None:
             return None
 
-        open_home_prob, open_away_prob = _consensus_implied_prob(open_home, open_away)
-        curr_home_prob, curr_away_prob = _consensus_implied_prob(curr_home, curr_away)
+        open_draw = _getf(context, "opening_moneyline_draw")
+        curr_draw = _getf(context, "current_moneyline_draw")
+
+        open_home_prob, open_away_prob = _consensus_implied_prob(open_home, open_away, open_draw)
+        curr_home_prob, curr_away_prob = _consensus_implied_prob(curr_home, curr_away, curr_draw)
 
         home_move = curr_home_prob - open_home_prob
         away_move = curr_away_prob - open_away_prob

@@ -720,6 +720,7 @@ class OddsAPIFeed:
         """Extract one bookmaker's line snapshot for a game."""
         home_price: float | None = None
         away_price: float | None = None
+        draw_price: float | None = None
         spread_home: float | None = None
         total: float | None = None
 
@@ -737,6 +738,8 @@ class OddsAPIFeed:
                         home_price = price
                     elif outcome.get("name") == game.away_team:
                         away_price = price
+                    elif str(outcome.get("name", "")).lower() == "draw":
+                        draw_price = price
 
             elif key == "spreads":
                 for outcome in outcomes:
@@ -759,6 +762,7 @@ class OddsAPIFeed:
         return {
             "home_price": home_price,
             "away_price": away_price,
+            "draw_price": draw_price,
             "spread_home": spread_home,
             "total": total,
         }
@@ -791,6 +795,7 @@ class OddsAPIFeed:
                         "commence_time": self._parse_timestamp(game.commence_time),
                         "home_price": home_price,
                         "away_price": away_price,
+                        "draw_price": line.get("draw_price"),
                         "spread_home": line["spread_home"],
                         "total": line["total"],
                         "captured_at": captured_at,
