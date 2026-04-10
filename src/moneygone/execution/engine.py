@@ -364,6 +364,81 @@ class ExecutionEngine:
     # Market evaluation
     # ------------------------------------------------------------------
 
+    def _log_candidate(
+        self,
+        *,
+        ticker: str,
+        category: str,
+        status: str,
+        reject_reason: str = "",
+        model_prob: float | None = None,
+        market_prob: float | None = None,
+        raw_edge: float | None = None,
+        fee_adjusted_edge: float | None = None,
+        confidence: float | None = None,
+        side: str | None = None,
+        action: str | None = None,
+        contracts: int | None = None,
+        target_price: str | None = None,
+        kelly_fraction: float | None = None,
+        spread: float | None = None,
+        liquidity: int | None = None,
+        fill_rate: float | None = None,
+        features: dict[str, float] | None = None,
+        risk_limit: str | None = None,
+    ) -> None:
+        """Emit a structured log entry for every candidate trade evaluation.
+
+        This is the foundation for the stress testing framework: every
+        market that reaches evaluate_market() gets logged, whether it
+        was selected for trading or rejected at any gate.
+        """
+        log_fields: dict[str, Any] = {
+            "ticker": ticker,
+            "category": category,
+            "status": status,  # "selected" | "rejected"
+        }
+        if reject_reason:
+            log_fields["reject_reason"] = reject_reason
+        if model_prob is not None:
+            log_fields["model_prob"] = round(model_prob, 4)
+        if market_prob is not None:
+            log_fields["market_prob"] = round(market_prob, 4)
+        if raw_edge is not None:
+            log_fields["raw_edge"] = round(raw_edge, 4)
+        if fee_adjusted_edge is not None:
+            log_fields["fee_adjusted_edge"] = round(fee_adjusted_edge, 4)
+        if confidence is not None:
+            log_fields["confidence"] = round(confidence, 4)
+        if side is not None:
+            log_fields["side"] = side
+        if action is not None:
+            log_fields["action"] = action
+        if contracts is not None:
+            log_fields["contracts"] = contracts
+        if target_price is not None:
+            log_fields["target_price"] = target_price
+        if kelly_fraction is not None:
+            log_fields["kelly_fraction"] = round(kelly_fraction, 4)
+        if spread is not None:
+            log_fields["spread"] = round(spread, 4)
+        if liquidity is not None:
+            log_fields["liquidity"] = liquidity
+        if fill_rate is not None:
+            log_fields["fill_rate"] = round(fill_rate, 4)
+        if risk_limit is not None:
+            log_fields["risk_limit"] = risk_limit
+        if features is not None:
+            # Include key feature values for post-hoc analysis
+            for k in (
+                "ensemble_exceedance_prob", "ensemble_mean", "ensemble_spread",
+                "model_disagreement", "forecast_horizon",
+            ):
+                if k in features:
+                    log_fields[f"f_{k}"] = round(features[k], 4)
+
+        logger.info("engine.candidate", **log_fields)
+
     async def evaluate_market(self, ticker: str) -> TradeDecision | None:
         """Run the full decision pipeline for a single market.
 
@@ -377,8 +452,12 @@ class ExecutionEngine:
           7. If approved: return TradeDecision
 
         Returns None if the market is not tradeable or edge is insufficient.
+        Every evaluation — selected or rejected — is logged via _log_candidate()
+        for stress test analysis.
         """
         now = datetime.now(timezone.utc)
+        category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
+        cat_str = category.value
 
         if any(order.ticker == ticker for order in self._orders.get_open_orders()):
             logger.debug("engine.open_order_exists", ticker=ticker)
@@ -404,13 +483,22 @@ class ExecutionEngine:
                     timestamp=now,
                 )
             else:
-                logger.debug("engine.no_orderbook", ticker=ticker)
+                self._log_candidate(
+                    ticker=ticker, category=cat_str,
+                    status="rejected", reject_reason="no_orderbook",
+                )
                 return None
 
+        # Compute spread from orderbook
+        market_obj = self._market_cache.get(ticker)
+        ob_spread: float | None = None
+        if market_obj is not None and market_obj.yes_bid > 0 and market_obj.yes_ask > 0:
+            ob_spread = float(market_obj.yes_ask - market_obj.yes_bid)
+
         # 2. Determine market category and get the right model/pipeline
-        category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
         provider = self._category_providers.get(category)
         sports_snapshot: dict[str, Any] | None = None
+        features: dict[str, float] = {}
 
         if provider is not None:
             # Use category-specific model + pipeline + data provider
@@ -420,10 +508,9 @@ class ExecutionEngine:
                     self._market_cache.get(ticker),
                 ) or {}
             if not context_data:
-                logger.debug(
-                    "engine.no_category_data",
-                    ticker=ticker,
-                    category=category.value,
+                self._log_candidate(
+                    ticker=ticker, category=cat_str,
+                    status="rejected", reject_reason="no_category_data",
                 )
                 return None
 
@@ -441,18 +528,19 @@ class ExecutionEngine:
             )
             features = provider.pipeline.compute(context)
             if not features:
-                logger.debug("engine.no_features", ticker=ticker, category=category.value)
+                self._log_candidate(
+                    ticker=ticker, category=cat_str,
+                    status="rejected", reject_reason="no_features",
+                )
                 return None
             prediction = provider.model.predict_proba(features)
         else:
             # Legacy path: sports-only via sports_snapshot_provider
             sports_snapshot = await self._get_sports_snapshot(ticker)
             if sports_snapshot is None:
-                logger.debug(
-                    "engine.no_data_for_category",
-                    ticker=ticker,
-                    category=category.value,
-                    msg="No provider and no sports snapshot — skipping",
+                self._log_candidate(
+                    ticker=ticker, category=cat_str,
+                    status="rejected", reject_reason="no_data_provider",
                 )
                 return None
 
@@ -466,17 +554,26 @@ class ExecutionEngine:
             )
             features = self._pipeline.compute(context)
             if not features:
-                logger.debug("engine.no_features", ticker=ticker)
+                self._log_candidate(
+                    ticker=ticker, category=cat_str,
+                    status="rejected", reject_reason="no_features",
+                )
                 return None
             prediction = self._model.predict_proba(features)
 
+        # Common fields for all subsequent log entries
+        market_prob_est = float(orderbook.yes_bids[0].price) if orderbook.yes_bids else None
+
         # 3. Reject low-confidence predictions
         if prediction.confidence < 0.30:
-            logger.debug(
-                "engine.low_confidence",
-                ticker=ticker,
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected", reject_reason="low_confidence",
+                model_prob=prediction.probability,
+                market_prob=market_prob_est,
                 confidence=prediction.confidence,
-                msg="Model confidence too low to act",
+                spread=ob_spread,
+                features=features,
             )
             return None
 
@@ -488,10 +585,18 @@ class ExecutionEngine:
         )
 
         if not edge.is_actionable:
-            logger.debug(
-                "engine.edge_not_actionable",
-                ticker=ticker,
-                net_edge=edge.fee_adjusted_edge,
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected", reject_reason="edge_not_actionable",
+                model_prob=prediction.probability,
+                market_prob=edge.implied_probability,
+                raw_edge=edge.raw_edge,
+                fee_adjusted_edge=edge.fee_adjusted_edge,
+                confidence=prediction.confidence,
+                side=edge.side,
+                spread=ob_spread,
+                liquidity=edge.available_liquidity,
+                features=features,
             )
             return None
 
@@ -502,14 +607,18 @@ class ExecutionEngine:
             sports_snapshot=sports_snapshot,
         )
         if duplicate is not None:
-            logger.info(
-                "engine.duplicate_exposure_blocked",
-                ticker=ticker,
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected", reject_reason=f"duplicate_exposure:{duplicate['kind']}",
+                model_prob=prediction.probability,
+                market_prob=edge.implied_probability,
+                raw_edge=edge.raw_edge,
+                fee_adjusted_edge=edge.fee_adjusted_edge,
+                confidence=prediction.confidence,
                 side=edge.side,
-                conflict_kind=duplicate["kind"],
-                conflict_ticker=duplicate["ticker"],
-                conflict_side=duplicate.get("side"),
-                conflict_contracts=duplicate.get("contracts"),
+                spread=ob_spread,
+                liquidity=edge.available_liquidity,
+                features=features,
             )
             return None
 
@@ -525,10 +634,21 @@ class ExecutionEngine:
         )
 
         if size.contracts <= 0:
-            logger.debug(
-                "engine.zero_size",
-                ticker=ticker,
-                capped_by=size.capped_by,
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected", reject_reason=f"zero_size:{size.capped_by or 'kelly'}",
+                model_prob=prediction.probability,
+                market_prob=edge.implied_probability,
+                raw_edge=edge.raw_edge,
+                fee_adjusted_edge=edge.fee_adjusted_edge,
+                confidence=prediction.confidence,
+                side=edge.side,
+                action=edge.action,
+                kelly_fraction=size.kelly_fraction,
+                spread=ob_spread,
+                liquidity=edge.available_liquidity,
+                fill_rate=edge.estimated_fill_rate,
+                features=features,
             )
             return None
 
@@ -550,11 +670,24 @@ class ExecutionEngine:
             actual_contracts = risk_check.adjusted_size
 
         if not risk_check.approved:
-            logger.info(
-                "engine.risk_rejected",
-                ticker=ticker,
-                limit=risk_check.limit_triggered,
-                reason=risk_check.rejection_reason,
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected", reject_reason="risk_rejected",
+                model_prob=prediction.probability,
+                market_prob=edge.implied_probability,
+                raw_edge=edge.raw_edge,
+                fee_adjusted_edge=edge.fee_adjusted_edge,
+                confidence=prediction.confidence,
+                side=edge.side,
+                action=edge.action,
+                contracts=size.contracts,
+                target_price=str(edge.target_price),
+                kelly_fraction=size.kelly_fraction,
+                spread=ob_spread,
+                liquidity=edge.available_liquidity,
+                fill_rate=edge.estimated_fill_rate,
+                risk_limit=risk_check.limit_triggered,
+                features=features,
             )
             return None
 
@@ -574,14 +707,24 @@ class ExecutionEngine:
             timestamp=now,
         )
 
-        logger.info(
-            "engine.trade_decision",
-            ticker=ticker,
+        # Log as selected candidate with full metadata
+        self._log_candidate(
+            ticker=ticker, category=cat_str,
+            status="selected",
+            model_prob=prediction.probability,
+            market_prob=edge.implied_probability,
+            raw_edge=edge.raw_edge,
+            fee_adjusted_edge=edge.fee_adjusted_edge,
+            confidence=prediction.confidence,
             side=edge.side,
+            action=edge.action,
             contracts=actual_contracts,
-            net_edge=round(edge.fee_adjusted_edge, 4),
-            model_prob=round(prediction.probability, 4),
-            kelly=round(size.kelly_fraction, 4),
+            target_price=str(edge.target_price),
+            kelly_fraction=size.kelly_fraction,
+            spread=ob_spread,
+            liquidity=edge.available_liquidity,
+            fill_rate=edge.estimated_fill_rate,
+            features=features,
         )
 
         return decision
@@ -641,6 +784,10 @@ class ExecutionEngine:
                 await self._refresh_market_universe()
                 await self._maybe_reconcile_open_orders()
 
+                cycle_evaluated = 0
+                cycle_selected = 0
+                cycle_start = datetime.now(timezone.utc)
+
                 for ticker in self._watched:
                     if not self._running:
                         break
@@ -655,10 +802,24 @@ class ExecutionEngine:
                             continue
 
                     self._last_eval[ticker] = now
+                    cycle_evaluated += 1
 
                     decision = await self.evaluate_market(ticker)
                     if decision is not None:
+                        cycle_selected += 1
                         await self.execute_decision(decision)
+
+                # Per-cycle summary for stress test analysis
+                if cycle_evaluated > 0:
+                    elapsed_s = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+                    logger.info(
+                        "engine.cycle_summary",
+                        evaluated=cycle_evaluated,
+                        selected=cycle_selected,
+                        rejected=cycle_evaluated - cycle_selected,
+                        watched_total=len(self._watched),
+                        elapsed_s=round(elapsed_s, 1),
+                    )
 
             except asyncio.CancelledError:
                 return
