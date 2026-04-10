@@ -10,7 +10,7 @@ build/
 *.env
 *.pem
 *.key
-data/
+/data/
 models/trained/
 models/*.pkl
 models/*.joblib
