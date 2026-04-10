@@ -96,7 +96,7 @@ async def _ws_loop(
     while True:
         try:
             # Discover all open markets via REST
-            markets = await rest_client.get_all_markets(status="open", limit=200)
+            markets = await rest_client.get_all_markets(status="open", limit=1000)
             current_tickers = {m.ticker for m in markets}
 
             # Subscribe to new tickers
@@ -136,7 +136,7 @@ async def _rest_sweep_loop(
 
     while True:
         try:
-            markets = await rest_client.get_all_markets(status="open", limit=200)
+            markets = await rest_client.get_all_markets(status="open", limit=1000)
             if markets:
                 for m in markets:
                     row = {

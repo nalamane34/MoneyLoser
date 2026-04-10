@@ -685,7 +685,7 @@ class ExecutionEngine:
         ):
             return
 
-        markets = await self._rest.get_all_markets(status="open", limit=200)
+        markets = await self._rest.get_all_markets(status="open", limit=1000)
         new_tickers: list[str] = []
         category_counts: dict[str, int] = {}
 
