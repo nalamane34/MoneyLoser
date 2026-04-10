@@ -205,7 +205,7 @@ async def main() -> None:
                 exchange_ids=config.crypto.exchanges,
             )
             vol_feed = CryptoVolatilityFeed(
-                exchange_id=config.crypto.exchanges[0] if config.crypto.exchanges else "binance",
+                exchange_id=config.crypto.exchanges[0] if config.crypto.exchanges else "binanceus",
             )
             crypto_provider = CryptoDataProvider(crypto_feed, vol_feed)
             crypto_model = CryptoVolModel()

@@ -17,7 +17,7 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 # Open-Meteo GEFS ensemble endpoint
-_BASE_URL = "https://ensemble-api.open-meteo.com/v1/gfs"
+_BASE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
 # Mapping from our canonical variable names to Open-Meteo parameter names.
 _VARIABLE_MAP: dict[str, str] = {

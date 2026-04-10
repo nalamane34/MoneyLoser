@@ -76,7 +76,7 @@ class CryptoVolatilityFeed:
 
     def __init__(
         self,
-        exchange_id: str = "binance",
+        exchange_id: str = "binanceus",
         deribit_enabled: bool = True,
     ) -> None:
         self._exchange_id = exchange_id

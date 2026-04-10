@@ -23,7 +23,7 @@ weather:
 crypto:
   enabled: true
   exchanges:
-    - "binance"
+    - "binanceus"
   symbols:
     - "BTC/USDT"
     - "ETH/USDT"

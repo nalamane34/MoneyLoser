@@ -89,7 +89,7 @@ class CryptoDataFeed:
         *,
         sandbox: bool = False,
     ) -> None:
-        self._exchange_ids = exchange_ids or ["binance"]
+        self._exchange_ids = exchange_ids or ["binanceus"]
         self._sandbox = sandbox
         self._exchanges: dict[str, ccxt_async.Exchange] = {}
         self._streaming = False
