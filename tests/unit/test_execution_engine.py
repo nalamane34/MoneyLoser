@@ -7,8 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from moneygone.exchange.types import Action, Market, MarketResult, MarketStatus, Order, OrderStatus, Side
-from moneygone.execution.engine import ExecutionEngine
+from moneygone.execution.engine import CategoryProvider, ExecutionEngine, TradeDecision
+from moneygone.models.base import ModelPrediction, ProbabilityModel
+from moneygone.data.market_discovery import MarketCategory
 from moneygone.risk.portfolio import LocalPosition
+from moneygone.signals.edge import EdgeResult
+from moneygone.sizing.kelly import SizeResult
+from moneygone.sizing.risk_limits import RiskCheckResult
 
 
 def _market(ticker: str, *, event_ticker: str, yes_sub_title: str) -> Market:
@@ -272,3 +277,216 @@ async def test_reconcile_runs_on_startup() -> None:
     await engine.stop()
 
     assert orders.reconcile_calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# Demo-only model safety tests
+# ---------------------------------------------------------------------------
+
+
+def _make_prediction(*, model_name: str = "sharp_sportsbook") -> ModelPrediction:
+    return ModelPrediction(
+        probability=0.60,
+        raw_probability=0.60,
+        confidence=0.50,
+        model_name=model_name,
+        model_version="v1",
+        features_used={},
+        prediction_time=datetime.now(timezone.utc),
+    )
+
+
+def _make_edge() -> EdgeResult:
+    return EdgeResult(
+        raw_edge=0.05,
+        fee_adjusted_edge=0.04,
+        implied_probability=0.55,
+        model_probability=0.60,
+        available_liquidity=10,
+        estimated_fill_rate=0.8,
+        is_actionable=True,
+        side="yes",
+        action="buy",
+        target_price=Decimal("0.55"),
+        expected_value=Decimal("0.04"),
+    )
+
+
+def _make_size() -> SizeResult:
+    return SizeResult(
+        kelly_fraction=0.10,
+        adjusted_fraction=0.025,
+        contracts=3,
+        dollar_risk=Decimal("1.65"),
+        dollar_ev=Decimal("0.12"),
+        capped_by=None,
+    )
+
+
+def _make_risk_check() -> RiskCheckResult:
+    return RiskCheckResult(approved=True, adjusted_size=None, limit_triggered=None, rejection_reason=None)
+
+
+def _make_decision(*, model_name: str = "sharp_sportsbook", ticker: str = "KXTEST-YES") -> TradeDecision:
+    return TradeDecision(
+        ticker=ticker,
+        edge_result=_make_edge(),
+        size_result=_make_size(),
+        risk_check=_make_risk_check(),
+        prediction=_make_prediction(model_name=model_name),
+        timestamp=datetime.now(timezone.utc),
+        cycle_id="test-cycle",
+        category="economics",
+    )
+
+
+class _DemoOnlyModel:
+    """Fake model that declares itself as demo-only."""
+    name = "future_experimental"
+    version = "v0"
+    demo_only = True
+
+
+class _RealModel:
+    """Fake model with real edge."""
+    name = "sharp_sportsbook"
+    version = "v1"
+    demo_only = False
+
+
+class _FakeOrderbook:
+    """Minimal orderbook for execute_decision tests."""
+    def __init__(self):
+        self.yes_bids = [{"price": Decimal("0.55"), "quantity": 10}]
+        self.no_bids = [{"price": Decimal("0.45"), "quantity": 10}]
+
+
+class _FakeStrategy:
+    """Tracks whether execute was called."""
+    def __init__(self):
+        self.executed = False
+
+    async def execute(self, edge, size, orders, orderbook):
+        self.executed = True
+        return None  # No actual order created
+
+
+class _FakeWSForGuard:
+    """Returns a fake orderbook."""
+    def get_orderbook(self, ticker):
+        return _FakeOrderbook()
+
+
+def _engine_for_guard_test(*, demo_mode: bool, category_providers=None) -> ExecutionEngine:
+    """Create a minimal engine for testing execute_decision guards."""
+    engine = object.__new__(ExecutionEngine)
+    engine._demo_mode = demo_mode
+    engine._category_providers = category_providers or {}
+    engine._market_categories = {}
+    engine._market_cache = {}
+    engine._decision_context = {}
+    engine._decision_context_by_client_order_id = {}
+    engine._ws = _FakeWSForGuard()
+    engine._rest = SimpleNamespace()
+    engine._fills = SimpleNamespace(record_submission=lambda: None)
+    engine._strategy = _FakeStrategy()
+    engine._orders = _FakeOrders([])
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_blocks_market_baseline_in_live_mode() -> None:
+    """market_baseline model must be blocked when demo_mode=False."""
+    engine = _engine_for_guard_test(demo_mode=False)
+    decision = _make_decision(model_name="market_baseline")
+
+    await engine.execute_decision(decision)
+
+    # Strategy should NOT have been called
+    assert engine._strategy.executed is False
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_allows_market_baseline_in_demo_mode() -> None:
+    """market_baseline model should be allowed when demo_mode=True."""
+    engine = _engine_for_guard_test(demo_mode=True)
+    decision = _make_decision(model_name="market_baseline")
+
+    await engine.execute_decision(decision)
+
+    # Strategy SHOULD have been called
+    assert engine._strategy.executed is True
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_allows_real_model_in_live_mode() -> None:
+    """Real models (sharp_sportsbook) must NOT be blocked in live mode."""
+    engine = _engine_for_guard_test(demo_mode=False)
+    decision = _make_decision(model_name="sharp_sportsbook")
+
+    await engine.execute_decision(decision)
+
+    # Strategy SHOULD have been called
+    assert engine._strategy.executed is True
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_blocks_demo_only_model_via_flag() -> None:
+    """Any model with demo_only=True must be blocked in live mode, even
+    if its name isn't 'market_baseline'."""
+    providers = {
+        MarketCategory.ECONOMICS: CategoryProvider(
+            category=MarketCategory.ECONOMICS,
+            model=_DemoOnlyModel(),  # type: ignore[arg-type]
+            pipeline=SimpleNamespace(),  # type: ignore[arg-type]
+            get_context_data=None,
+        ),
+    }
+    engine = _engine_for_guard_test(demo_mode=False, category_providers=providers)
+    # Simulate the engine knowing this ticker's category
+    engine._market_categories["KXTEST-YES"] = MarketCategory.ECONOMICS
+
+    decision = _make_decision(model_name="future_experimental", ticker="KXTEST-YES")
+
+    await engine.execute_decision(decision)
+
+    # Strategy should NOT have been called
+    assert engine._strategy.executed is False
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_allows_non_demo_only_model_via_flag() -> None:
+    """Models with demo_only=False must be allowed in live mode."""
+    providers = {
+        MarketCategory.SPORTS: CategoryProvider(
+            category=MarketCategory.SPORTS,
+            model=_RealModel(),  # type: ignore[arg-type]
+            pipeline=SimpleNamespace(),  # type: ignore[arg-type]
+            get_context_data=None,
+        ),
+    }
+    engine = _engine_for_guard_test(demo_mode=False, category_providers=providers)
+    engine._market_categories["KXTEST-YES"] = MarketCategory.SPORTS
+
+    decision = _make_decision(model_name="sharp_sportsbook", ticker="KXTEST-YES")
+
+    await engine.execute_decision(decision)
+
+    # Strategy SHOULD have been called
+    assert engine._strategy.executed is True
+
+
+def test_market_baseline_model_has_demo_only_flag() -> None:
+    """MarketBaselineModel must always declare itself as demo_only."""
+    from moneygone.models.market_baseline import MarketBaselineModel
+
+    model = MarketBaselineModel()
+    assert model.demo_only is True, "MarketBaselineModel must have demo_only=True"
+
+
+def test_real_models_have_demo_only_false() -> None:
+    """Production models should NOT be demo_only."""
+    from moneygone.models.sharp_sportsbook import SharpSportsbookModel
+
+    model = SharpSportsbookModel()
+    assert model.demo_only is False, "SharpSportsbookModel should have demo_only=False"
