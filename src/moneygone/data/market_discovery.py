@@ -46,6 +46,9 @@ class MarketCategory(str, Enum):
     CRYPTO = "crypto"
     WEATHER = "weather"
     ECONOMICS = "economics"
+    POLITICS = "politics"
+    FINANCIALS = "financials"
+    COMPANIES = "companies"
     UNKNOWN = "unknown"
 
 
@@ -69,7 +72,34 @@ _SPORTS_PATTERNS = re.compile(
     r"nba|nfl|mlb|nhl|ncaa|game|winner|moneyline|"
     r"championship|playoff|series|lakers|celtics|warriors|"
     r"yankees|dodgers|chiefs|eagles|soccer|mls|epl|"
-    r"tennis|boxing|mma|ufc",
+    r"tennis|boxing|mma|ufc|golf|pga|lpga|esports|"
+    r"bundesliga|serie a|la liga|ligue 1|premier league|"
+    r"kbo|npb|total runs|spread|team total",
+    re.IGNORECASE,
+)
+_POLITICS_PATTERNS = re.compile(
+    r"trump|biden|president|election|congress|senate|house|"
+    r"democrat|republican|governor|mayor|vote|ballot|"
+    r"political|cabinet|supreme court|scotus|impeach|"
+    r"executive order|legislation|bill sign|veto|"
+    r"primary|caucus|nominee|approval rating|poll",
+    re.IGNORECASE,
+)
+_FINANCIALS_PATTERNS = re.compile(
+    r"\bspy\b|\bs&p\b|s&p 500|nasdaq|\bqqq\b|dow jones|\bdji\b|"
+    r"stock market|stock price|index|russell|vix|volatility|"
+    r"nyse|wall street|bear market|bull market|"
+    r"oil price|gold price|silver price|commodity|"
+    r"forex|\beur\b|\busd\b|exchange rate|bond|"
+    r"\binx\b|\binxu\b|\bkxsilver\b|\bkxgold\b|\bkxoil\b",
+    re.IGNORECASE,
+)
+_COMPANIES_PATTERNS = re.compile(
+    r"apple|google|amazon|meta|microsoft|tesla|nvidia|"
+    r"truth social|tiktok|twitter|\bx corp\b|openai|"
+    r"spacex|starlink|neuralink|"
+    r"earnings|revenue|market cap|ipo|stock split|"
+    r"ceo|layoff|merger|acquisition|antitrust",
     re.IGNORECASE,
 )
 
@@ -92,10 +122,16 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.CRYPTO
     if _WEATHER_PATTERNS.search(text):
         return MarketCategory.WEATHER
-    if _ECONOMICS_PATTERNS.search(text):
-        return MarketCategory.ECONOMICS
     if _SPORTS_PATTERNS.search(text):
         return MarketCategory.SPORTS
+    if _POLITICS_PATTERNS.search(text):
+        return MarketCategory.POLITICS
+    if _FINANCIALS_PATTERNS.search(text):
+        return MarketCategory.FINANCIALS
+    if _COMPANIES_PATTERNS.search(text):
+        return MarketCategory.COMPANIES
+    if _ECONOMICS_PATTERNS.search(text):
+        return MarketCategory.ECONOMICS
     return MarketCategory.UNKNOWN
 
 
@@ -208,24 +244,20 @@ class MarketDiscoveryService:
     # Sports series that the paginated bulk fetch often misses because
     # they sort beyond the ``max_pages`` window.
     _SPORTS_SERIES: list[str] = [
-        # US major leagues
-        "KXNBAGAME",
-        "KXMLBGAME",
-        "KXNHLGAME",
-        "KXNFLGAME",
-        "KXNCAABBGAME",
-        "KXNCAAFBGAME",
+        # US major leagues — game winners
+        "KXNBAGAME", "KXMLBGAME", "KXNHLGAME", "KXNFLGAME",
+        "KXNCAABBGAME", "KXNCAAFBGAME",
+        # US major leagues — totals, spreads, team totals
+        "KXNBATOTAL", "KXMLBTOTAL", "KXNHLTOTAL", "KXNFLTOTAL",
+        "KXNBASPREAD", "KXMLBSPREAD", "KXNHLSPREAD", "KXNFLSPREAD",
+        "KXNBATEAMTOTAL", "KXMLBTEAMTOTAL",
         # Soccer
-        "KXEPLGAME",
-        "KXMLSGAME",
-        "KXLALIGAGAME",
-        "KXBUNDESLIGAGAME",
-        "KXSERIEAGAME",
-        "KXLIGUE1GAME",
-        "KXUCLGAME",
-        # Other
-        "KXELHGAME",
-        "KXNPBGAME",
+        "KXEPLGAME", "KXMLSGAME", "KXLALIGAGAME",
+        "KXBUNDESLIGAGAME", "KXSERIEAGAME", "KXLIGUE1GAME", "KXUCLGAME",
+        # International baseball / hockey
+        "KXKBOGAME", "KXNPBGAME", "KXELHGAME",
+        # Golf, tennis, esports
+        "KXPGA", "KXLPGA", "KXTENNIS", "KXESPORTS",
     ]
 
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
@@ -239,7 +271,9 @@ class MarketDiscoveryService:
         fall outside the first ``max_pages`` of the bulk endpoint.
         """
         now = datetime.now(timezone.utc)
-        max_close = int((now + timedelta(hours=72)).timestamp())
+        # 7 days: sports markets close 2-3 days after the event, so
+        # 72h misses games more than 1-2 days out.
+        max_close = int((now + timedelta(days=7)).timestamp())
 
         markets = await self._rest.get_all_markets(
             limit=1000,
