@@ -421,6 +421,7 @@ class ExecutionEngine:
                 sports_snapshot=context_data if category == MarketCategory.SPORTS else None,
                 crypto_snapshot=context_data if category == MarketCategory.CRYPTO else None,
                 weather_ensemble=context_data.get("ensemble") if category == MarketCategory.WEATHER else None,
+                weather_threshold=context_data.get("threshold") if category == MarketCategory.WEATHER else None,
                 store=self._store,
             )
             features = provider.pipeline.compute(context)

@@ -140,25 +140,31 @@ class EnsembleSpread(Feature):
 
 
 class EnsembleExceedanceProb(Feature):
-    """Fraction of ensemble members exceeding a configurable threshold.
+    """Fraction of ensemble members exceeding the market threshold.
 
-    This directly maps to probability for threshold-based weather markets
-    (e.g., "Will temperature exceed 100F?").
+    Reads the threshold from ``context.weather_threshold`` (extracted from
+    the market title), falling back to a configurable default.
     """
 
     name = "ensemble_exceedance_prob"
     dependencies = ()
     lookback = timedelta(0)
 
-    def __init__(self, threshold: float = 0.0) -> None:
-        self.threshold = threshold
+    def __init__(self, default_threshold: float = 0.0) -> None:
+        self._default_threshold = default_threshold
 
     def compute(self, context: FeatureContext) -> float | None:
         members = _get_members(context)
         if members is None:
             return None
+
+        # Use market-specific threshold if available
+        threshold = getattr(context, "weather_threshold", None)
+        if threshold is None:
+            threshold = self._default_threshold
+
         arr = np.array(members)
-        return float(np.mean(arr > self.threshold))
+        return float(np.mean(arr > threshold))
 
 
 class ForecastRevisionMagnitude(Feature):
