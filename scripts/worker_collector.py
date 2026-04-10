@@ -99,6 +99,7 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
         bookmakers=config.sportsbook.bookmakers,
     )
 
+    first_run = True
     try:
         while True:
             try:
@@ -116,19 +117,21 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
                         log.warning("collector.stop_for_quota", league=league, remaining=remaining)
                         break
 
-                    try:
-                        has_games = await asyncio.wait_for(
-                            _league_has_games_within_window(
-                                stats_feed, league, config.sportsbook.lookahead_hours, reference_time=now,
-                            ),
-                            timeout=15.0,
-                        )
-                    except asyncio.TimeoutError:
-                        log.warning("collector.espn_check_timeout", league=league)
-                        has_games = True  # Fetch anyway if ESPN check hangs
-                    if not has_games:
-                        log.info("collector.skip_no_games", league=league)
-                        continue
+                    # Skip ESPN check on first run — always fetch initial lines
+                    if not first_run:
+                        try:
+                            has_games = await asyncio.wait_for(
+                                _league_has_games_within_window(
+                                    stats_feed, league, config.sportsbook.lookahead_hours, reference_time=now,
+                                ),
+                                timeout=15.0,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning("collector.espn_check_timeout", league=league)
+                            has_games = True
+                        if not has_games:
+                            log.info("collector.skip_no_games", league=league)
+                            continue
 
                     games = await odds_feed.get_upcoming_games(
                         league,
@@ -158,6 +161,7 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
             except Exception:
                 log.exception("collector.error")
 
+            first_run = False
             await asyncio.sleep(interval)
     finally:
         await odds_feed.close()

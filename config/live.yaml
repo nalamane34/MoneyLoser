@@ -30,7 +30,7 @@ sportsbook:
   markets:
     - "h2h"
   fetch_interval_minutes: 30
-  lookahead_hours: 12
+  lookahead_hours: 24
   min_requests_remaining: 250
 
 execution:
