@@ -41,7 +41,7 @@ from moneygone.execution.engine import (
 )
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
-from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
+from moneygone.execution.strategies import AggressiveStrategy, DryRunStrategy, PassiveStrategy
 from moneygone.features import (
     BidAskSpread,
     DepthRatio,
@@ -193,10 +193,14 @@ async def main() -> None:
         ),
     )
 
-    strategy = (
+    inner_strategy = (
         PassiveStrategy(timeout_seconds=30.0)
         if config.execution.prefer_maker
         else AggressiveStrategy()
+    )
+    strategy = (
+        DryRunStrategy(inner_strategy) if config.exchange.demo_mode
+        else inner_strategy
     )
 
     # ---- Category providers: crypto, weather ----

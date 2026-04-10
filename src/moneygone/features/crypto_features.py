@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 import numpy as np
@@ -10,6 +11,12 @@ import structlog
 from moneygone.features.base import Feature, FeatureContext
 
 log = structlog.get_logger()
+
+# Regex to extract threshold from Kalshi crypto ticker
+# KXBTC-26JAN0815-B87125 -> 87125
+# KXDOGE-26JAN0809-T0.3249999 -> 0.3249999
+# KXETH-26JAN0818-B2440 -> 2440
+_TICKER_THRESHOLD_RE = re.compile(r"-[ABT]([\d.]+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -471,3 +478,109 @@ class BRTIDistanceToThreshold(Feature):
             return None
 
         return (brti - float(threshold)) / brti
+
+
+# ---------------------------------------------------------------------------
+# Threshold & time features needed by CryptoVolModel
+# ---------------------------------------------------------------------------
+
+
+class ThresholdPrice(Feature):
+    """Extract the numeric threshold (strike price) from the ticker.
+
+    For crypto binary markets like KXBTC-26JAN0815-B87125, the
+    threshold is 87125 (the BTC price level the market is about).
+    The CryptoVolModel needs this as ``threshold_price`` to compute
+    the log-normal probability of reaching the strike.
+    """
+
+    name = "threshold_price"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        # Try crypto_snapshot first (set by context provider)
+        if context.crypto_snapshot and "threshold" in context.crypto_snapshot:
+            return float(context.crypto_snapshot["threshold"])
+
+        # Parse from ticker
+        m = _TICKER_THRESHOLD_RE.search(context.ticker)
+        if m:
+            return float(m.group(1))
+
+        return None
+
+
+class HoursToExpiry(Feature):
+    """Hours remaining until the market closes.
+
+    The CryptoVolModel needs this as ``hours_to_expiry`` for
+    the time component of the log-normal pricing formula.
+    """
+
+    name = "hours_to_expiry"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        if context.market_state is not None and context.market_state.close_time:
+            close_time = context.market_state.close_time
+            if isinstance(close_time, str):
+                from datetime import datetime, timezone
+                try:
+                    close_time = datetime.fromisoformat(close_time)
+                except ValueError:
+                    return None
+            delta = close_time - context.observation_time
+            hours = delta.total_seconds() / 3600.0
+            return max(hours, 0.001)  # Avoid zero
+
+        # Try to parse expiry from ticker format: KXBTC-26JAN0815-B87125
+        # 26JAN0815 = Jan 8, 2026 at 15:00
+        try:
+            parts = context.ticker.split("-")
+            if len(parts) >= 2:
+                date_part = parts[1]
+                # Format: 26JAN0815 (YY MON DD HH) or 26JAN08T0600 (YY MON DD T HHMM)
+                import re as _re
+                # Try YYMONDDHH format first
+                m = _re.match(r"(\d{2})([A-Z]{3})(\d{2})(\d{2})", date_part)
+                if m:
+                    from datetime import datetime, timezone
+                    year = 2000 + int(m.group(1))
+                    month_map = {
+                        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+                        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+                        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+                    }
+                    month = month_map.get(m.group(2), 1)
+                    day = int(m.group(3))
+                    hour = int(m.group(4))
+                    close_time = datetime(year, month, day, hour, 0, tzinfo=timezone.utc)
+                    delta = close_time - context.observation_time
+                    hours = delta.total_seconds() / 3600.0
+                    return max(hours, 0.001)
+
+                # Try YYMONDD T HHMM format
+                m = _re.match(r"(\d{2})([A-Z]{3})(\d{2})T(\d{4})", date_part)
+                if m:
+                    from datetime import datetime, timezone
+                    year = 2000 + int(m.group(1))
+                    month_map = {
+                        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+                        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+                        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+                    }
+                    month = month_map.get(m.group(2), 1)
+                    day = int(m.group(3))
+                    hhmm = m.group(4)
+                    hour = int(hhmm[:2])
+                    minute = int(hhmm[2:])
+                    close_time = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+                    delta = close_time - context.observation_time
+                    hours = delta.total_seconds() / 3600.0
+                    return max(hours, 0.001)
+        except Exception:
+            pass
+
+        return None

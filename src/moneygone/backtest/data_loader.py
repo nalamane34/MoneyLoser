@@ -162,14 +162,19 @@ class HistoricalDataLoader:
             category_filter = f" AND category IN ({cat_placeholders})"
             params.extend(categories)
 
+        # Use ingested_at OR close_time for time filtering.
+        # When data is backfilled, ingested_at is the INSERT time (not event time),
+        # so we also check close_time to catch backfilled rows.
         query = f"""
             SELECT *
             FROM market_states
-            WHERE ingested_at >= ? AND ingested_at <= ?
+            WHERE (ingested_at >= ? AND ingested_at <= ?)
+               OR (close_time >= ? AND close_time <= ?)
             {ticker_filter}
             {category_filter}
-            ORDER BY ingested_at
+            ORDER BY COALESCE(close_time, ingested_at)
         """
+        params.extend([start, end])  # For close_time range
 
         try:
             results = self._store._conn.execute(query, params).fetchall()
@@ -177,7 +182,7 @@ class HistoricalDataLoader:
                 columns = [desc[0] for desc in self._store._conn.description]
                 for row in results:
                     row_dict = dict(zip(columns, row))
-                    ts = row_dict.get("ingested_at", start)
+                    ts = row_dict.get("close_time") or row_dict.get("ingested_at", start)
                     events.append(HistoricalEvent(
                         timestamp=ts,
                         event_type=EventType.TICK,
@@ -206,13 +211,17 @@ class HistoricalDataLoader:
             ticker_filter = f" AND ticker IN ({placeholders})"
             params.extend(tickers)
 
+        # Use snapshot_time for orderbooks (ingested_at is insertion time,
+        # not when the snapshot was taken; backfilled data uses snapshot_time).
         query = f"""
             SELECT *
             FROM orderbook_snapshots
-            WHERE ingested_at >= ? AND ingested_at <= ?
+            WHERE (snapshot_time >= ? AND snapshot_time <= ?)
+               OR (ingested_at >= ? AND ingested_at <= ?)
             {ticker_filter}
-            ORDER BY ingested_at
+            ORDER BY COALESCE(snapshot_time, ingested_at)
         """
+        params.extend([start, end])  # For ingested_at fallback
 
         try:
             results = self._store._conn.execute(query, params).fetchall()
@@ -226,7 +235,7 @@ class HistoricalDataLoader:
                     if isinstance(row_dict.get("no_levels"), str):
                         row_dict["no_levels"] = json.loads(row_dict["no_levels"])
 
-                    ts = row_dict.get("ingested_at", start)
+                    ts = row_dict.get("snapshot_time") or row_dict.get("ingested_at", start)
                     events.append(HistoricalEvent(
                         timestamp=ts,
                         event_type=EventType.ORDERBOOK,

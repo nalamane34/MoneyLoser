@@ -16,6 +16,7 @@ from typing import Any
 import pandas as pd
 import structlog
 
+from moneygone.backtest.context_providers import BacktestContextProvider
 from moneygone.backtest.data_loader import (
     EventType,
     HistoricalDataLoader,
@@ -25,6 +26,7 @@ from moneygone.backtest.guards import LeakageGuard, LookaheadError, TimeFencedSt
 from moneygone.backtest.results import BacktestResult
 from moneygone.backtest.sim_exchange import SimulatedExchange
 from moneygone.config import BacktestConfig, RiskConfig
+from moneygone.data.store import DataStore
 from moneygone.exchange.types import (
     Action,
     Market,
@@ -87,6 +89,16 @@ class BacktestEngine:
         If False, only evaluate on tick events.
     progress_interval:
         Log progress every N events.
+    context_provider:
+        Optional provider that injects external data (crypto snapshots,
+        sports snapshots, weather ensembles) into the FeatureContext
+        during backtest replay.
+    data_store:
+        Optional DataStore instance.  When provided, a
+        :class:`TimeFencedStore` wrapping this store is set as
+        ``context.store`` on every FeatureContext, giving features
+        safe lookback-query access that is fenced to the current
+        observation time.
     """
 
     def __init__(
@@ -104,6 +116,8 @@ class BacktestEngine:
         fee_calculator: KalshiFeeCalculator | None = None,
         evaluation_on_orderbook: bool = True,
         progress_interval: int = 1000,
+        context_provider: BacktestContextProvider | None = None,
+        data_store: DataStore | None = None,
     ) -> None:
         self._loader = data_loader
         self._pipeline = feature_pipeline
@@ -118,6 +132,8 @@ class BacktestEngine:
         self._fees = fee_calculator or KalshiFeeCalculator()
         self._eval_on_orderbook = evaluation_on_orderbook
         self._progress_interval = progress_interval
+        self._context_provider = context_provider
+        self._data_store = data_store
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -191,11 +207,11 @@ class BacktestEngine:
             if i > 0 and i % self._progress_interval == 0:
                 logger.info(
                     "backtest.progress",
-                    event=i,
+                    event_idx=i,
                     total=len(events),
                     pct=round(100 * i / len(events), 1),
                     equity=str(exchange.get_equity()),
-                    trades=len(trades),
+                    n_trades=len(trades),
                 )
 
             try:
@@ -330,6 +346,11 @@ class BacktestEngine:
             yes_levels = self._parse_levels(yes_levels_raw)
             no_levels = self._parse_levels(no_levels_raw)
 
+            # Ensure ascending sort by price — the EdgeCalculator expects
+            # bids sorted ascending with the best (highest) bid at the end.
+            yes_levels.sort(key=lambda lvl: lvl.price)
+            no_levels.sort(key=lambda lvl: lvl.price)
+
             return OrderbookSnapshot(
                 ticker=data["ticker"],
                 yes_bids=tuple(yes_levels),
@@ -423,6 +444,28 @@ class BacktestEngine:
             market_state=market,
             orderbook=orderbook,
         )
+
+        # 2a. Inject external data from context provider (if configured)
+        if self._context_provider is not None:
+            ctx_data = self._context_provider.get_context_data(
+                ticker, observation_time
+            )
+            if ctx_data.get("crypto_snapshot") is not None:
+                context.crypto_snapshot = ctx_data["crypto_snapshot"]
+            if ctx_data.get("sports_snapshot") is not None:
+                context.sports_snapshot = ctx_data["sports_snapshot"]
+            if ctx_data.get("weather_ensemble") is not None:
+                context.weather_ensemble = ctx_data["weather_ensemble"]
+            if ctx_data.get("weather_threshold") is not None:
+                context.weather_threshold = ctx_data["weather_threshold"]
+            if ctx_data.get("weather_direction") is not None:
+                context.weather_direction = ctx_data["weather_direction"]
+
+        # 2b. Attach a time-fenced DataStore for lookback queries
+        if self._data_store is not None:
+            context.store = TimeFencedStore(
+                self._data_store, as_of=observation_time
+            )
 
         # Validate feature context
         try:

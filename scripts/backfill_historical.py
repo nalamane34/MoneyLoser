@@ -32,7 +32,7 @@ import asyncio
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -78,48 +78,93 @@ def save_checkpoint(state: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Fetch all settled markets from the API
+# Phase 1: Load settled markets from local JSON (fast) or API (slow)
 # ---------------------------------------------------------------------------
 
+JSON_MARKETS_PATH = DATA_DIR / "historical_markets.json"
 
-async def fetch_all_settled_markets(client: KalshiRestClient) -> list[Market]:
-    """Paginate through all historical (settled) markets."""
-    all_markets: list[Market] = []
-    cursor: str | None = None
-    page = 0
 
-    while True:
-        page += 1
-        params: dict[str, Any] = {"limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
+def load_markets_from_json(
+    category_filter: set[str] | None = None,
+) -> list[Market]:
+    """Load settled markets from the local JSON dump.
+
+    This is MUCH faster than paginating 1M+ markets from the API.
+    The JSON file is ~991MB and contains ~500K settled markets.
+    Markets are classified and filtered in a streaming fashion to
+    avoid holding all 500K in memory.
+    """
+    from moneygone.exchange.types import MarketResult, MarketStatus
+
+    json_path = JSON_MARKETS_PATH
+    if not json_path.exists():
+        raise FileNotFoundError(
+            f"No local market dump at {json_path}. "
+            f"Download from Kalshi API first or use --from-api flag."
+        )
+
+    log.info("backfill.loading_json", path=str(json_path))
+    with open(json_path) as f:
+        raw_markets = json.load(f)
+
+    log.info("backfill.json_loaded", total=len(raw_markets))
+
+    markets: list[Market] = []
+    skipped = 0
+
+    for m in raw_markets:
+        ticker = m.get("ticker", "")
+        # Skip MVE markets (multi-value event containers, not tradeable)
+        if ticker.startswith("KXMVE"):
+            skipped += 1
+            continue
 
         try:
-            data = await client._request("GET", "/historical/markets", params=params)
-        except Exception as e:
-            log.error("backfill.fetch_markets_error", page=page, error=str(e))
-            break
+            close_time_str = m.get("close_time") or m.get("expiration_time", "")
+            if not close_time_str:
+                skipped += 1
+                continue
 
-        markets_raw = data.get("markets", [])
-        if not markets_raw:
-            break
+            close_time = datetime.fromisoformat(
+                close_time_str.replace("Z", "+00:00")
+            )
 
-        for m_raw in markets_raw:
-            try:
-                market = client._parse_market(m_raw)
-                all_markets.append(market)
-            except Exception:
-                pass
+            market = Market(
+                ticker=ticker,
+                event_ticker=m.get("event_ticker", ""),
+                series_ticker=m.get("series_ticker", ""),
+                title=m.get("title", ""),
+                subtitle=m.get("subtitle", ""),
+                yes_sub_title=m.get("yes_sub_title", ""),
+                no_sub_title=m.get("no_sub_title", ""),
+                status=MarketStatus.SETTLED,  # All historical markets are settled
+                yes_bid=Decimal(str(m.get("yes_bid_dollars", "0") or "0")),
+                yes_ask=Decimal(str(m.get("yes_ask_dollars", "0") or "0")),
+                last_price=Decimal(str(m.get("last_price_dollars", "0") or "0")),
+                volume=int(float(m.get("volume_fp", "0") or "0")),
+                open_interest=int(float(m.get("open_interest_fp", "0") or "0")),
+                close_time=close_time,
+                result=MarketResult(m.get("result", "")) if m.get("result") else MarketResult.NOT_SETTLED,
+                category=m.get("category", ""),
+            )
 
-        cursor = data.get("cursor", "")
-        log.info("backfill.markets_page", page=page, count=len(markets_raw), total=len(all_markets))
+            # Filter by category early to avoid holding unneeded markets
+            if category_filter:
+                cat = classify_market(market).value
+                if cat not in category_filter:
+                    continue
 
-        if not cursor:
-            break
+            markets.append(market)
+        except Exception:
+            skipped += 1
 
-        await asyncio.sleep(REQUEST_DELAY)
-
-    return all_markets
+    log.info(
+        "backfill.markets_filtered",
+        kept=len(markets),
+        skipped=skipped,
+        categories=list(category_filter) if category_filter else "all",
+    )
+    return markets
 
 
 # ---------------------------------------------------------------------------
@@ -464,17 +509,18 @@ async def main() -> None:
     client = KalshiRestClient(config.exchange)
 
     try:
-        # ---- Phase 1: Fetch settled markets ----
+        # ---- Phase 1: Load settled markets from local JSON ----
         print("=" * 60)
-        print("Phase 1: Fetching settled markets from Kalshi API...")
+        print("Phase 1: Loading settled markets from local JSON...")
         print("=" * 60)
 
-        markets = await fetch_all_settled_markets(client)
-        print(f"  Fetched {len(markets)} total settled markets")
-
-        # Filter to non-MVE binary markets
-        markets = [m for m in markets if not m.ticker.startswith("KXMVE")]
-        print(f"  Non-MVE markets: {len(markets)}")
+        cat_filter = (
+            {c.strip().lower() for c in args.category.split(",")}
+            if args.category
+            else None
+        )
+        markets = load_markets_from_json(category_filter=cat_filter)
+        print(f"  Loaded {len(markets)} markets" + (f" (categories: {args.category})" if args.category else ""))
 
         # Apply series filter
         if args.series:
@@ -482,14 +528,27 @@ async def main() -> None:
             markets = [m for m in markets if any(m.ticker.startswith(p) for p in prefixes)]
             print(f"  After series filter ({args.series}): {len(markets)}")
 
-        # Apply category filter
-        if args.category:
-            cat_filter = {c.strip().lower() for c in args.category.split(",")}
-            markets = [
-                m for m in markets
-                if classify_market(m).value in cat_filter
-            ]
-            print(f"  After category filter ({args.category}): {len(markets)}")
+        # Apply lookback-days filter: only keep markets that closed within the window.
+        # Uses the latest close_time in the dataset as reference (not "now"),
+        # since the JSON dump may be weeks/months old.
+        if args.lookback_days > 0 and markets:
+            # Parse all close times to find the reference date
+            parsed_times: list[tuple[int, datetime]] = []
+            for idx, m in enumerate(markets):
+                ct = m.close_time
+                if isinstance(ct, str):
+                    ct = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                if ct.tzinfo is None:
+                    ct = ct.replace(tzinfo=timezone.utc)
+                parsed_times.append((idx, ct))
+
+            max_date = max(ct for _, ct in parsed_times)
+            cutoff = max_date - timedelta(days=args.lookback_days)
+            before_count = len(markets)
+            keep_indices = {idx for idx, ct in parsed_times if ct >= cutoff}
+            markets = [markets[idx] for idx in sorted(keep_indices)]
+            print(f"  Data range ends: {max_date.date()}")
+            print(f"  After lookback filter ({args.lookback_days}d from {max_date.date()}): {len(markets)} (dropped {before_count - len(markets)})")
 
         # Apply limit
         if args.limit > 0:

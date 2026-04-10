@@ -131,4 +131,21 @@ def load_config(
             overlay_data = yaml.safe_load(f) or {}
         base_data = _deep_merge(base_data, overlay_data)
 
-    return AppConfig(**base_data)
+    config = AppConfig(**base_data)
+
+    # Safety: refuse to start if demo_mode is set but production URLs are used.
+    # This catches misconfigurations where someone thinks they're in demo mode
+    # but orders would go to the live exchange.
+    _PROD_HOSTS = ("api.elections.kalshi.com", "trading-api.kalshi.com")
+    if config.exchange.demo_mode:
+        base_url = (config.exchange.base_url or "").lower()
+        ws_url = (config.exchange.ws_url or "").lower()
+        for host in _PROD_HOSTS:
+            if host in base_url or host in ws_url:
+                raise ValueError(
+                    f"SAFETY: demo_mode=true but config uses production URL "
+                    f"({host}). Either set demo_mode=false or use demo-api.kalshi.co. "
+                    f"Refusing to start to prevent accidental live trading."
+                )
+
+    return config
