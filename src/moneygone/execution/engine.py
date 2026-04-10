@@ -507,12 +507,14 @@ class ExecutionEngine:
                 context_data = await provider.get_context_data(
                     self._market_cache.get(ticker),
                 ) or {}
-            if not context_data:
-                self._log_candidate(
-                    ticker=ticker, category=cat_str,
-                    status="rejected", reject_reason="no_category_data",
-                )
-                return None
+                if not context_data:
+                    self._log_candidate(
+                        ticker=ticker, category=cat_str,
+                        status="rejected", reject_reason="no_category_data",
+                    )
+                    return None
+            # If get_context_data is None (baseline categories), proceed
+            # with empty context_data — model uses orderbook features only.
 
             context = FeatureContext(
                 ticker=ticker,

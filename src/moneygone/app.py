@@ -48,7 +48,9 @@ from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
 from moneygone.execution.strategies import AggressiveStrategy, DryRunStrategy, PassiveStrategy
 from moneygone.features import (
+    BidAskSpread,
     ClimatologicalAnomaly,
+    DepthRatio,
     EnsembleExceedanceProb,
     EnsembleMean,
     EnsembleSpread,
@@ -57,14 +59,18 @@ from moneygone.features import (
     ForecastRevisionMagnitude,
     HomeFieldAdvantage,
     KalshiVsSportsbookEdge,
+    MidPrice,
     ModelDisagreement,
     MoneylineMovement,
+    OrderbookImbalance,
     PinnacleVsMarketEdge,
     PinnacleWinProbability,
     PowerRatingEdge,
     SpreadImpliedWinProb,
     SportsbookWinProbability,
     TeamInjuryImpact,
+    TimeToExpiry,
+    WeightedMidPrice,
 )
 from moneygone.features.pipeline import FeaturePipeline
 from moneygone.monitoring.alerts import AlertManager
@@ -72,6 +78,7 @@ from moneygone.monitoring.calibration_monitor import CalibrationMonitor
 from moneygone.monitoring.drift import DriftDetector
 from moneygone.monitoring.pnl import PnLTracker
 from moneygone.monitoring.regime_detector import RegimeDetector
+from moneygone.models.market_baseline import MarketBaselineModel
 from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.models.weather_ensemble import WeatherEnsembleModel
 from moneygone.risk.manager import RiskManager
@@ -593,6 +600,43 @@ def build_app(config: AppConfig) -> Application:
                 "build_app.weather_ready",
                 locations=[loc["name"] for loc in weather_locations],
             )
+
+        # Register market-baseline model for all categories that lack a
+        # specialised data feed (politics, economics, financials, companies,
+        # crypto-without-feed, unknown).  The baseline model uses only
+        # orderbook microstructure features and needs no external data.
+        baseline_model = MarketBaselineModel()
+        baseline_pipeline = FeaturePipeline(
+            [
+                BidAskSpread(),
+                MidPrice(),
+                OrderbookImbalance(),
+                WeightedMidPrice(),
+                DepthRatio(),
+                TimeToExpiry(),
+            ],
+            store=store,
+        )
+        _baseline_cats = [
+            MarketCategory.ECONOMICS,
+            MarketCategory.POLITICS,
+            MarketCategory.FINANCIALS,
+            MarketCategory.COMPANIES,
+            MarketCategory.CRYPTO,
+            MarketCategory.UNKNOWN,
+        ]
+        for cat in _baseline_cats:
+            if cat not in category_providers:
+                category_providers[cat] = CategoryProvider(
+                    category=cat,
+                    model=baseline_model,
+                    pipeline=baseline_pipeline,
+                    get_context_data=None,  # No external data needed
+                )
+        log.info(
+            "build_app.baseline_categories_ready",
+            categories=[c.value for c in _baseline_cats if c in category_providers and category_providers[c].model is baseline_model],
+        )
 
         # Load sportsbook data from parquet (written by collector worker)
         data_dir = Path(config.data_dir)
