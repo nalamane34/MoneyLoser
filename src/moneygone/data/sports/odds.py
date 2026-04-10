@@ -37,6 +37,10 @@ SPORT_KEYS: dict[str, str] = {
     "ncaaf": "americanfootball_ncaaf",
     "soccer_epl": "soccer_epl",
     "soccer_usa_mls": "soccer_usa_mls",
+    "soccer_spain_la_liga": "soccer_spain_la_liga",
+    "soccer_germany_bundesliga": "soccer_germany_bundesliga",
+    "soccer_italy_serie_a": "soccer_italy_serie_a",
+    "soccer_france_ligue_one": "soccer_france_ligue_one",
 }
 
 # Common player prop market keys.
@@ -825,6 +829,10 @@ class OddsAPIFeed:
             "mlb": "baseball",
             "soccer_epl": "soccer",
             "soccer_usa_mls": "soccer",
+            "soccer_spain_la_liga": "soccer",
+            "soccer_germany_bundesliga": "soccer",
+            "soccer_italy_serie_a": "soccer",
+            "soccer_france_ligue_one": "soccer",
         }
         sport = sport_lookup.get(league.lower())
         if sport is None:

@@ -29,8 +29,12 @@ _LEAGUE_MARKERS = {
     "mlb": ("mlb", "baseball"),
     "ncaab": ("ncaab", "ncaa", "college basketball"),
     "ncaaf": ("ncaaf", "ncaa", "college football"),
-    "soccer_epl": ("epl", "premier league", "soccer"),
-    "soccer_usa_mls": ("mls", "major league soccer", "soccer"),
+    "soccer_epl": ("epl", "premier league"),
+    "soccer_usa_mls": ("mls", "major league soccer"),
+    "soccer_spain_la_liga": ("la liga", "laliga"),
+    "soccer_germany_bundesliga": ("bundesliga",),
+    "soccer_italy_serie_a": ("serie a", "seriea"),
+    "soccer_france_ligue_one": ("ligue 1", "ligue1"),
 }
 
 

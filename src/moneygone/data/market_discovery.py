@@ -208,16 +208,24 @@ class MarketDiscoveryService:
     # Sports series that the paginated bulk fetch often misses because
     # they sort beyond the ``max_pages`` window.
     _SPORTS_SERIES: list[str] = [
+        # US major leagues
         "KXNBAGAME",
         "KXMLBGAME",
         "KXNHLGAME",
         "KXNFLGAME",
-        "KXNCAAFBGAME",
         "KXNCAABBGAME",
-        "KXSOCCERGAME",
-        "KXMLSGAME",
+        "KXNCAAFBGAME",
+        # Soccer
         "KXEPLGAME",
-        "KXUCL",
+        "KXMLSGAME",
+        "KXLALIGAGAME",
+        "KXBUNDESLIGAGAME",
+        "KXSERIEAGAME",
+        "KXLIGUE1GAME",
+        "KXUCLGAME",
+        # Other
+        "KXELHGAME",
+        "KXNPBGAME",
     ]
 
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
