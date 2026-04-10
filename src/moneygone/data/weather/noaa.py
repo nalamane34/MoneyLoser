@@ -145,7 +145,7 @@ class NOAAEnsembleFetcher:
             "longitude": lon,
             "hourly": om_var,
             "forecast_days": min(forecast_days, 16),
-            "models": "gfs025_ensemble",
+            "models": "gfs025",
         }
         if self._api_key:
             params["apikey"] = self._api_key

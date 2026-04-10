@@ -9,8 +9,7 @@ exchange:
   demo_mode: false
 
 weather:
-  enabled: true
-  open_meteo_api_key: ""  # Set in .env as MONEYGONE_WEATHER__OPEN_METEO_API_KEY
+  enabled: false  # Re-enable tomorrow after Open-Meteo daily rate limit resets
   locations:
     - name: "New York"
       lat: 40.7128
