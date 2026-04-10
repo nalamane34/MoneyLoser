@@ -9,7 +9,7 @@ exchange:
   demo_mode: false
 
 weather:
-  enabled: true
+  enabled: false  # Disabled until ensemble data source is fixed (Open-Meteo rate limit)
   locations:
     - name: "New York"
       lat: 40.7128
