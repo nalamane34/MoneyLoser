@@ -17,15 +17,88 @@ log = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 
-def _get_members(context: FeatureContext) -> list[float] | None:
-    """Extract ensemble member values from the weather ensemble."""
+def _target_timestep_idx(context: FeatureContext) -> int | None:
+    """Return the index of the forecast timestep closest to market close."""
     ens = context.weather_ensemble
     if ens is None:
         return None
-    members = getattr(ens, "member_values", None)
-    if members is None or len(members) == 0:
+    valid_times = getattr(ens, "valid_times", None)
+    member_values = getattr(ens, "member_values", None)
+    if not valid_times or not member_values or not member_values[0]:
         return None
-    return [float(v) for v in members]
+
+    n_timesteps = len(member_values[0])
+    target_time = None
+    if context.market_state is not None:
+        target_time = getattr(context.market_state, "close_time", None)
+
+    if target_time is None or len(valid_times) != n_timesteps:
+        return n_timesteps - 1
+
+    best_idx = 0
+    best_delta = abs((valid_times[0] - target_time).total_seconds())
+    for i, vt in enumerate(valid_times):
+        delta = abs((vt - target_time).total_seconds())
+        if delta < best_delta:
+            best_delta = delta
+            best_idx = i
+    return best_idx
+
+
+def _get_ensemble_mean_scalar(context: FeatureContext) -> float | None:
+    """Get the ensemble mean at the target timestep as a scalar."""
+    ens = context.weather_ensemble
+    if ens is None:
+        return None
+    idx = _target_timestep_idx(context)
+    if idx is None:
+        return None
+    em = getattr(ens, "ensemble_mean", None)
+    if em is not None and isinstance(em, list) and len(em) > idx:
+        return float(em[idx])
+    # Fall back to computing from members
+    members = _get_members(context)
+    if members is not None:
+        return float(np.mean(members))
+    return None
+
+
+def _get_members(context: FeatureContext) -> list[float] | None:
+    """Extract ensemble member values at the forecast timestep closest to market close.
+
+    ``member_values`` is shaped ``[n_members][n_timesteps]``.  We pick the
+    timestep nearest to the market's close time (or the last timestep if
+    no market state is available) and return one value per member.
+    """
+    ens = context.weather_ensemble
+    if ens is None:
+        return None
+    member_values = getattr(ens, "member_values", None)
+    if member_values is None or len(member_values) == 0:
+        return None
+
+    # Each member is a list of values across timesteps
+    n_timesteps = len(member_values[0]) if member_values[0] else 0
+    if n_timesteps == 0:
+        return None
+
+    # Find timestep closest to market close time
+    valid_times = getattr(ens, "valid_times", None)
+    target_time = None
+    if context.market_state is not None:
+        target_time = getattr(context.market_state, "close_time", None)
+
+    idx = n_timesteps - 1  # default: last timestep
+    if valid_times and target_time is not None and len(valid_times) == n_timesteps:
+        # Pick closest valid time to market close
+        best_delta = abs((valid_times[0] - target_time).total_seconds())
+        for i, vt in enumerate(valid_times):
+            delta = abs((vt - target_time).total_seconds())
+            if delta < best_delta:
+                best_delta = delta
+                idx = i
+
+    return [float(m[idx]) for m in member_values if len(m) > idx]
 
 
 # ---------------------------------------------------------------------------
@@ -100,25 +173,15 @@ class ForecastRevisionMagnitude(Feature):
     lookback = timedelta(hours=12)
 
     def compute(self, context: FeatureContext) -> float | None:
+        current_mean = _get_ensemble_mean_scalar(context)
+        if current_mean is None or context.store is None:
+            return 0.0  # No revision info available
+
         ens = context.weather_ensemble
-        if ens is None:
-            return None
-
-        current_mean = getattr(ens, "ensemble_mean", None)
-        if current_mean is None:
-            members = _get_members(context)
-            if members is None:
-                return None
-            current_mean = float(np.mean(members))
-        else:
-            current_mean = float(current_mean)
-
-        if context.store is None:
-            return None
+        location = getattr(ens, "location_name", "")
+        variable = getattr(ens, "variable", "")
 
         try:
-            location = getattr(ens, "location_name", "")
-            variable = getattr(ens, "variable", "")
             result = context.store.query(
                 "SELECT ensemble_mean "
                 "FROM forecast_ensembles "
@@ -134,8 +197,7 @@ class ForecastRevisionMagnitude(Feature):
                 },
             )
         except Exception:
-            log.warning("forecast_revision_query_failed")
-            return None
+            return 0.0
 
         if result is None or len(result) == 0:
             return 0.0
@@ -157,25 +219,15 @@ class ForecastRevisionDirection(Feature):
     lookback = timedelta(hours=12)
 
     def compute(self, context: FeatureContext) -> float | None:
+        current_mean = _get_ensemble_mean_scalar(context)
+        if current_mean is None or context.store is None:
+            return 0.0
+
         ens = context.weather_ensemble
-        if ens is None:
-            return None
-
-        current_mean = getattr(ens, "ensemble_mean", None)
-        if current_mean is None:
-            members = _get_members(context)
-            if members is None:
-                return None
-            current_mean = float(np.mean(members))
-        else:
-            current_mean = float(current_mean)
-
-        if context.store is None:
-            return None
+        location = getattr(ens, "location_name", "")
+        variable = getattr(ens, "variable", "")
 
         try:
-            location = getattr(ens, "location_name", "")
-            variable = getattr(ens, "variable", "")
             result = context.store.query(
                 "SELECT ensemble_mean "
                 "FROM forecast_ensembles "
@@ -191,8 +243,7 @@ class ForecastRevisionDirection(Feature):
                 },
             )
         except Exception:
-            log.warning("forecast_revision_dir_query_failed")
-            return None
+            return 0.0
 
         if result is None or len(result) == 0:
             return 0.0
@@ -223,7 +274,9 @@ class ModelDisagreement(Feature):
         if ens is None or context.store is None:
             return None
 
-        current_mean = float(getattr(ens, "ensemble_mean", 0.0))
+        current_mean = _get_ensemble_mean_scalar(context)
+        if current_mean is None:
+            return None
         location = getattr(ens, "location_name", "")
         variable = getattr(ens, "variable", "")
 
@@ -273,11 +326,16 @@ class ForecastHorizon(Feature):
             return None
 
         init_time = getattr(ens, "init_time", None)
-        valid_time = getattr(ens, "valid_time", None)
-        if init_time is None or valid_time is None:
+        if init_time is None:
             return None
 
-        delta = valid_time - init_time
+        # Use the target timestep's valid time
+        idx = _target_timestep_idx(context)
+        valid_times = getattr(ens, "valid_times", None)
+        if idx is None or not valid_times or idx >= len(valid_times):
+            return None
+
+        delta = valid_times[idx] - init_time
         return max(delta.total_seconds() / 3600.0, 0.0)
 
 
@@ -297,17 +355,7 @@ class ClimatologicalAnomaly(Feature):
         self.normal = normal
 
     def compute(self, context: FeatureContext) -> float | None:
-        ens = context.weather_ensemble
-        if ens is None:
-            return None
-
-        current_mean = getattr(ens, "ensemble_mean", None)
+        current_mean = _get_ensemble_mean_scalar(context)
         if current_mean is None:
-            members = _get_members(context)
-            if members is None:
-                return None
-            current_mean = float(np.mean(members))
-        else:
-            current_mean = float(current_mean)
-
+            return None
         return current_mean - self.normal
