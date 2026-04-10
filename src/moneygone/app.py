@@ -594,6 +594,23 @@ def build_app(config: AppConfig) -> Application:
                 locations=[loc["name"] for loc in weather_locations],
             )
 
+        # Load sportsbook data from parquet (written by collector worker)
+        data_dir = Path(config.data_dir)
+        sportsbook_parquet = data_dir / "sportsbook_lines.parquet"
+        if sportsbook_parquet.exists():
+            try:
+                count = store.load_parquet_into_table(
+                    "sportsbook_game_lines", sportsbook_parquet,
+                )
+                log.info("build_app.sportsbook_parquet_loaded", rows=count)
+            except Exception:
+                log.warning("build_app.sportsbook_parquet_failed", exc_info=True)
+        else:
+            log.info(
+                "build_app.no_sportsbook_parquet",
+                msg="Sports data will load when collector exports parquet",
+            )
+
         execution_engine = ExecutionEngine(
             rest_client=rest_client,
             ws_client=ws_client,
@@ -611,6 +628,7 @@ def build_app(config: AppConfig) -> Application:
             sports_snapshot_provider=sports_provider,
             recorder=recorder,
             category_providers=category_providers,
+            sportsbook_parquet_path=sportsbook_parquet,
         )
         log.info(
             "build_app.sports_execution_ready",
