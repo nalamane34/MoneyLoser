@@ -66,10 +66,16 @@ class CoinalyzeFeed:
         Coinalyze API key (free signup at coinalyze.net).
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, cache_ttl: float = 60.0) -> None:
         self._api_key = api_key
         self._client: httpx.AsyncClient | None = None
         self._markets_cache: dict[str, str] | None = None
+        self._cache_ttl = cache_ttl
+        self._funding_cache: dict[str, FundingRate] = {}
+        self._funding_cache_time: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._oi_cache: dict[str, OpenInterestSnapshot] = {}
+        self._oi_cache_time: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._all_symbols: list[str] = list(_SYMBOL_MAP.keys())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -95,11 +101,12 @@ class CoinalyzeFeed:
     # Funding rates
     # ------------------------------------------------------------------
 
-    async def get_funding_rates(self, symbols: list[str]) -> list[FundingRate]:
-        """Fetch current funding rates for the given symbols."""
-        results: list[FundingRate] = []
-        ca_symbols = [self._resolve_symbol(s) for s in symbols]
-
+    async def _refresh_funding_cache(self) -> None:
+        """Batch-fetch funding rates for all tracked symbols (1 API call)."""
+        now = datetime.now(timezone.utc)
+        if (now - self._funding_cache_time).total_seconds() < self._cache_ttl:
+            return
+        ca_symbols = [self._resolve_symbol(s) for s in self._all_symbols]
         try:
             data = await self._request(
                 "/funding-rate",
@@ -107,32 +114,36 @@ class CoinalyzeFeed:
             )
             for item in data:
                 ca_sym = item.get("symbol", "")
-                # Reverse-map back to our symbol format
-                orig_sym = self._reverse_symbol(ca_sym, symbols)
+                orig_sym = self._reverse_symbol(ca_sym, self._all_symbols)
                 rate = item.get("value")
                 if rate is None:
                     continue
                 ts = item.get("timestamp", 0)
-                results.append(FundingRate(
+                self._funding_cache[orig_sym] = FundingRate(
                     exchange="coinalyze",
                     symbol=orig_sym,
                     rate=float(rate),
                     timestamp=datetime.fromtimestamp(ts, tz=timezone.utc),
-                ))
+                )
+            self._funding_cache_time = now
         except Exception:
             logger.warning("coinalyze.funding_rate_error", exc_info=True)
 
-        return results
+    async def get_funding_rates(self, symbols: list[str]) -> list[FundingRate]:
+        """Return cached funding rates for the given symbols."""
+        await self._refresh_funding_cache()
+        return [self._funding_cache[s] for s in symbols if s in self._funding_cache]
 
     # ------------------------------------------------------------------
     # Open interest
     # ------------------------------------------------------------------
 
-    async def get_open_interest(self, symbols: list[str]) -> list[OpenInterestSnapshot]:
-        """Fetch current open interest for the given symbols."""
-        results: list[OpenInterestSnapshot] = []
-        ca_symbols = [self._resolve_symbol(s) for s in symbols]
-
+    async def _refresh_oi_cache(self) -> None:
+        """Batch-fetch open interest for all tracked symbols (1 API call)."""
+        now = datetime.now(timezone.utc)
+        if (now - self._oi_cache_time).total_seconds() < self._cache_ttl:
+            return
+        ca_symbols = [self._resolve_symbol(s) for s in self._all_symbols]
         try:
             data = await self._request(
                 "/open-interest",
@@ -140,21 +151,25 @@ class CoinalyzeFeed:
             )
             for item in data:
                 ca_sym = item.get("symbol", "")
-                orig_sym = self._reverse_symbol(ca_sym, symbols)
+                orig_sym = self._reverse_symbol(ca_sym, self._all_symbols)
                 oi = item.get("value")
                 if oi is None:
                     continue
                 ts = item.get("timestamp", 0)
-                results.append(OpenInterestSnapshot(
+                self._oi_cache[orig_sym] = OpenInterestSnapshot(
                     exchange="coinalyze",
                     symbol=orig_sym,
                     value=float(oi),
                     timestamp=datetime.fromtimestamp(ts, tz=timezone.utc),
-                ))
+                )
+            self._oi_cache_time = now
         except Exception:
             logger.warning("coinalyze.open_interest_error", exc_info=True)
 
-        return results
+    async def get_open_interest(self, symbols: list[str]) -> list[OpenInterestSnapshot]:
+        """Return cached open interest for the given symbols."""
+        await self._refresh_oi_cache()
+        return [self._oi_cache[s] for s in symbols if s in self._oi_cache]
 
     # ------------------------------------------------------------------
     # Liquidations
