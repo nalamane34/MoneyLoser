@@ -232,77 +232,128 @@ class CryptoDataProvider:
 # ---------------------------------------------------------------------------
 
 
-class WeatherDataProvider:
-    """Fetches NOAA/ECMWF ensemble forecasts and builds a feature-ready snapshot."""
+_WEATHER_TICKER_RE = re.compile(
+    r"KXLOWT|KXHIGHT|KXTEMP|KXRAIN|KXSNOW|KXWIND|KXHURR|KXPRECIP",
+    re.IGNORECASE,
+)
 
-    def __init__(self, noaa_fetcher: Any, ecmwf_fetcher: Any, locations: list[dict[str, Any]]) -> None:
+
+class WeatherDataProvider:
+    """Fetches NWS observations + NOAA/ECMWF ensemble forecasts for weather markets.
+
+    Data priority:
+    1. NWS current observation (ground truth) — free, no key
+    2. NWS hourly forecast (deterministic, high-resolution) — free, no key
+    3. NOAA GEFS ensemble (probabilistic spread) — Open-Meteo, free
+    4. ECMWF IFS ensemble (model comparison) — Open-Meteo, free
+    """
+
+    # Common abbreviations for matching market text to locations
+    _LOCATION_ALIASES: dict[str, list[str]] = {
+        "new york": ["nyc", "new york", "manhattan", "ny"],
+        "chicago": ["chicago", "chi"],
+        "los angeles": ["los angeles", "la ", "l.a."],
+        "miami": ["miami", "mia"],
+        "dallas": ["dallas", "dfw"],
+        "denver": ["denver", "den"],
+        "seattle": ["seattle", "sea"],
+        "atlanta": ["atlanta", "atl"],
+    }
+
+    def __init__(
+        self,
+        noaa_fetcher: Any,
+        ecmwf_fetcher: Any,
+        locations: list[dict[str, Any]],
+        nws_fetcher: Any | None = None,
+    ) -> None:
         self._noaa = noaa_fetcher
         self._ecmwf = ecmwf_fetcher
+        self._nws = nws_fetcher
         self._locations = {loc["name"].lower(): loc for loc in locations}
         self._ensemble_cache: dict[str, Any] = {}
         self._cache_time: dict[str, datetime] = {}
+
+    def _match_location(self, text: str) -> dict[str, Any] | None:
+        """Match market text to a configured location."""
+        for name, loc in self._locations.items():
+            if name in text or name.split(",")[0] in text:
+                return loc
+            for full_name, abbrs in self._LOCATION_ALIASES.items():
+                if full_name in name and any(a in text for a in abbrs):
+                    return loc
+        return None
+
+    @staticmethod
+    def _detect_variable(text: str) -> str:
+        """Determine weather variable from market text."""
+        if any(w in text for w in ("rain", "precipitation", "inches of rain")):
+            return "precipitation"
+        if any(w in text for w in ("wind", "gust")):
+            return "wind_speed_10m"
+        if any(w in text for w in ("snow", "snowfall")):
+            return "snowfall"
+        return "temperature_2m"
 
     async def get_context(self, market: Market | None) -> dict[str, Any] | None:
         if market is None:
             return None
 
+        # Only process actual weather markets — ticker must match known patterns
+        if not _WEATHER_TICKER_RE.search(market.ticker or ""):
+            return None
+
         # Match market to a location
         text = " ".join(
-            v for v in [market.title, market.subtitle, market.event_ticker] if v
+            v for v in [
+                market.title, market.subtitle, market.event_ticker, market.ticker,
+            ] if v
         ).lower()
 
-        matched_loc = None
-        for name, loc in self._locations.items():
-            # Check for city name or common abbreviations
-            if name in text or name.split(",")[0] in text:
-                matched_loc = loc
-                break
-            # Check common abbreviations
-            abbrevs = {
-                "new york": ["nyc", "new york", "manhattan"],
-                "chicago": ["chicago", "chi"],
-                "los angeles": ["los angeles", "la ", "l.a."],
-            }
-            for full_name, abbrs in abbrevs.items():
-                if full_name in name and any(a in text for a in abbrs):
-                    matched_loc = loc
-                    break
-            if matched_loc:
-                break
-
+        matched_loc = self._match_location(text)
         if matched_loc is None:
             return None
 
         threshold = _extract_threshold(market)
         hours = _hours_to_expiry(market)
+        variable = self._detect_variable(text)
+        lat, lon = matched_loc["lat"], matched_loc["lon"]
+        loc_name = matched_loc["name"]
 
-        # Fetch ensemble (cache for 30 min)
-        cache_key = f"{matched_loc['name']}_{market.ticker}"
+        # Fetch ensemble (cache for 15 min)
+        cache_key = f"{loc_name}_{variable}_{market.ticker}"
         now = datetime.now(timezone.utc)
-        cache_age = (now - self._cache_time.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))).total_seconds()
+        cache_age = (
+            now - self._cache_time.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
+        ).total_seconds()
 
-        if cache_age > 1800 or cache_key not in self._ensemble_cache:
-            # Determine weather variable from market title
-            variable = "temperature_2m"  # default
-            if any(w in text for w in ("rain", "precipitation", "inches of rain")):
-                variable = "precipitation"
-            elif any(w in text for w in ("wind", "gust")):
-                variable = "wind_speed_10m"
-            elif any(w in text for w in ("snow", "snowfall")):
-                variable = "snowfall"
+        if cache_age > 900 or cache_key not in self._ensemble_cache:
+            ensemble = None
 
+            # Primary: NOAA GEFS ensemble (probabilistic spread for calibration)
             try:
                 ensemble = await self._noaa.fetch_ensemble(
-                    lat=matched_loc["lat"],
-                    lon=matched_loc["lon"],
+                    lat=lat, lon=lon,
                     variable=variable,
-                    location_name=matched_loc["name"],
+                    location_name=loc_name,
                 )
-                if ensemble is not None:
-                    self._ensemble_cache[cache_key] = ensemble
-                    self._cache_time[cache_key] = now
             except Exception:
-                logger.debug("weather_provider.fetch_failed", loc=matched_loc["name"], exc_info=True)
+                logger.debug("weather_provider.noaa_failed", loc=loc_name, exc_info=True)
+
+            # Fallback: NWS hourly forecast (deterministic, 1-member)
+            if (ensemble is None or not ensemble.valid_times) and self._nws is not None:
+                try:
+                    ensemble = await self._nws.fetch_ensemble(
+                        lat=lat, lon=lon,
+                        variable=variable,
+                        location_name=loc_name,
+                    )
+                except Exception:
+                    logger.debug("weather_provider.nws_failed", loc=loc_name, exc_info=True)
+
+            if ensemble is not None and ensemble.valid_times:
+                self._ensemble_cache[cache_key] = ensemble
+                self._cache_time[cache_key] = now
 
         ensemble = self._ensemble_cache.get(cache_key)
         if ensemble is None:
@@ -314,20 +365,47 @@ class WeatherDataProvider:
         if hours is not None:
             snapshot["hours_to_expiry"] = hours
 
+        # Get NWS current observation for ground-truth anchoring
+        if self._nws is not None:
+            try:
+                obs = await self._nws.get_current_observation(lat, lon, loc_name)
+                if obs is not None:
+                    snapshot["nws_observation"] = obs
+                    # If temperature market, include current temp for decision context
+                    if variable == "temperature_2m" and obs.temperature_f is not None:
+                        snapshot["current_temp_f"] = obs.temperature_f
+                        snapshot["current_temp_c"] = obs.temperature_c
+            except Exception:
+                logger.debug("weather_provider.nws_obs_failed", loc=loc_name, exc_info=True)
+
         # Try ECMWF for model comparison
         try:
             ecmwf_ens = await self._ecmwf.fetch_ensemble(
-                lat=matched_loc["lat"],
-                lon=matched_loc["lon"],
+                lat=lat, lon=lon,
                 variable=variable,
-                location_name=matched_loc["name"],
+                location_name=loc_name,
             )
             if ecmwf_ens is not None:
                 snapshot["ecmwf_ensemble"] = ecmwf_ens
         except Exception:
             pass
 
+        logger.info(
+            "weather_provider.context_built",
+            ticker=market.ticker,
+            location=loc_name,
+            variable=variable,
+            threshold=threshold,
+            hours=round(hours, 1) if hours else None,
+            has_nws_obs="nws_observation" in snapshot,
+            current_temp_f=snapshot.get("current_temp_f"),
+        )
         return snapshot
 
     async def close(self) -> None:
-        pass
+        if self._nws is not None:
+            await self._nws.close()
+        if self._noaa is not None:
+            await self._noaa.close()
+        if self._ecmwf is not None:
+            await self._ecmwf.close()

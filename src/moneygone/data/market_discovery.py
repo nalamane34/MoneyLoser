@@ -58,8 +58,10 @@ _CRYPTO_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _WEATHER_PATTERNS = re.compile(
-    r"temperature|degrees|weather|rain|snow|hurricane|tornado|"
-    r"heat wave|cold snap|precipitation|wind speed|forecast",
+    r"KXLOWT|KXHIGHT|KXTEMP|KXRAIN|KXSNOW|KXWIND|KXHURR|KXPRECIP|"
+    r"temperature.*(above|below|over|under)|"
+    r"(high|low)\s+temp|heat wave|cold snap|"
+    r"inches of (rain|snow)|precipitation.*(above|below)",
     re.IGNORECASE,
 )
 _ECONOMICS_PATTERNS = re.compile(

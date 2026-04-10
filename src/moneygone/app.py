@@ -30,6 +30,7 @@ import structlog
 from moneygone.config import AppConfig
 from moneygone.data.crypto.ccxt_feed import CryptoDataFeed
 from moneygone.data.market_data import MarketDataRecorder
+from moneygone.data.market_discovery import MarketCategory
 from moneygone.data.sports.espn import ESPNLiveFeed
 from moneygone.data.sports.live_snapshots import (
     StoreBackedSportsSnapshotProvider,
@@ -37,15 +38,26 @@ from moneygone.data.sports.live_snapshots import (
 )
 from moneygone.data.sports.live_weather import LiveWeatherFeed
 from moneygone.data.store import DataStore
+from moneygone.data.weather import NOAAEnsembleFetcher, ECMWFOpenDataFetcher
+from moneygone.data.weather.nws import NWSFetcher
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
-from moneygone.execution.engine import ExecutionEngine
+from moneygone.execution.category_providers import WeatherDataProvider
+from moneygone.execution.engine import CategoryProvider, ExecutionEngine
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
 from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
 from moneygone.features import (
+    ClimatologicalAnomaly,
+    EnsembleExceedanceProb,
+    EnsembleMean,
+    EnsembleSpread,
+    ForecastHorizon,
+    ForecastRevisionDirection,
+    ForecastRevisionMagnitude,
     HomeFieldAdvantage,
     KalshiVsSportsbookEdge,
+    ModelDisagreement,
     MoneylineMovement,
     PinnacleVsMarketEdge,
     PinnacleWinProbability,
@@ -61,6 +73,7 @@ from moneygone.monitoring.drift import DriftDetector
 from moneygone.monitoring.pnl import PnLTracker
 from moneygone.monitoring.regime_detector import RegimeDetector
 from moneygone.models.sharp_sportsbook import SharpSportsbookModel
+from moneygone.models.weather_ensemble import WeatherEnsembleModel
 from moneygone.risk.manager import RiskManager
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
@@ -530,6 +543,53 @@ def build_app(config: AppConfig) -> Application:
             if config.execution.prefer_maker
             else AggressiveStrategy()
         )
+
+        # Weather category provider — NWS + NOAA + ECMWF
+        category_providers: dict[MarketCategory, CategoryProvider] = {}
+        if config.weather.enabled:
+            weather_locations = config.weather.locations or [
+                {"name": "New York", "lat": 40.7128, "lon": -74.0060},
+                {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
+                {"name": "Los Angeles", "lat": 34.0522, "lon": -118.2437},
+                {"name": "Miami", "lat": 25.7617, "lon": -80.1918},
+                {"name": "Dallas", "lat": 32.7767, "lon": -96.7970},
+                {"name": "Denver", "lat": 39.7392, "lon": -104.9903},
+            ]
+            nws_fetcher = NWSFetcher()
+            noaa_fetcher = NOAAEnsembleFetcher()
+            ecmwf_fetcher = ECMWFOpenDataFetcher()
+            weather_provider = WeatherDataProvider(
+                noaa_fetcher=noaa_fetcher,
+                ecmwf_fetcher=ecmwf_fetcher,
+                locations=weather_locations,
+                nws_fetcher=nws_fetcher,
+            )
+            weather_pipeline = FeaturePipeline(
+                [
+                    EnsembleMean(),
+                    EnsembleSpread(),
+                    EnsembleExceedanceProb(),
+                    ForecastRevisionMagnitude(),
+                    ForecastRevisionDirection(),
+                    ModelDisagreement(),
+                    ForecastHorizon(),
+                    ClimatologicalAnomaly(),
+                ],
+                store=store,
+            )
+            weather_model = WeatherEnsembleModel()
+            category_providers[MarketCategory.WEATHER] = CategoryProvider(
+                category=MarketCategory.WEATHER,
+                model=weather_model,
+                pipeline=weather_pipeline,
+                get_context_data=weather_provider.get_context,
+            )
+            async_closeables.append(weather_provider)
+            log.info(
+                "build_app.weather_ready",
+                locations=[loc["name"] for loc in weather_locations],
+            )
+
         execution_engine = ExecutionEngine(
             rest_client=rest_client,
             ws_client=ws_client,
@@ -546,6 +606,7 @@ def build_app(config: AppConfig) -> Application:
             store=store,
             sports_snapshot_provider=sports_provider,
             recorder=recorder,
+            category_providers=category_providers,
         )
         log.info(
             "build_app.sports_execution_ready",
