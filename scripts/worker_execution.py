@@ -34,11 +34,6 @@ from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.data.market_discovery import MarketCategory
-from moneygone.execution.artifact_runtime import (
-    ArtifactFeaturePipeline,
-    load_default_artifact_model,
-    universal_category_id,
-)
 from moneygone.execution.category_providers import CryptoDataProvider, WeatherDataProvider
 from moneygone.execution.engine import (
     CategoryProvider,
@@ -48,15 +43,21 @@ from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
 from moneygone.execution.strategies import AggressiveStrategy, PassiveStrategy
 from moneygone.features import (
+    BidAskSpread,
+    DepthRatio,
     HomeFieldAdvantage,
     KalshiVsSportsbookEdge,
+    MidPrice,
     MoneylineMovement,
+    OrderbookImbalance,
     PinnacleVsMarketEdge,
     PinnacleWinProbability,
     PowerRatingEdge,
     SpreadImpliedWinProb,
     SportsbookWinProbability,
     TeamInjuryImpact,
+    TimeToExpiry,
+    WeightedMidPrice,
 )
 from moneygone.features.crypto_features import (
     ATR14,
@@ -90,6 +91,7 @@ from moneygone.features.weather_features import (
     ModelDisagreement,
 )
 from moneygone.models.crypto_vol import CryptoVolModel
+from moneygone.models.market_baseline import MarketBaselineModel
 from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.models.weather_ensemble import WeatherEnsembleModel
 from moneygone.risk.drawdown import DrawdownMonitor
@@ -298,50 +300,47 @@ async def main() -> None:
         except Exception:
             log.warning("execution.weather_provider_failed", exc_info=True)
 
-    model_root = Path(config.model.model_dir)
-    universal_model = load_default_artifact_model(
-        model_root,
+    baseline_model = MarketBaselineModel()
+    baseline_pipeline = FeaturePipeline(
         [
-            "trained/gbm_universal/model.pkl",
-            "trained/logistic_universal/model.pkl",
+            BidAskSpread(),
+            MidPrice(),
+            OrderbookImbalance(),
+            WeightedMidPrice(),
+            DepthRatio(),
+            TimeToExpiry(),
         ],
-        model_name="market_universal",
+        store=store,
     )
-    if universal_model is not None:
-        for category in (
-            MarketCategory.FINANCIALS,
-            MarketCategory.ECONOMICS,
-            MarketCategory.POLITICS,
-            MarketCategory.COMPANIES,
-            MarketCategory.UNKNOWN,
-        ):
-            category_providers[category] = CategoryProvider(
-                category=category,
-                model=universal_model,
-                pipeline=ArtifactFeaturePipeline(
-                    universal_model.feature_names,
-                    category_id=(
-                        universal_category_id(category)
-                        if "category_id" in universal_model.feature_names
-                        else None
-                    ),
-                ),
-                get_context_data=None,
-            )
-        log.info(
-            "execution.universal_market_provider_enabled",
-            categories=[
-                MarketCategory.FINANCIALS.value,
-                MarketCategory.ECONOMICS.value,
-                MarketCategory.POLITICS.value,
-                MarketCategory.COMPANIES.value,
-                MarketCategory.UNKNOWN.value,
-            ],
-            model=universal_model.name,
-            version=universal_model.version,
+    baseline_categories = (
+        MarketCategory.ECONOMICS,
+        MarketCategory.POLITICS,
+        MarketCategory.FINANCIALS,
+        MarketCategory.COMPANIES,
+        MarketCategory.CRYPTO,
+        MarketCategory.ENTERTAINMENT,
+        MarketCategory.UNKNOWN,
+    )
+    for category in baseline_categories:
+        if category in category_providers:
+            continue
+        category_providers[category] = CategoryProvider(
+            category=category,
+            model=baseline_model,
+            pipeline=baseline_pipeline,
+            get_context_data=None,
         )
-    else:
-        log.warning("execution.universal_market_provider_unavailable", model_dir=str(model_root))
+    log.info(
+        "execution.market_baseline_provider_enabled",
+        categories=[
+            category.value
+            for category in baseline_categories
+            if category in category_providers
+            and category_providers[category].model is baseline_model
+        ],
+        model=baseline_model.name,
+        version=baseline_model.version,
+    )
 
     log.info(
         "execution.category_providers",

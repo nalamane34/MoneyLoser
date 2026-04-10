@@ -167,6 +167,11 @@ class KalshiRestClient:
             demo_mode=config.demo_mode,
         )
 
+    @property
+    def max_batch_cancel_size(self) -> int:
+        """Return a conservative batch-cancel size for the current rate limit."""
+        return max(1, min(20, int(self._config.rate_limit_rps)))
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -672,7 +677,9 @@ class KalshiRestClient:
 
     async def batch_cancel_orders(self, order_ids: list[str]) -> None:
         """Cancel multiple orders in a single request (up to 20)."""
-        body: dict[str, Any] = {"order_ids": order_ids}
+        body: dict[str, Any] = {
+            "orders": [{"order_id": order_id} for order_id in order_ids]
+        }
         try:
             await self._request(
                 "DELETE", "/portfolio/orders/batched", json_body=body

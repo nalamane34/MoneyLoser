@@ -29,15 +29,22 @@ from datetime import datetime
 
 
 def parse_logs(stream):
-    """Parse engine.candidate and engine.cycle_summary entries from JSON lines."""
+    """Parse stress-test log events from JSON lines."""
     candidates = []
     cycles = []
     dry_runs = []
+    fills = []
+    orders = []
 
     for line in stream:
         line = line.strip()
         if not line:
             continue
+        if not line.startswith("{"):
+            json_start = line.find("{")
+            if json_start == -1:
+                continue
+            line = line[json_start:]
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
@@ -50,8 +57,50 @@ def parse_logs(stream):
             cycles.append(d)
         elif event == "dry_run.would_trade":
             dry_runs.append(d)
+        elif event == "fill_tracker.recorded":
+            fills.append(d)
+        elif event == "engine.order_executed":
+            orders.append(d)
 
-    return candidates, cycles, dry_runs
+    return candidates, cycles, dry_runs, fills, orders
+
+
+def _candidate_score(candidate):
+    reason = candidate.get("reject_reason", "") or ""
+    if reason.startswith("duplicate_exposure:"):
+        return None
+    if reason == "open_order_exists":
+        return None
+    if reason.startswith("edge_not_actionable:edge_sanity_check"):
+        return None
+    if reason.startswith("edge_not_actionable:insufficient_liquidity"):
+        return None
+    if reason.startswith("risk_rejected:min_contract_price"):
+        return None
+    if reason.startswith("risk_rejected:max_contract_price"):
+        return None
+
+    score = candidate.get("rank_score")
+    if score is not None:
+        return score
+    edge = candidate.get("fee_adjusted_edge")
+    if edge is None:
+        return None
+    confidence = candidate.get("confidence", 1.0) or 0.0
+    fill_rate = candidate.get("fill_rate", 1.0) or 1.0
+    return edge * confidence * fill_rate
+
+
+def _group_by_cycle(candidates):
+    grouped = defaultdict(list)
+    ungrouped = []
+    for candidate in candidates:
+        cycle_id = candidate.get("cycle_id")
+        if cycle_id:
+            grouped[cycle_id].append(candidate)
+        else:
+            ungrouped.append(candidate)
+    return grouped, ungrouped
 
 
 def analyze_candidates(candidates):
@@ -97,6 +146,27 @@ def analyze_candidates(candidates):
         print(f"  {reason:35s}: {len(entries):4d}")
     print()
 
+    protected_reasons = {
+        "edge_not_actionable:edge_sanity_check",
+        "edge_not_actionable:insufficient_liquidity",
+        "risk_rejected:min_contract_price",
+        "risk_rejected:max_contract_price",
+    }
+    protected = [
+        c for c in rejected
+        if (c.get("reject_reason", "") or "") in protected_reasons
+        or (c.get("reject_reason", "") or "").startswith("duplicate_exposure:")
+        or (c.get("reject_reason", "") or "") == "open_order_exists"
+    ]
+    if protected:
+        print("── Protected Rejects ──")
+        grouped_protected = defaultdict(int)
+        for entry in protected:
+            grouped_protected[entry.get("reject_reason", "unknown")] += 1
+        for reason, count in sorted(grouped_protected.items(), key=lambda item: (-item[1], item[0])):
+            print(f"  {reason:35s}: {count:4d}")
+        print()
+
     # ── Test #1: Adversarial Market Test — Flag Extreme Edges ──
     print("── #1 Adversarial Market Test ──")
     extreme = [c for c in selected if c.get("fee_adjusted_edge", 0) > 0.30]
@@ -117,9 +187,8 @@ def analyze_candidates(candidates):
 
     # ── Test #2: Counterfactual Ranking ──
     print("── #2 Counterfactual Ranking ──")
-    # Rank ALL candidates that got through to edge computation (have fee_adjusted_edge)
-    ranked = [c for c in candidates if c.get("fee_adjusted_edge") is not None]
-    ranked.sort(key=lambda c: c.get("fee_adjusted_edge", 0), reverse=True)
+    ranked = [c for c in candidates if _candidate_score(c) is not None]
+    ranked.sort(key=lambda c: _candidate_score(c), reverse=True)
 
     if ranked:
         print(f"  Top 10 by fee-adjusted edge (of {len(ranked)} scoreable):")
@@ -128,6 +197,7 @@ def analyze_candidates(candidates):
             reason = c.get("reject_reason", "")
             print(
                 f"  {i:2d}. {status_mark} {c['ticker']:35s} "
+                f"score={_candidate_score(c):+.4f}  "
                 f"edge={c.get('fee_adjusted_edge',0):+.4f}  "
                 f"model={c.get('model_prob',0):.3f}  "
                 f"mkt={c.get('market_prob',0):.3f}  "
@@ -150,30 +220,96 @@ def analyze_candidates(candidates):
                 print("  ~  Engine is picking mid-tier — may be leaving edge on table")
             else:
                 print("  ✗  Engine is NOT picking the best opportunities")
+
+    cycle_groups, ungrouped = _group_by_cycle(candidates)
+    cycle_scored = 0
+    cycle_top_pick = 0
+    cycle_top_decile = 0
+    missed_within_cycle = []
+    for cycle_id, entries in cycle_groups.items():
+        scoreable = [c for c in entries if _candidate_score(c) is not None]
+        chosen = [c for c in scoreable if c.get("status") == "selected"]
+        rejected_scoreable = [c for c in scoreable if c.get("status") == "rejected"]
+        if not scoreable or not chosen:
+            continue
+        cycle_scored += 1
+        ranked_cycle = sorted(scoreable, key=lambda c: _candidate_score(c), reverse=True)
+        best_selected_rank = min(
+            i + 1 for i, c in enumerate(ranked_cycle) if c.get("status") == "selected"
+        )
+        if best_selected_rank == 1:
+            cycle_top_pick += 1
+        top_decile_cutoff = max(1, int(len(ranked_cycle) * 0.10))
+        if best_selected_rank <= top_decile_cutoff:
+            cycle_top_decile += 1
+        best_selected_score = max(_candidate_score(c) for c in chosen)
+        better_rejects = [
+            c for c in rejected_scoreable if _candidate_score(c) > best_selected_score
+        ]
+        if better_rejects:
+            missed_within_cycle.append((cycle_id, better_rejects[:3]))
+
+    if cycle_scored:
+        print(f"\n  Cycle-aware ranking: {cycle_scored} cycles with selected candidates")
+        print(
+            f"  Selected best candidate in-cycle: {cycle_top_pick}/{cycle_scored} "
+            f"({cycle_top_pick / cycle_scored * 100:.0f}%)"
+        )
+        print(
+            f"  Selected from top decile in-cycle: {cycle_top_decile}/{cycle_scored} "
+            f"({cycle_top_decile / cycle_scored * 100:.0f}%)"
+        )
+        if missed_within_cycle:
+            print(f"  ⚠  {len(missed_within_cycle)} cycles had rejected candidates ranked above the best selected:")
+            for cycle_id, misses in missed_within_cycle[:5]:
+                print(f"     cycle={cycle_id}")
+                for miss in misses:
+                    print(
+                        f"       {miss['ticker']:35s} score={_candidate_score(miss):+.4f} "
+                        f"edge={miss.get('fee_adjusted_edge', 0):+.4f} "
+                        f"reason={miss.get('reject_reason', '')}"
+                    )
+        else:
+            print("  ✓  No cycles where a rejected trade outranked the best selected trade")
+    elif ungrouped:
+        print("  ~  Candidate logs are missing cycle_id for some entries, so within-cycle ranking is incomplete")
     print()
 
     # ── Test #3: Best Opportunity Test ──
     print("── #3 Best-Opportunity Test ──")
-    selected_with_edge = [c for c in selected if c.get("fee_adjusted_edge") is not None]
-    rejected_with_edge = [c for c in rejected if c.get("fee_adjusted_edge") is not None and c.get("fee_adjusted_edge", 0) > 0]
+    selected_with_edge = [c for c in selected if _candidate_score(c) is not None]
+    rejected_with_edge = [c for c in rejected if _candidate_score(c) is not None and (c.get("fee_adjusted_edge", 0) > 0 or _candidate_score(c) > 0)]
     if selected_with_edge and rejected_with_edge:
-        avg_sel_edge = sum(c["fee_adjusted_edge"] for c in selected_with_edge) / len(selected_with_edge)
-        avg_rej_edge = sum(c["fee_adjusted_edge"] for c in rejected_with_edge) / len(rejected_with_edge)
-        print(f"  Selected avg edge: {avg_sel_edge:+.4f}  ({len(selected_with_edge)} trades)")
-        print(f"  Rejected (positive edge) avg: {avg_rej_edge:+.4f}  ({len(rejected_with_edge)} trades)")
-        if avg_sel_edge > avg_rej_edge:
-            print("  ✓  Selected trades have higher edge than rejected positive-edge trades")
+        avg_sel_score = sum(_candidate_score(c) for c in selected_with_edge) / len(selected_with_edge)
+        avg_rej_score = sum(_candidate_score(c) for c in rejected_with_edge) / len(rejected_with_edge)
+        print(f"  Selected avg score: {avg_sel_score:+.4f}  ({len(selected_with_edge)} trades)")
+        print(f"  Rejected avg score: {avg_rej_score:+.4f}  ({len(rejected_with_edge)} trades)")
+        if avg_sel_score > avg_rej_score:
+            print("  ✓  Selected trades outrank rejected trades on average")
         else:
-            print("  ✗  Rejected trades had HIGHER edge — check filtering logic")
+            print("  ✗  Rejected trades outrank selected trades — check filtering logic")
 
-        # How many rejected trades had edge > best selected?
         if selected_with_edge:
-            best_selected = max(c["fee_adjusted_edge"] for c in selected_with_edge)
-            missed = [c for c in rejected_with_edge if c["fee_adjusted_edge"] > best_selected]
+            best_selected = max(_candidate_score(c) for c in selected_with_edge)
+            missed = [c for c in rejected_with_edge if _candidate_score(c) > best_selected]
             if missed:
-                print(f"  ⚠  {len(missed)} rejected trades had edge ABOVE best selected ({best_selected:.4f}):")
+                print(f"  ⚠  {len(missed)} rejected trades had score ABOVE best selected ({best_selected:.4f}):")
                 for c in missed[:5]:
-                    print(f"     {c['ticker']:35s} edge={c['fee_adjusted_edge']:.4f} reason={c.get('reject_reason','')}")
+                    print(f"     {c['ticker']:35s} score={_candidate_score(c):.4f} reason={c.get('reject_reason','')}")
+
+    cycle_medians = []
+    for cycle_id, entries in cycle_groups.items():
+        chosen = [c for c in entries if c.get("status") == "selected" and _candidate_score(c) is not None]
+        rejected_scoreable = [c for c in entries if c.get("status") == "rejected" and _candidate_score(c) is not None]
+        if not chosen or not rejected_scoreable:
+            continue
+        reject_scores = sorted(_candidate_score(c) for c in rejected_scoreable)
+        median_reject = reject_scores[len(reject_scores) // 2]
+        best_selected = max(_candidate_score(c) for c in chosen)
+        cycle_medians.append(best_selected > median_reject)
+    if cycle_medians:
+        beat_rate = sum(1 for ok in cycle_medians if ok) / len(cycle_medians)
+        print(f"  Selected beat median rejected in same cycle: {beat_rate*100:.0f}% of comparable cycles")
     print()
 
     # ── Test #4: Human Audit — Selected Trades ──
@@ -230,8 +366,23 @@ def analyze_candidates(candidates):
         print(f"  {bucket:20s}: {data['count']:4d} candidates, avg_edge={avg_edge:+.4f}")
     print()
 
-    # ── Test #7: Edge Distribution ──
-    print("── #7 Edge Distribution ──")
+    print("── #7 Correlation Discipline ──")
+    selected_clusters = defaultdict(list)
+    for c in selected:
+        cluster = c.get("cluster_id")
+        if cluster:
+            selected_clusters[cluster].append(c)
+    stacked_clusters = {k: v for k, v in selected_clusters.items() if len(v) > 1}
+    if stacked_clusters:
+        print(f"  ⚠  {len(stacked_clusters)} clusters had multiple selected trades")
+        for cluster, entries in sorted(stacked_clusters.items(), key=lambda item: -len(item[1]))[:10]:
+            print(f"     {cluster}: {len(entries)} selections")
+    else:
+        print("  ✓  No repeated cluster stacking detected in selected trades")
+    print()
+
+    # ── Test #8: Edge Distribution ──
+    print("── #8 Edge Distribution ──")
     all_edges = [c.get("fee_adjusted_edge", 0) for c in candidates if c.get("fee_adjusted_edge") is not None]
     if all_edges:
         negative = sum(1 for e in all_edges if e < 0)
@@ -257,6 +408,31 @@ def analyze_candidates(candidates):
         print(f"  Total with prob:          {len(all_probs)}")
         if at_extreme > len(all_probs) * 0.5:
             print("  ⚠ Over half at extremes — calibration issue!")
+    print()
+
+
+def analyze_fills(fills, orders):
+    """Analyze realized fill quality and edge decay."""
+    if not fills:
+        return
+
+    print("── #9 Edge-Decay / Fill Quality ──")
+    avg_slippage = sum(f.get("slippage", 0.0) for f in fills) / len(fills)
+    avg_fill_edge = sum(f.get("fill_edge", 0.0) for f in fills) / len(fills)
+    positive_fill_edge = sum(1 for f in fills if f.get("fill_edge", 0.0) > 0)
+    print(f"  Fills recorded: {len(fills)}")
+    if orders:
+        print(f"  Fill / order ratio: {len(fills)}/{len(orders)} ({len(fills)/len(orders)*100:.0f}%)")
+    print(f"  Avg slippage: {avg_slippage:+.4f}")
+    print(f"  Avg fill-edge: {avg_fill_edge:+.4f}")
+    print(f"  Positive fill-edge rate: {positive_fill_edge}/{len(fills)} ({positive_fill_edge/len(fills)*100:.0f}%)")
+
+    by_category = defaultdict(list)
+    for fill in fills:
+        by_category[fill.get("category", "unknown")].append(fill)
+    for category, entries in sorted(by_category.items()):
+        category_fill_edge = sum(f.get("fill_edge", 0.0) for f in entries) / len(entries)
+        print(f"  {category:12s}: fills={len(entries):3d}  avg_fill_edge={category_fill_edge:+.4f}")
     print()
 
 
@@ -341,18 +517,34 @@ def compute_trade_iq(candidates, cycles):
     details = {}
 
     # 1. Ranking quality (25 pts)
-    ranked = [c for c in candidates if c.get("fee_adjusted_edge") is not None]
-    ranked.sort(key=lambda c: c.get("fee_adjusted_edge", 0), reverse=True)
+    ranked = [c for c in candidates if _candidate_score(c) is not None]
+    ranked.sort(key=lambda c: _candidate_score(c), reverse=True)
     selected = [c for c in candidates if c["status"] == "selected"]
 
-    if ranked and selected:
+    cycle_groups, _ = _group_by_cycle(candidates)
+    cycle_rank_hits = []
+    for entries in cycle_groups.values():
+        ranked_cycle = [c for c in entries if _candidate_score(c) is not None]
+        chosen = [c for c in ranked_cycle if c["status"] == "selected"]
+        if not ranked_cycle or not chosen:
+            continue
+        ranked_cycle.sort(key=lambda c: _candidate_score(c), reverse=True)
+        best_selected_rank = min(
+            i + 1 for i, c in enumerate(ranked_cycle) if c["status"] == "selected"
+        )
+        cycle_rank_hits.append(best_selected_rank / max(len(ranked_cycle), 1))
+    if cycle_rank_hits:
+        avg_rank_pct = sum(cycle_rank_hits) / len(cycle_rank_hits)
+        ranking_score = max(0, 25 * (1 - 2 * avg_rank_pct))
+        score += ranking_score
+        details["ranking"] = round(ranking_score, 1)
+    elif ranked and selected:
         selected_ranks = []
         for i, c in enumerate(ranked):
             if c["status"] == "selected":
                 selected_ranks.append(i + 1)
         if selected_ranks:
             avg_rank_pct = sum(selected_ranks) / len(selected_ranks) / max(len(ranked), 1)
-            # Perfectly top-ranked = 25, random = 12.5, bottom = 0
             ranking_score = max(0, 25 * (1 - 2 * avg_rank_pct))
             score += ranking_score
             details["ranking"] = round(ranking_score, 1)
@@ -403,11 +595,11 @@ def compute_trade_iq(candidates, cycles):
         details["calibration"] = cal_score
 
     # 5. Confidence-edge coherence (10 pts)
-    high_conf = [c for c in candidates if (c.get("confidence") or 0) >= 0.55 and c.get("fee_adjusted_edge") is not None]
-    low_conf = [c for c in candidates if 0.30 <= (c.get("confidence") or 0) < 0.45 and c.get("fee_adjusted_edge") is not None]
+    high_conf = [c for c in candidates if (c.get("confidence") or 0) >= 0.55 and _candidate_score(c) is not None]
+    low_conf = [c for c in candidates if 0.30 <= (c.get("confidence") or 0) < 0.45 and _candidate_score(c) is not None]
     if high_conf and low_conf:
-        avg_high = sum(c["fee_adjusted_edge"] for c in high_conf) / len(high_conf)
-        avg_low = sum(c["fee_adjusted_edge"] for c in low_conf) / len(low_conf)
+        avg_high = sum(_candidate_score(c) for c in high_conf) / len(high_conf)
+        avg_low = sum(_candidate_score(c) for c in low_conf) / len(low_conf)
         if avg_high > avg_low:
             coh_score = 10
         else:
@@ -433,11 +625,12 @@ def compute_trade_iq(candidates, cycles):
 
 
 def main():
-    candidates, cycles, dry_runs = parse_logs(sys.stdin)
+    candidates, cycles, dry_runs, fills, orders = parse_logs(sys.stdin)
 
     if candidates:
         analyze_candidates(candidates)
         analyze_cycles(cycles)
+        analyze_fills(fills, orders)
 
         iq_result = compute_trade_iq(candidates, cycles)
         if iq_result is not None:

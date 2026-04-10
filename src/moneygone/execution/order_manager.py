@@ -6,12 +6,14 @@ fill events, and periodically reconciles local state against the exchange.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import structlog
 
+from moneygone.exchange.errors import OrderError
 from moneygone.exchange.types import (
     Fill,
     Order,
@@ -147,10 +149,34 @@ class OrderManager:
             ticker=ticker,
         )
 
-        if len(to_cancel) > 1:
-            await self._client.batch_cancel_orders(to_cancel)
-        else:
-            await self._client.cancel_order(to_cancel[0])
+        batch_size = getattr(self._client, "max_batch_cancel_size", 20)
+        batch_size = max(1, min(20, int(batch_size)))
+        batch_size = max(1, min(batch_size, 5))
+
+        for start in range(0, len(to_cancel), batch_size):
+            batch = to_cancel[start:start + batch_size]
+            try:
+                if len(batch) > 1:
+                    await self._client.batch_cancel_orders(batch)
+                else:
+                    await self._client.cancel_order(batch[0])
+            except OrderError as exc:
+                if exc.status_code != 429 or len(batch) == 1:
+                    raise
+                logger.warning(
+                    "order_manager.batch_cancel_rate_limited",
+                    batch_size=len(batch),
+                    retry_after=getattr(exc, "retry_after", None),
+                )
+                await asyncio.sleep(getattr(exc, "retry_after", None) or 1.5)
+                for order_id in batch:
+                    await self._client.cancel_order(order_id)
+                    await asyncio.sleep(0.15)
+
+            if start + batch_size < len(to_cancel):
+                # Kalshi counts each order in a batch against the per-second
+                # order-op limit, so pace large shutdown cancellations.
+                await asyncio.sleep(1.05)
 
         for oid in to_cancel:
             self._forget_order(oid)

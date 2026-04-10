@@ -90,6 +90,9 @@ class FillTracker:
         fill: Fill,
         prediction: ModelPrediction,
         edge: EdgeResult,
+        *,
+        cycle_id: str | None = None,
+        category: str | None = None,
     ) -> None:
         """Record a fill with its associated prediction context.
 
@@ -143,10 +146,15 @@ class FillTracker:
             "fill_tracker.recorded",
             trade_id=fill.fill_id,
             ticker=fill.ticker,
+            cycle_id=cycle_id,
+            category=category,
             price=str(fill.price),
+            target_price=str(edge.target_price),
             slippage=round(slippage, 4),
             model_prob=round(prediction.probability, 4),
+            confidence=round(prediction.confidence, 4),
             edge=round(edge.fee_adjusted_edge, 4),
+            fill_edge=round(edge.fee_adjusted_edge - slippage, 4),
         )
 
     def get_recent_fills(self, n: int = 100) -> list[FillRecord]:

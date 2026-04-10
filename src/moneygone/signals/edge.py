@@ -58,6 +58,18 @@ class EdgeResult:
     expected_value: Decimal
     """Expected profit per contract after fees (payout is $1)."""
 
+    actionable_reason: str | None = None
+    """Primary reason the opportunity was not actionable, if any."""
+
+    edge_sufficient: bool = False
+    """Whether fee-adjusted edge met the minimum threshold."""
+
+    liquidity_ok: bool = False
+    """Whether available liquidity met the minimum requirement."""
+
+    sanity_ok: bool = True
+    """Whether the raw edge passed the sanity cap."""
+
 
 class EdgeCalculator:
     """Computes actionable edge between model predictions and market prices.
@@ -153,6 +165,13 @@ class EdgeCalculator:
         edge_sufficient = fee_adjusted_edge >= self._min_edge
 
         is_actionable = edge_sufficient and liquidity_ok and not edge_too_large
+        actionable_reason: str | None = None
+        if edge_too_large:
+            actionable_reason = "edge_sanity_check"
+        elif not liquidity_ok:
+            actionable_reason = "insufficient_liquidity"
+        elif not edge_sufficient:
+            actionable_reason = "edge_below_threshold"
 
         if edge_too_large:
             logger.warning(
@@ -163,8 +182,13 @@ class EdgeCalculator:
                 max_allowed=self._max_edge,
             )
 
-        # Estimated fill rate: 1.0 for top-of-book IOC, scale down for maker
-        estimated_fill_rate = 1.0 if not is_maker else min(1.0, available_liquidity / max(available_liquidity, 1))
+        estimated_fill_rate = self._estimate_fill_rate(
+            orderbook=orderbook,
+            side=side,
+            target_price=target_price,
+            available_liquidity=available_liquidity,
+            is_maker=is_maker,
+        )
 
         ev = Decimal(str(fee_adjusted_edge)).quantize(
             Decimal("0.0001"), rounding=ROUND_HALF_UP
@@ -182,6 +206,10 @@ class EdgeCalculator:
             action=action,
             target_price=target_price,
             expected_value=ev,
+            actionable_reason=actionable_reason,
+            edge_sufficient=edge_sufficient,
+            liquidity_ok=liquidity_ok,
+            sanity_ok=not edge_too_large,
         )
 
     def _best_executable_level(
@@ -207,6 +235,51 @@ class EdgeCalculator:
         target_price = _ONE - best_bid.price
         return target_price, int(best_bid.contracts)
 
+    def _estimate_fill_rate(
+        self,
+        *,
+        orderbook: OrderbookSnapshot,
+        side: str,
+        target_price: Decimal,
+        available_liquidity: int,
+        is_maker: bool,
+    ) -> float:
+        """Estimate fill probability at the intended execution style.
+
+        IOC orders at the best ask are assumed to fill immediately.
+        Passive orders are discounted by spread width and top-of-book depth.
+        """
+        if not is_maker:
+            return 1.0
+
+        same_side_bids = orderbook.yes_bids if side == "yes" else orderbook.no_bids
+        same_side_best_bid = same_side_bids[-1].price if same_side_bids else None
+
+        if same_side_best_bid is None:
+            spread_ticks = 5
+        else:
+            spread_ticks = max(
+                1,
+                int(
+                    (
+                        (target_price - same_side_best_bid)
+                        * Decimal("100")
+                    ).to_integral_value(rounding=ROUND_HALF_UP)
+                ),
+            )
+
+        if spread_ticks <= 1:
+            spread_factor = 0.9
+        elif spread_ticks == 2:
+            spread_factor = 0.7
+        elif spread_ticks <= 4:
+            spread_factor = 0.5
+        else:
+            spread_factor = 0.3
+
+        liquidity_factor = min(1.0, 0.5 + (available_liquidity / 100.0))
+        return max(0.1, min(0.95, spread_factor * liquidity_factor))
+
     def _empty_result(self, model_prob: float, side: str) -> EdgeResult:
         """Return a non-actionable result when no levels exist."""
         return EdgeResult(
@@ -221,4 +294,8 @@ class EdgeCalculator:
             action="buy",
             target_price=_ZERO,
             expected_value=_ZERO,
+            actionable_reason="no_executable_level",
+            edge_sufficient=False,
+            liquidity_ok=False,
+            sanity_ok=True,
         )
