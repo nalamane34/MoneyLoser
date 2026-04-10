@@ -644,13 +644,16 @@ class ExecutionEngine:
                     cache_used = True
                     logger.debug("engine.using_discovery_cache", age_s=int(age), markets=len(markets))
 
-        # Fallback: fetch directly via REST (cap at 20 pages = ~20k markets)
+        # Fallback: fetch directly via REST — only markets closing within 72h
         if not markets:
-            markets = await self._rest.get_all_markets(
-                status="open", limit=1000, max_pages=20,
+            from datetime import timedelta
+            max_close = int((now + timedelta(hours=72)).timestamp())
+            all_fetched = await self._rest.get_all_markets(
+                limit=1000, max_pages=20, max_close_ts=max_close,
             )
+            markets = [m for m in all_fetched if m.status == MarketStatus.OPEN]
             classified = [(m, classify_market(m)) for m in markets]
-            logger.debug("engine.direct_rest_fetch", markets=len(markets))
+            logger.debug("engine.direct_rest_fetch", fetched=len(all_fetched), open=len(markets))
 
         new_tickers: list[str] = []
         category_counts: dict[str, int] = {}

@@ -22,7 +22,7 @@ import json
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -206,25 +206,43 @@ class MarketDiscoveryService:
     # -- core --
 
     async def refresh(self) -> list[tuple[Market, MarketCategory]]:
-        """Fetch markets from Kalshi, classify, write cache file."""
+        """Fetch near-term open markets from Kalshi, classify, write cache.
+
+        Uses ``max_close_ts`` to only fetch markets closing within 72h.
+        The Kalshi API doesn't allow combining close_ts with status=open,
+        so we filter out non-open markets client-side.
+        """
+        now = datetime.now(timezone.utc)
+        max_close = int((now + timedelta(hours=72)).timestamp())
+
         markets = await self._rest.get_all_markets(
-            status="open", limit=1000, max_pages=self._max_pages,
+            limit=1000,
+            max_pages=self._max_pages,
+            max_close_ts=max_close,
         )
+
+        # Filter to only open/active markets (API can't combine close_ts + status)
         classified: list[tuple[Market, MarketCategory]] = []
         category_counts: dict[str, int] = {}
+        skipped_closed = 0
 
         for m in markets:
+            if m.status != MarketStatus.OPEN:
+                skipped_closed += 1
+                continue
             cat = classify_market(m)
             classified.append((m, cat))
             category_counts[cat.value] = category_counts.get(cat.value, 0) + 1
 
         self._markets = classified
-        self._refreshed_at = datetime.now(timezone.utc)
+        self._refreshed_at = now
         self._write_cache(classified)
 
         log.info(
             "market_discovery.refreshed",
             total=len(classified),
+            fetched=len(markets),
+            skipped_closed=skipped_closed,
             categories=category_counts,
         )
         return classified
