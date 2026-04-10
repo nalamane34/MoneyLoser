@@ -139,7 +139,7 @@ def _market_status(value: str | None) -> MarketStatus:
     try:
         return MarketStatus(normalized)
     except ValueError:
-        log.warning("rest_client.unknown_market_status", raw_status=value)
+        log.error("rest_client.unknown_market_status", raw_status=value)
         return MarketStatus.CLOSED
 
 

@@ -225,9 +225,6 @@ def _parse_datetime(value: Any) -> datetime | None:
 
 
 def _hours_to_close(market: Market, observation_time: datetime) -> float:
-    if market.created_time is not None:
-        delta = (market.close_time - market.created_time).total_seconds() / 3600.0
-        return max(delta, 0.0)
     delta = (market.close_time - observation_time).total_seconds() / 3600.0
     return max(delta, 0.0)
 

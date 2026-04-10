@@ -248,6 +248,9 @@ async def test_reconcile_runs_on_startup() -> None:
         async def subscribe_fills(self) -> None:
             return None
 
+        async def subscribe_positions(self) -> None:
+            return None
+
         async def disconnect(self) -> None:
             return None
 
