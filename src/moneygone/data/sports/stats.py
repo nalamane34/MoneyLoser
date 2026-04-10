@@ -29,6 +29,14 @@ _LEAGUE_PATHS: dict[str, str] = {
     "mlb": "baseball/mlb",
     "ncaab": "basketball/mens-college-basketball",
     "ncaaf": "football/college-football",
+    "soccer_epl": "soccer/eng.1",
+    "soccer_usa_mls": "soccer/usa.1",
+}
+
+# Sport/league split for ESPN scoreboard checks (used by collector).
+_SPORT_MAP: dict[str, dict[str, str]] = {
+    k: {"sport": v.split("/")[0], "league": v.split("/")[1]}
+    for k, v in _LEAGUE_PATHS.items()
 }
 
 _INJURY_STATUS_WEIGHTS: dict[str, float] = {
