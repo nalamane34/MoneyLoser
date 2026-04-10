@@ -373,13 +373,15 @@ class KalshiRestClient:
 
     @staticmethod
     def _parse_orderbook(data: dict[str, Any], ticker: str) -> OrderbookSnapshot:
+        # Kalshi API returns orderbook levels under yes_dollars/no_dollars
+        # (inside orderbook_fp), falling back to legacy yes/no keys.
         yes_levels = tuple(
             OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
-            for lvl in (data.get("yes") or [])
+            for lvl in (data.get("yes_dollars", data.get("yes")) or [])
         )
         no_levels = tuple(
             OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
-            for lvl in (data.get("no") or [])
+            for lvl in (data.get("no_dollars", data.get("no")) or [])
         )
         return OrderbookSnapshot(
             ticker=ticker,
@@ -457,14 +459,18 @@ class KalshiRestClient:
         data = await self._request(
             "GET", f"/markets/{ticker}/orderbook", params=params
         )
-        return self._parse_orderbook(data.get("orderbook", data), ticker)
+        # Kalshi returns orderbook_fp (with _dollars fields) or legacy orderbook
+        ob = data.get("orderbook_fp", data.get("orderbook", data))
+        return self._parse_orderbook(ob, ticker)
 
     async def get_orderbooks(self, tickers: list[str]) -> list[OrderbookSnapshot]:
         """Fetch orderbooks for multiple markets in a single bulk request."""
         params: dict[str, Any] = {"tickers": ",".join(tickers)}
         data = await self._request("GET", "/markets/orderbooks", params=params)
         results: list[OrderbookSnapshot] = []
-        for ticker_key, book_data in (data.get("orderbooks", {})).items():
+        # Bulk response may use orderbooks_fp or orderbooks key
+        books = data.get("orderbooks_fp", data.get("orderbooks", {}))
+        for ticker_key, book_data in books.items():
             results.append(self._parse_orderbook(book_data, ticker_key))
         return results
 
