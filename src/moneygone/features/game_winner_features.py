@@ -522,3 +522,67 @@ class PublicBettingLoad(Feature):
             public_home = 1.0 - public_away
 
         return _team_perspective(public_home, public_away, context)
+
+
+# ---------------------------------------------------------------------------
+# Data quality features (#9 from improvement plan)
+# ---------------------------------------------------------------------------
+
+
+class LineAgeHours(Feature):
+    """Age of the sportsbook line in hours since it was last captured.
+
+    Stale lines (> 4h) are less reliable because the true probability
+    may have shifted.  The model uses this to reduce confidence.
+    Capped at 48h to avoid outliers dominating.
+    """
+
+    name = "line_age_hours"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        age = _getf(context, "line_age_hours")
+        if age is None:
+            return 0.0  # Unknown age → conservative default
+        return min(age, 48.0)
+
+
+class IsConsensusFallback(Feature):
+    """Whether we're using consensus odds instead of Pinnacle.
+
+    1.0 = no Pinnacle data available, using averaged bookmaker odds.
+    0.0 = Pinnacle data is the anchor.
+    """
+
+    name = "is_consensus_fallback"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        # If pinnacle_home_win_prob is missing but sportsbook_home_win_prob exists
+        snap = context.sports_snapshot
+        if snap is None:
+            return 1.0
+        has_pinnacle = snap.get("pinnacle_home_win_prob") is not None
+        return 0.0 if has_pinnacle else 1.0
+
+
+class MatchQuality(Feature):
+    """Quality of the Kalshi → sportsbook event mapping (0.0 to 1.0).
+
+    1.0 = perfect match (both teams found in title + priced team confirmed).
+    Lower values indicate uncertain mapping where we might be pricing
+    the wrong event.
+    """
+
+    name = "match_quality"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        score = _getf(context, "match_score")
+        if score is None:
+            return 1.0  # If no score tracked, assume good match
+        # Normalize 0-4 scale to 0.0-1.0
+        return min(max(score / 4.0, 0.0), 1.0)

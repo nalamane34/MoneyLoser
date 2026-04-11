@@ -33,11 +33,11 @@ from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.types import (
     Action,
     Market,
-    OrderbookSnapshot,
     OrderRequest,
     Side,
     TimeInForce,
 )
+from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
 from moneygone.risk.manager import RiskManager
 from moneygone.signals.edge import EdgeCalculator, EdgeResult
@@ -141,6 +141,26 @@ class SportsProbabilityEstimator:
                 "nfl": "nfl",
                 "mlb": "mlb",
                 "nhl": "nhl",
+                "eng.1": "soccer",
+                "esp.1": "soccer",
+                "ger.1": "soccer",
+                "ita.1": "soccer",
+                "fra.1": "soccer",
+                "usa.1": "soccer",
+                "soccer_epl": "soccer",
+                "soccer_spain_la_liga": "soccer",
+                "soccer_germany_bundesliga": "soccer",
+                "soccer_italy_serie_a": "soccer",
+                "soccer_france_ligue_one": "soccer",
+                "soccer_usa_mls": "soccer",
+                "mls": "soccer",
+                "ufc": "mma",
+                "atp": "tennis",
+                "wta": "tennis",
+                "tennis_atp": "tennis",
+                "tennis_wta": "tennis",
+                "pga": "golf",
+                "golf_pga": "golf",
             }
             sport = league_to_sport.get(game.league, "")
 
@@ -165,6 +185,19 @@ class SportsProbabilityEstimator:
             return self._mlb_win_prob(lead, period, is_top)
         elif sport in ("hockey", "nhl"):
             return self._nhl_win_prob(lead, period, minutes_left)
+        elif sport in ("soccer",) or game.league in (
+            "eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "usa.1",
+            "soccer_epl", "soccer_spain_la_liga", "soccer_germany_bundesliga",
+            "soccer_italy_serie_a", "soccer_france_ligue_one", "soccer_usa_mls",
+            "mls",
+        ):
+            return self._soccer_win_prob(lead, period, minutes_left)
+        elif sport in ("mma",) or game.league in ("ufc",):
+            return self._mma_win_prob(game)
+        elif sport in ("tennis",) or game.league in ("atp", "wta", "tennis_atp", "tennis_wta"):
+            return self._tennis_win_prob(game)
+        elif sport in ("golf",) or game.league in ("pga", "golf_pga"):
+            return self._golf_win_prob(game)
 
         return None
 
@@ -178,8 +211,6 @@ class SportsProbabilityEstimator:
         """
         if period < 3:
             # Too early to estimate with high confidence
-            if period == 3 and lead >= 20:
-                return 0.90
             return None
 
         # Q4 or OT
@@ -308,6 +339,188 @@ class SportsProbabilityEstimator:
                     return 0.98
                 if lead >= 3:
                     return 0.96
+
+        return None
+
+    def _soccer_win_prob(
+        self, lead: int, period: int, minutes_left: float
+    ) -> float | None:
+        """Soccer win probability from current game state.
+
+        Soccer games are 90 minutes (two 45-min halves).  Goals are rare
+        (~2.7 per game total), so multi-goal leads late in the match are
+        extremely durable.
+
+        ESPN reports period=1 (1st half) or period=2 (2nd half).
+        Clock counts UP in soccer, so we convert: minutes_played = clock,
+        minutes_left = 90 - minutes_played (approximately).
+
+        Historical conversion rates for leads:
+        - 2-goal lead after 70 min → ~97% win rate
+        - 2-goal lead after 80 min → ~99%
+        - 1-goal lead after 85 min → ~93%
+        - 3-goal lead any time 2nd half → ~99%
+        """
+        # In ESPN soccer data, the clock is minutes played (counts up)
+        # and period=2 means second half.
+        if period < 2:
+            # First half — only trade 3+ goal leads
+            if lead >= 3:
+                return 0.92
+            return None
+
+        # Second half — estimate minutes remaining
+        # ESPN clock for soccer = minutes played in current half
+        # Total minutes played ≈ 45 + clock_in_2nd_half
+        mins_played = 45 + minutes_left  # minutes_left here is actually clock
+        mins_remaining = max(0.0, 95.0 - mins_played)  # include ~5 min stoppage
+
+        if lead >= 3:
+            return 0.99
+        if lead >= 2:
+            if mins_remaining < 10:
+                return 0.99
+            if mins_remaining < 20:
+                return 0.97
+            if mins_remaining < 30:
+                return 0.95
+        if lead >= 1:
+            if mins_remaining < 5:
+                return 0.93
+            if mins_remaining < 10:
+                return 0.90
+
+        return None
+
+    def _mma_win_prob(self, game: GameState) -> float | None:
+        """MMA/UFC win probability from current fight state.
+
+        UFC fights are 3 rounds (non-title) or 5 rounds (title).
+        If a fighter is significantly ahead on the scorecards going
+        into the final round, the probability of winning is very high
+        (would need a finish to lose).
+
+        ESPN provides limited real-time scoring for MMA, so we're
+        conservative — only trade when fight goes to decision
+        (i.e., is_final or near-final).
+        """
+        # MMA is harder to estimate mid-fight without scorecard data.
+        # We'll only snipe after the fight is over (resolution sniper),
+        # not mid-fight via live edge.
+        return None
+
+    def _tennis_win_prob(self, game: GameState) -> float | None:
+        """Tennis win probability from current match state.
+
+        Tennis matches are best of 3 or 5 sets.  Key near-decided states:
+        - Up 2 sets to 0 in best of 3 → match over (100%)
+        - Up 2 sets to 0 in best of 5 → ~95% (historical)
+        - Up 2 sets to 1 in best of 5 and serving for match → ~92%
+
+        ESPN detail string shows set scores, e.g. "6-3, 6-4, 3-2"
+        We parse the detail to count sets won.
+        """
+        detail = game.detail or ""
+        detail_lower = detail.lower()
+
+        # Try to count completed sets from the detail string
+        # ESPN format: "6-3, 7-5, 4-2" or "Final: 6-3, 6-4"
+        import re
+        set_scores = re.findall(r"(\d+)-(\d+)", detail)
+        if not set_scores:
+            return None
+
+        # Count sets won by each side
+        # We need to figure out which player is leading
+        home_sets = 0
+        away_sets = 0
+        for s1, s2 in set_scores:
+            s1, s2 = int(s1), int(s2)
+            if s1 > s2 and s1 >= 6:
+                home_sets += 1
+            elif s2 > s1 and s2 >= 6:
+                away_sets += 1
+            # else: set still in progress
+
+        sets_leader = max(home_sets, away_sets)
+        sets_trailer = min(home_sets, away_sets)
+
+        # Detect best-of-5 (Grand Slams) from detail string or set count
+        is_best_of_5 = (
+            "5 sets" in detail_lower
+            or "best of 5" in detail_lower
+            or len(set_scores) > 3
+            or sets_leader == 3
+        )
+
+        # Best of 5 (Grand Slams) — check first to avoid early return
+        if is_best_of_5:
+            if sets_leader == 3:
+                return 0.99  # match over
+            if sets_leader == 2 and sets_trailer == 0:
+                # Up 2-0 in best of 5 — historically ~95%
+                return 0.95
+            if sets_leader == 2 and sets_trailer == 1:
+                # Up 2-1 in best of 5
+                return 0.90
+            return None
+
+        # Best of 3 (most ATP/WTA except Grand Slams)
+        if sets_leader == 2 and sets_trailer == 0:
+            # Match is over or about to be
+            return 0.99
+        if sets_leader == 2 and sets_trailer == 1:
+            # 2-1 in sets, in deciding set — still competitive
+            return None
+
+        return None
+
+    def _golf_win_prob(self, game: GameState) -> float | None:
+        """Golf tournament leader probability.
+
+        Golf scoring is relative (strokes under/over par).  Historical
+        conversion rates for stroke leads going into the final round:
+        - 6+ stroke lead after 54 holes → ~98%
+        - 4-5 stroke lead after 54 holes → ~90%
+        - 3 stroke lead after 54 holes → ~80%
+
+        For mid-round leads, the probabilities are higher because
+        there are fewer holes remaining.
+
+        ESPN provides the leaderboard; we use home_score/away_score
+        as a proxy for the score differential.
+        """
+        lead = abs(game.home_score - game.away_score)
+        if lead == 0:
+            return None
+
+        # Golf uses period for the round number (1-4)
+        try:
+            round_num = int(game.period)
+        except (ValueError, TypeError):
+            return None
+
+        # Round 4 (final round) or later
+        if round_num >= 4:
+            if lead >= 8:
+                return 0.99
+            if lead >= 6:
+                return 0.98
+            if lead >= 4:
+                return 0.95
+            if lead >= 3:
+                return 0.92
+            if lead >= 2:
+                return 0.90
+
+        # Round 3 (going into final round)
+        if round_num == 3:
+            if lead >= 7:
+                return 0.97
+            if lead >= 5:
+                return 0.93
+            if lead >= 4:
+                return 0.90
 
         return None
 
@@ -538,6 +751,7 @@ class LiveEventEdge:
         order_manager: OrderManager,
         config: LiveEdgeConfig,
         crypto_feed: CryptoDataFeed | None = None,
+        fill_tracker: FillTracker | None = None,
     ) -> None:
         self._client = rest_client
         self._espn = espn_feed
@@ -549,6 +763,7 @@ class LiveEventEdge:
         self._orders = order_manager
         self._config = config
         self._crypto_feed = crypto_feed
+        self._fill_tracker = fill_tracker
         self._sports_estimator = SportsProbabilityEstimator()
         self._crypto_estimator = (
             CryptoPriceEdgeEstimator(crypto_feed) if crypto_feed else None
@@ -1424,6 +1639,40 @@ class LiveEventEdge:
                 contracts=decision.contracts,
                 price=str(yes_price),
             )
+
+            # Record fill in tracker for audit trail
+            if self._fill_tracker is not None:
+                try:
+                    fills = await self._client.get_fills(ticker=signal.ticker)
+                    for f in fills:
+                        if (
+                            f.side == side
+                            and f.action == Action.BUY
+                            and abs(f.price - yes_price) < Decimal("0.01")
+                        ):
+                            self._fill_tracker.on_closer_fill(
+                                f,
+                                strategy="live_edge",
+                                signal_source=signal.category,
+                                confidence=signal.confidence,
+                                expected_profit=float(decision.edge_result.expected_value),
+                                entry_price=float(yes_price),
+                                contracts=decision.contracts,
+                                category=signal.category,
+                                signal_data={
+                                    "edge": signal.edge,
+                                    "fee_adjusted_edge": signal.fee_adjusted_edge,
+                                    "reasoning": signal.reasoning,
+                                    "implied_probability": signal.implied_probability,
+                                },
+                            )
+                            break
+                except Exception:
+                    log.warning(
+                        "live_edge.fill_tracker_error",
+                        ticker=signal.ticker,
+                        exc_info=True,
+                    )
         except Exception:
             log.error(
                 "live_edge.execution_error",

@@ -20,6 +20,7 @@ import structlog
 
 from moneygone.data.market_discovery import MarketCategory
 from moneygone.exchange.types import Market
+from moneygone.utils.time import now_utc
 from moneygone.features.base import FeatureContext
 from moneygone.models.base import ModelPrediction, ProbabilityModel
 
@@ -203,6 +204,21 @@ def universal_category_id(category: MarketCategory) -> float:
     return _UNIVERSAL_CATEGORY_HINTS.get(category, _UNIVERSAL_CATEGORY_HINTS[MarketCategory.UNKNOWN])
 
 
+def fallback_categories_for_config(
+    *,
+    weather_enabled: bool,
+    crypto_enabled: bool,
+) -> list[MarketCategory]:
+    """Return the categories eligible for artifact fallback under the current config.
+
+    DISABLED: The universal artifact model has no real edge on politics,
+    entertainment, economics, etc. — it outputs constant probabilities
+    and burns cash.  Only specialist models (weather ensemble, sharp
+    sportsbook) should trade.
+    """
+    return []
+
+
 def build_universal_artifact_fallbacks(
     model_dir: Path,
     categories: list[MarketCategory],
@@ -257,10 +273,8 @@ def _parse_datetime(value: Any) -> datetime | None:
 
 
 def _hours_to_close(market: Market, observation_time: datetime) -> float:
-    if market.created_time is not None:
-        delta = (market.close_time - market.created_time).total_seconds() / 3600.0
-        return max(delta, 0.0)
-    delta = (market.close_time - observation_time).total_seconds() / 3600.0
+    now = now_utc()
+    delta = (market.close_time - now).total_seconds() / 3600.0
     return max(delta, 0.0)
 
 

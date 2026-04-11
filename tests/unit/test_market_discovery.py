@@ -59,8 +59,11 @@ def test_classify_market_prefers_explicit_api_category() -> None:
         ("Will CPI inflation fall below 3% by June?", MarketCategory.ECONOMICS),
         ("Will the election winner be decided on Tuesday?", MarketCategory.POLITICS),
         ("Wisconsin Supreme Court winner?", MarketCategory.POLITICS),
+        ("Will Donald Trump be at the White House on Jan 20?", MarketCategory.POLITICS),
+        ("Will OpenAI revenue be at least $10B in 2027?", MarketCategory.COMPANIES),
+        ("Will the Oscar winner be announced at the ceremony?", MarketCategory.ENTERTAINMENT),
         ("Best Picture winner?", MarketCategory.UNKNOWN),
-        ("Phoenix at Los Angeles L Winner?", MarketCategory.SPORTS),
+        ("Phoenix vs Los Angeles L NBA Winner?", MarketCategory.SPORTS),
     ],
 )
 def test_classify_market_avoids_false_sports_matches(

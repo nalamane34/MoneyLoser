@@ -50,9 +50,10 @@ model:
 
 execution:
   min_edge_threshold: 0.02
+  min_conviction_score: 0.02
   max_edge_sanity: 0.30
   prefer_maker: true
-  max_order_staleness_seconds: 60
+  max_order_staleness_seconds: 30
   evaluation_interval_seconds: 5.0
   max_model_market_disagreement: 0.08
 

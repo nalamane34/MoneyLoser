@@ -56,6 +56,7 @@ class DataStore:
     def __init__(self, db_path: Path | str, *, read_only: bool = False) -> None:
         self._db_path = str(db_path)
         self._read_only = read_only
+        self._column_cache: dict[str, set[str]] = {}
         config: dict[str, Any] = {"threads": 1}
         if read_only:
             config["access_mode"] = "read_only"
@@ -78,7 +79,30 @@ class DataStore:
         ddl_list = tables if tables is not None else ALL_TABLES
         for ddl in ddl_list:
             self._conn.execute(ddl)
+        self._run_migrations()
+        self._column_cache.clear()
         logger.info("datastore.schema_initialized", table_count=len(ddl_list))
+
+    def _run_migrations(self) -> None:
+        """Run lightweight schema migrations for columns added after initial deploy."""
+        migrations = [
+            ("sportsbook_game_lines", "draw_price", "DOUBLE"),
+            ("sports_outcomes", "pinnacle_draw_price", "DOUBLE"),
+            ("sports_outcomes", "consensus_draw_price", "DOUBLE"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                cols = [
+                    row[0]
+                    for row in self._conn.execute(
+                        f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}'"
+                    ).fetchall()
+                ]
+                if column not in cols and cols:  # table exists but column missing
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                    logger.info("datastore.migration", table=table, column=column)
+            except Exception:
+                pass  # table doesn't exist yet, CREATE TABLE will handle it
 
     def attach_readonly(self, name: str, db_path: Path | str, retries: int = 5) -> None:
         """Attach another DuckDB file as a read-only schema.
@@ -165,6 +189,15 @@ class DataStore:
         self._conn.close()
         logger.info("datastore.closed", db_path=self._db_path)
 
+    def has_column(self, table: str, column: str) -> bool:
+        """Return whether *table* currently contains *column*."""
+        columns = self._column_cache.get(table)
+        if columns is None:
+            rows = self._conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+            columns = {str(row[1]) for row in rows}
+            self._column_cache[table] = columns
+        return column in columns
+
     def query(self, sql: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a SQL query with ``$name`` parameters.
 
@@ -190,8 +223,9 @@ class DataStore:
             """
             INSERT INTO market_states
                 (ticker, event_ticker, title, status, yes_bid, yes_ask,
-                 last_price, volume, open_interest, close_time, result, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_price, volume, open_interest, close_time, snapshot_time,
+                 result, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -204,7 +238,10 @@ class DataStore:
                     r.get("last_price"),
                     r.get("volume"),
                     r.get("open_interest"),
-                    r["close_time"],
+                    _coerce_timestamp(r["close_time"]),
+                    _coerce_timestamp(
+                        r.get("snapshot_time", datetime.now(timezone.utc))
+                    ),
                     r.get("result"),
                     r.get("category"),
                 )
@@ -325,9 +362,9 @@ class DataStore:
             """
             INSERT INTO sportsbook_game_lines
                 (event_id, sport, home_team, away_team, bookmaker,
-                 commence_time, home_price, away_price, spread_home,
-                 total, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 commence_time, home_price, away_price, draw_price,
+                 spread_home, total, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -339,6 +376,7 @@ class DataStore:
                     _coerce_timestamp(r.get("commence_time")),
                     r["home_price"],
                     r["away_price"],
+                    r.get("draw_price"),
                     r.get("spread_home"),
                     r.get("total"),
                     _coerce_timestamp(r["captured_at"]),
@@ -449,12 +487,17 @@ class DataStore:
         self, ticker: str, as_of: datetime
     ) -> dict[str, Any] | None:
         """Return the latest market-state row for *ticker* ingested before *as_of*."""
+        time_expr = (
+            "COALESCE(snapshot_time, ingested_at)"
+            if self.has_column("market_states", "snapshot_time")
+            else "ingested_at"
+        )
         result = self._conn.execute(
-            """
+            f"""
             SELECT *
             FROM market_states
-            WHERE ticker = ? AND ingested_at <= ?
-            ORDER BY ingested_at DESC
+            WHERE ticker = ? AND {time_expr} <= ?
+            ORDER BY {time_expr} DESC, ingested_at DESC
             LIMIT 1
             """,
             [ticker, _strip_tz(as_of)],
@@ -472,8 +515,8 @@ class DataStore:
             """
             SELECT *
             FROM orderbook_snapshots
-            WHERE ticker = ? AND ingested_at <= ?
-            ORDER BY ingested_at DESC
+            WHERE ticker = ? AND COALESCE(snapshot_time, ingested_at) <= ?
+            ORDER BY COALESCE(snapshot_time, ingested_at) DESC, ingested_at DESC
             LIMIT 1
             """,
             [ticker, _strip_tz(as_of)],

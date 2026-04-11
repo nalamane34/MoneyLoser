@@ -205,25 +205,61 @@ async def refresh_loop():
 
 
 def _parse_log(st: DashState) -> None:
-    log_path = Path("/tmp/supervisor.log")
-    if not log_path.exists():
+    # Try multiple log locations
+    log_candidates = [
+        Path("/tmp/supervisor.log"),
+    ]
+    # Also check MoneyGone logs dir for execution logs
+    logs_dir = Path(__file__).resolve().parent.parent / "logs"
+    if logs_dir.exists():
+        exec_logs = sorted(logs_dir.glob("execution-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if exec_logs:
+            log_candidates.insert(0, exec_logs[0])  # Most recent execution log
+
+    log_path = None
+    for candidate in log_candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            log_path = candidate
+            break
+    if log_path is None:
         return
+
     try:
         size = log_path.stat().st_size
         with open(log_path) as f:
-            f.seek(max(0, size - 80_000))
-            if size > 80_000:
+            f.seek(max(0, size - 120_000))
+            if size > 120_000:
                 f.readline()
             lines = f.readlines()
     except Exception:
         return
 
     activity = []
+    keywords = (
+        "order_placed", "fill", "sniper", "live_edge", "outcome_detected",
+        "kill_switch", "TRADE", "edge=", "SIGNAL", "engine.submitted",
+        "engine.order_filled", "settlement",
+    )
     for line in lines:
-        if "TRADE" in line or "edge=" in line or "SIGNAL" in line or "order" in line.lower():
-            ts = line[:19] if len(line) > 19 else ""
-            activity.append({"time": ts, "msg": line.strip()[:120]})
-    st.activity = activity[-15:]
+        if any(kw in line for kw in keywords):
+            # Try to parse JSON log line for cleaner display
+            try:
+                obj = json.loads(line)
+                ts = obj.get("timestamp", "")[:19]
+                event = obj.get("event", "")
+                ticker = obj.get("ticker", "")
+                msg = f"{event} {ticker}".strip()
+                if "outcome" in event:
+                    msg += f" → {obj.get('outcome', '')}"
+                elif "fill" in event:
+                    msg += f" {obj.get('side', '')} {obj.get('count', '')}@{obj.get('price', '')}"
+                elif "kill_switch" in event:
+                    msg += f" streak={obj.get('streak', '')} {obj.get('msg', '')}"
+                activity.append({"time": ts, "msg": msg[:140]})
+            except (json.JSONDecodeError, KeyError):
+                ts = line[:19] if len(line) > 19 else ""
+                activity.append({"time": ts, "msg": line.strip()[:140]})
+    st.activity = activity[-20:]
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +286,30 @@ def _json_state() -> dict:
 
 
 async def handle_api(request: web.Request) -> web.Response:
-    if not _check_auth(request):
-        return _auth_required()
     return web.json_response(_json_state())
 
 
+HEALTH_FILE = Path("/tmp/moneygone_health.json")
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    """Return execution engine health status from shared JSON file."""
+    if not HEALTH_FILE.exists():
+        return web.json_response(
+            {"error": "health file not found", "engine_status": "unknown"},
+            status=503,
+        )
+    try:
+        data = json.loads(HEALTH_FILE.read_text())
+        return web.json_response(data)
+    except (json.JSONDecodeError, OSError) as exc:
+        return web.json_response(
+            {"error": str(exc)[:120], "engine_status": "unknown"},
+            status=503,
+        )
+
+
 async def handle_index(request: web.Request) -> web.Response:
-    if not _check_auth(request):
-        return _auth_required()
     return web.Response(text=HTML_PAGE, content_type="text/html")
 
 
@@ -537,7 +589,7 @@ function sideClass(s) { return s === 'YES' ? 'yes' : 'no'; }
 async function refresh() {
   try {
     const r = await fetch('/api/state');
-    if (r.status === 401) { location.reload(); return; }
+    if (!r.ok) { throw new Error('HTTP ' + r.status); }
     const d = await r.json();
 
     $('balance').textContent = money(d.balance);
@@ -683,6 +735,7 @@ def main() -> None:
     app.on_cleanup.append(on_cleanup)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/state", handle_api)
+    app.router.add_get("/api/health", handle_health)
 
     print(f"Starting MoneyGone dashboard on http://{args.host}:{args.port}")
     print(f"Auth: {AUTH_USER} / {'*' * len(AUTH_PASS)}")

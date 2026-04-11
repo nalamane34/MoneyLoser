@@ -66,10 +66,12 @@ def test_parse_market_maps_non_tradeable_statuses_conservatively() -> None:
 
 def test_get_balance_parses_cent_denominated_demo_response(monkeypatch) -> None:
     client = KalshiRestClient.__new__(KalshiRestClient)
+    client._subaccount = 2  # type: ignore[attr-defined]
 
-    async def _fake_request(method: str, path: str):
+    async def _fake_request(method: str, path: str, params=None):
         assert method == "GET"
         assert path == "/portfolio/balance"
+        assert params == {"subaccount": 2}
         return {
             "balance": 11007,
             "portfolio_value": 1460,
@@ -184,8 +186,28 @@ def test_parse_order_uses_fixed_point_count_fields() -> None:
     assert order.remaining_count == 2
 
 
+def test_parse_settlement_normalizes_cent_revenue_to_dollars() -> None:
+    settlement = KalshiRestClient._parse_settlement(
+        {
+            "ticker": "KXTEST-1",
+            "event_ticker": "KXTEST",
+            "market_result": "yes",
+            "yes_count_fp": "1.00",
+            "yes_total_cost_dollars": "0.4000",
+            "no_count_fp": "0.00",
+            "no_total_cost_dollars": "0.0000",
+            "revenue": 100,
+            "fee_cost": "0.0100",
+            "settled_time": "2026-04-10T18:00:00Z",
+        }
+    )
+
+    assert settlement.revenue == Decimal("1")
+
+
 def test_create_order_serializes_fixed_point_strings_and_current_tif() -> None:
     client = KalshiRestClient.__new__(KalshiRestClient)
+    client._subaccount = 3  # type: ignore[attr-defined]
     captured: dict[str, object] = {}
 
     async def _fake_request(method: str, path: str, json_body=None):
@@ -235,6 +257,31 @@ def test_create_order_serializes_fixed_point_strings_and_current_tif() -> None:
         "count": 5,
         "yes_price_dollars": "0.5700",
         "time_in_force": "immediate_or_cancel",
+        "subaccount": 3,
+    }
+
+
+def test_get_orders_uses_default_subaccount_when_not_overridden() -> None:
+    client = KalshiRestClient.__new__(KalshiRestClient)
+    client._subaccount = 4  # type: ignore[attr-defined]
+    captured: dict[str, object] = {}
+
+    async def _fake_request(method: str, path: str, params=None):
+        captured["method"] = method
+        captured["path"] = path
+        captured["params"] = dict(params or {})
+        return {"orders": []}
+
+    client._request = _fake_request  # type: ignore[attr-defined]
+
+    import asyncio
+
+    asyncio.run(KalshiRestClient.get_orders(client, status="resting", limit=10))
+
+    assert captured == {
+        "method": "GET",
+        "path": "/portfolio/orders",
+        "params": {"status": "resting", "limit": 10, "subaccount": 4},
     }
 
 
@@ -243,6 +290,12 @@ def test_request_signs_path_without_query_parameters() -> None:
 
     class _FakeLimiter:
         async def acquire(self) -> None:
+            return None
+
+        async def acquire_order(self) -> None:
+            return None
+
+        async def acquire_data(self) -> None:
             return None
 
     class _FakeAuth:

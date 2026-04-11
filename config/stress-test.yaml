@@ -1,78 +1,98 @@
-# Live trading config — wide-open filters, real orders on production Kalshi.
-# Risk controls (kelly_fraction, max_position_per_market) provide safety.
+# Live trading config — CONSERVATIVE while validating weather model v5.
+# DO NOT loosen these limits until forward validation confirms calibration.
 
 exchange:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
-  api_key_id: "1883dced-c29c-45ce-b4ae-86489918843e"
+  # api_key_id loaded from KALSHI_API_KEY_ID env var
   private_key_path: "kalshi_key.pem"
+  subaccount: 0
   demo_mode: false
 
 weather:
-  enabled: false  # Re-enable tomorrow after Open-Meteo daily rate limit resets
+  enabled: true
+  # Coordinates are NWS station locations used for Kalshi settlement,
+  # NOT city centers.  Kalshi settles from NWS Daily Climatological Reports.
   locations:
     - name: "New York"
-      lat: 40.7128
-      lon: -74.0060
+      lat: 40.7668    # KNYC Central Park
+      lon: -73.9829
     - name: "Chicago"
-      lat: 41.8781
-      lon: -87.6298
+      lat: 41.7856    # KMDW Midway Airport
+      lon: -87.7527
     - name: "Los Angeles"
-      lat: 34.0522
-      lon: -118.2437
+      lat: 33.9425    # KLAX LAX Airport
+      lon: -118.4080
     - name: "Miami"
-      lat: 25.7617
-      lon: -80.1918
+      lat: 25.7954    # KMIA Miami International
+      lon: -80.2901
     - name: "Dallas"
-      lat: 32.7767
-      lon: -96.7970
+      lat: 32.8972    # KDFW DFW Airport
+      lon: -97.0377
     - name: "Denver"
-      lat: 39.7392
-      lon: -104.9903
+      lat: 39.8617    # KDEN Denver International
+      lon: -104.6732
     - name: "Seattle"
-      lat: 47.6062
-      lon: -122.3321
+      lat: 47.4499    # KSEA SeaTac Airport
+      lon: -122.3118
     - name: "Atlanta"
-      lat: 33.7490
-      lon: -84.3880
+      lat: 33.6367    # KATL Hartsfield-Jackson
+      lon: -84.4279
 
 crypto:
-  enabled: false
+  enabled: false  # Disabled — focusing on weather + sports only
 
 sportsbook:
   enabled: true
   leagues:
+    # US majors
     - "nba"
     - "nhl"
     - "mlb"
+    # Top soccer
+    - "soccer_epl"
+    - "soccer_spain_la_liga"
+    - "soccer_germany_bundesliga"
+    - "soccer_italy_serie_a"
+    - "soccer_france_ligue_one"
+    - "soccer_usa_mls"
+    # Tennis — auto-discovers active tournament keys
+    - "tennis_atp"
+    - "tennis_wta"
+    # MMA / UFC
+    - "ufc"
+    # NFL when in season
+    - "americanfootball_nfl"
   bookmakers:
     - "pinnacle"
     - "fanduel"
     - "draftkings"
     - "betmgm"
+    - "bet365"
   markets:
     - "h2h"
   fetch_interval_minutes: 30
   lookahead_hours: 24
-  min_requests_remaining: 250
+  min_requests_remaining: 0
 
 execution:
-  min_edge_threshold: 0.01       # Very low — let marginal edges through for review
-  max_edge_sanity: 0.95          # Wide open — we WANT to see extreme weather edges
+  min_edge_threshold: 0.08        # Only trade with 8%+ edge (meaningful after fees)
+  min_conviction_score: 0.40      # Need real model conviction
+  max_edge_sanity: 0.50           # >50% edge = model error, reject
   prefer_maker: true
-  max_order_staleness_seconds: 120
-  evaluation_interval_seconds: 10.0
-  max_model_market_disagreement: 0.50  # Wide open for stress test
+  max_order_staleness_seconds: 30
+  evaluation_interval_seconds: 15.0
+  max_model_market_disagreement: 0.35  # Don't fight the market too hard
 
 risk:
-  kelly_fraction: 0.05
-  max_position_per_market: 10
-  max_position_per_category_pct: 0.50   # Wide for stress test
-  max_total_exposure_pct: 0.80          # Wide for stress test
-  daily_loss_limit_pct: 0.50            # Wide for stress test
-  max_drawdown_pct: 0.50               # Wide for stress test
-  min_contract_price: 0.02              # Allow extreme prices through
-  max_contract_price: 0.98              # Allow extreme prices through
-  max_tail_exposure_pct: 0.50           # Wide for stress test
+  kelly_fraction: 0.02             # Very conservative while validating model
+  max_position_per_market: 3       # Small positions
+  max_position_per_category_pct: 0.25  # Max 25% in any category
+  max_total_exposure_pct: 0.30     # Max 30% of bankroll at risk
+  daily_loss_limit_pct: 0.08       # Stop trading after 8% daily loss
+  max_drawdown_pct: 0.15           # Circuit breaker at 15% drawdown
+  min_contract_price: 0.08         # No extreme tail bets
+  max_contract_price: 0.92         # No extreme tail bets
+  max_tail_exposure_pct: 0.15      # Max 15% in tail positions
 
 log_level: "INFO"

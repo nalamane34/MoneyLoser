@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
+from moneygone.exchange.errors import OrderError
 from moneygone.exchange.types import Action, Market, MarketResult, MarketStatus, Order, OrderStatus, Side
 from moneygone.execution.engine import CategoryProvider, ExecutionEngine, TradeDecision
 from moneygone.models.base import ModelPrediction, ProbabilityModel
@@ -41,6 +42,7 @@ class _FakeOrders:
     def __init__(self, orders: list[Order]) -> None:
         self._orders = orders
         self.reconcile_calls = 0
+        self.cancelled_order_ids: list[str] = []
 
     def get_open_orders(self) -> list[Order]:
         return list(self._orders)
@@ -50,6 +52,10 @@ class _FakeOrders:
 
     async def cancel_all(self, ticker: str | None = None) -> int:
         return 0
+
+    async def cancel_order(self, order_id: str) -> None:
+        self.cancelled_order_ids.append(order_id)
+        self._orders = [order for order in self._orders if order.order_id != order_id]
 
     @property
     def open_order_count(self) -> int:
@@ -95,6 +101,27 @@ def _engine_with_context(
     engine._decision_context = {}
     engine._decision_context_by_client_order_id = {}
     return engine
+
+
+def _non_binary_market(ticker: str, *, event_ticker: str) -> Market:
+    return Market(
+        ticker=ticker,
+        event_ticker=event_ticker,
+        series_ticker="KXLOWTPHX",
+        title="Will Phoenix low temp be below 65.5F?",
+        subtitle="",
+        yes_sub_title="",
+        no_sub_title="",
+        status=MarketStatus.OPEN,
+        yes_bid=Decimal("0.53"),
+        yes_ask=Decimal("0.55"),
+        last_price=Decimal("0.54"),
+        volume=100,
+        open_interest=10,
+        close_time=datetime.now(timezone.utc),
+        result=MarketResult.NOT_SETTLED,
+        category="weather",
+    )
 
 
 def test_sports_outcome_key_treats_yes_away_and_no_home_as_same_view() -> None:
@@ -198,6 +225,59 @@ async def test_duplicate_equivalent_position_is_blocked() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_event_cluster_resting_order_is_blocked_for_non_binary_markets() -> None:
+    now = datetime.now(timezone.utc)
+    engine = object.__new__(ExecutionEngine)
+    engine._market_cache = {
+        "KXLOWTPHX-26APR11-B65.5": _non_binary_market(
+            "KXLOWTPHX-26APR11-B65.5",
+            event_ticker="KXLOWTPHX-26APR11",
+        ),
+        "KXLOWTPHX-26APR11-B63.5": _non_binary_market(
+            "KXLOWTPHX-26APR11-B63.5",
+            event_ticker="KXLOWTPHX-26APR11",
+        ),
+    }
+    engine._orders = _FakeOrders(
+        [
+            Order(
+                order_id="weather-order-1",
+                ticker="KXLOWTPHX-26APR11-B63.5",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=1,
+                remaining_count=1,
+                price=Decimal("0.55"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now,
+            )
+        ]
+    )
+    engine._risk = SimpleNamespace(
+        _portfolio=SimpleNamespace(positions={}),
+    )
+    engine._sports = None
+    engine._decision_context = {}
+    engine._decision_context_by_client_order_id = {}
+
+    conflict = await engine._find_duplicate_exposure(
+        "KXLOWTPHX-26APR11-B65.5",
+        "yes",
+        action="buy",
+        sports_snapshot=None,
+    )
+
+    assert conflict == {
+        "kind": "event_cluster_open_order",
+        "ticker": "KXLOWTPHX-26APR11-B63.5",
+        "side": "yes",
+        "action": "buy",
+    }
+
+
+@pytest.mark.asyncio
 async def test_reconcile_runs_on_startup() -> None:
     orders = _FakeOrders([])
     engine = object.__new__(ExecutionEngine)
@@ -277,6 +357,107 @@ async def test_reconcile_runs_on_startup() -> None:
     await engine.stop()
 
     assert orders.reconcile_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_open_orders_uses_config_threshold() -> None:
+    now = datetime.now(timezone.utc)
+    orders = _FakeOrders(
+        [
+            Order(
+                order_id="stale-order",
+                ticker="KXMLBGAME-PHI",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=3,
+                remaining_count=3,
+                price=Decimal("0.55"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now - timedelta(seconds=180),
+            ),
+            Order(
+                order_id="fresh-order",
+                ticker="KXMLBGAME-ARI",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=2,
+                remaining_count=2,
+                price=Decimal("0.54"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now - timedelta(seconds=10),
+            ),
+        ]
+    )
+    engine = object.__new__(ExecutionEngine)
+    engine._config = SimpleNamespace(max_order_staleness_seconds=90)
+    engine._orders = orders
+
+    cancelled = await engine._cancel_stale_open_orders()
+
+    assert cancelled == 1
+    assert orders.cancelled_order_ids == ["stale-order"]
+    assert [order.order_id for order in orders.get_open_orders()] == ["fresh-order"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_open_orders_rechecks_ticker_immediately() -> None:
+    now = datetime.now(timezone.utc)
+    orders = _FakeOrders(
+        [
+            Order(
+                order_id="stale-order",
+                ticker="KXMLBGAME-PHI",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=1,
+                remaining_count=1,
+                price=Decimal("0.55"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now - timedelta(seconds=45),
+            ),
+        ]
+    )
+    engine = object.__new__(ExecutionEngine)
+    engine._config = SimpleNamespace(max_order_staleness_seconds=30)
+    engine._orders = orders
+    engine._running = True
+    engine._watched = ["KXMLBGAME-PHI"]
+    engine._market_cache = {
+        "KXMLBGAME-PHI": _market(
+            "KXMLBGAME-PHI",
+            event_ticker="KXMLBGAME-ARIPHI",
+            yes_sub_title="Philadelphia",
+        )
+    }
+    engine._last_eval = {}
+    engine._stale_rechecks_inflight = set()
+
+    calls: list[tuple[str, str, str | None] | tuple[str, str]] = []
+
+    async def _evaluate_market(ticker: str, *, cycle_id: str | None = None):
+        calls.append(("evaluate", ticker, cycle_id))
+        return "decision"
+
+    async def _execute_decision(decision) -> None:
+        calls.append(("execute", decision))
+
+    engine.evaluate_market = _evaluate_market
+    engine.execute_decision = _execute_decision
+
+    cancelled = await engine._cancel_stale_open_orders()
+
+    assert cancelled == 1
+    assert orders.cancelled_order_ids == ["stale-order"]
+    assert calls[0][0] == "evaluate"
+    assert calls[0][1] == "KXMLBGAME-PHI"
+    assert str(calls[0][2]).startswith("stale-recheck:")
+    assert calls[1] == ("execute", "decision")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +550,17 @@ class _FakeStrategy:
     async def execute(self, edge, size, orders, orderbook):
         self.executed = True
         return None  # No actual order created
+
+
+class _FailingStrategy:
+    """Raises a deterministic order error for execute_decision tests."""
+
+    def __init__(self) -> None:
+        self.executed = False
+
+    async def execute(self, edge, size, orders, orderbook):
+        self.executed = True
+        raise OrderError("boom", status_code=403)
 
 
 class _FakeWSForGuard:
@@ -474,6 +666,19 @@ async def test_execute_decision_allows_non_demo_only_model_via_flag() -> None:
 
     # Strategy SHOULD have been called
     assert engine._strategy.executed is True
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_handles_order_error_without_raising() -> None:
+    """Order placement failures should be logged and contained."""
+    engine = _engine_for_guard_test(demo_mode=False)
+    engine._strategy = _FailingStrategy()
+    decision = _make_decision(model_name="sharp_sportsbook")
+
+    await engine.execute_decision(decision)
+
+    assert engine._strategy.executed is True
+    assert engine._decision_context == {}
 
 
 def test_market_baseline_model_has_demo_only_flag() -> None:

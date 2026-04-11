@@ -41,6 +41,54 @@ SPORT_KEYS: dict[str, str] = {
     "soccer_germany_bundesliga": "soccer_germany_bundesliga",
     "soccer_italy_serie_a": "soccer_italy_serie_a",
     "soccer_france_ligue_one": "soccer_france_ligue_one",
+    # MMA / UFC
+    "ufc": "mma_mixed_martial_arts",
+    "mma": "mma_mixed_martial_arts",
+    # Tennis — individual tournament keys; use get_active_tennis_keys() for
+    # dynamic discovery.  These shorthands map to the most recent active
+    # tournament when multiple are running.
+    "tennis_atp": "tennis_atp_aus_open_singles",  # placeholder, resolved dynamically
+    "tennis_wta": "tennis_wta_aus_open_singles",  # placeholder, resolved dynamically
+}
+
+# All known Odds API tennis tournament keys.  The API activates them
+# individually around each tournament window.
+TENNIS_TOURNAMENT_KEYS: dict[str, list[str]] = {
+    "tennis_atp": [
+        "tennis_atp_aus_open_singles",
+        "tennis_atp_french_open",
+        "tennis_atp_wimbledon",
+        "tennis_atp_us_open",
+        "tennis_atp_indian_wells",
+        "tennis_atp_miami_open",
+        "tennis_atp_monte_carlo_masters",
+        "tennis_atp_madrid_open",
+        "tennis_atp_italian_open",
+        "tennis_atp_canadian_open",
+        "tennis_atp_cincinnati_open",
+        "tennis_atp_shanghai_masters",
+        "tennis_atp_paris_masters",
+        "tennis_atp_dubai",
+        "tennis_atp_qatar_open",
+        "tennis_atp_china_open",
+    ],
+    "tennis_wta": [
+        "tennis_wta_aus_open_singles",
+        "tennis_wta_french_open",
+        "tennis_wta_wimbledon",
+        "tennis_wta_us_open",
+        "tennis_wta_indian_wells",
+        "tennis_wta_miami_open",
+        "tennis_wta_madrid_open",
+        "tennis_wta_italian_open",
+        "tennis_wta_canadian_open",
+        "tennis_wta_cincinnati_open",
+        "tennis_wta_dubai",
+        "tennis_wta_qatar_open",
+        "tennis_wta_china_open",
+        "tennis_wta_charleston_open",
+        "tennis_wta_wuhan_open",
+    ],
 }
 
 # Common player prop market keys.
@@ -99,7 +147,8 @@ class MoneylineOdds:
     away_team: str
     home_price: float  # decimal odds
     away_price: float  # decimal odds
-    bookmaker: str
+    draw_price: float | None = None  # decimal odds (soccer 3-way)
+    bookmaker: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +263,48 @@ class OddsAPIFeed:
             return SPORT_KEYS[key]
         # Assume already a full sport key.
         return key
+
+    async def get_active_tennis_keys(self) -> list[str]:
+        """Discover which tennis tournament keys are currently active.
+
+        The Odds API uses per-tournament keys for tennis (e.g.
+        ``tennis_atp_monte_carlo_masters``).  This method queries the
+        ``/sports`` endpoint and returns all currently-active tennis keys.
+        """
+        data = await self._get_json(f"{_ODDS_BASE}/sports")
+        if data is None or not isinstance(data, list):
+            return []
+        return [
+            s["key"]
+            for s in data
+            if isinstance(s, dict)
+            and s.get("key", "").startswith("tennis_")
+            and s.get("active")
+        ]
+
+    async def get_all_tennis_odds(self) -> list[MoneylineOdds]:
+        """Fetch moneyline odds across all active tennis tournaments."""
+        active_keys = await self.get_active_tennis_keys()
+        if not active_keys:
+            logger.info("odds.no_active_tennis")
+            return []
+        all_odds: list[MoneylineOdds] = []
+        for key in active_keys:
+            odds = await self.get_moneyline_odds(key)
+            all_odds.extend(odds)
+        return all_odds
+
+    async def get_all_tennis_games(self) -> list[GameOdds]:
+        """Fetch upcoming games across all active tennis tournaments."""
+        active_keys = await self.get_active_tennis_keys()
+        if not active_keys:
+            logger.info("odds.no_active_tennis")
+            return []
+        all_games: list[GameOdds] = []
+        for key in active_keys:
+            games = await self.get_upcoming_games(key, markets=["h2h"])
+            all_games.extend(games)
+        return all_games
 
     # ------------------------------------------------------------------
     # Public API
@@ -347,11 +438,17 @@ class OddsAPIFeed:
                         continue
                     outcomes = mkt.get("outcomes", [])
                     home_price = away_price = 0.0
+                    draw_price: float | None = None
                     for outcome in outcomes:
                         if outcome.get("name") == home:
                             home_price = float(outcome.get("price", 0))
                         elif outcome.get("name") == away:
                             away_price = float(outcome.get("price", 0))
+                        elif outcome.get("name") == "Draw":
+                            try:
+                                draw_price = float(outcome.get("price", 0))
+                            except (ValueError, TypeError):
+                                pass
                     if home_price > 0 and away_price > 0:
                         results.append(
                             MoneylineOdds(
@@ -359,6 +456,7 @@ class OddsAPIFeed:
                                 away_team=away,
                                 home_price=home_price,
                                 away_price=away_price,
+                                draw_price=draw_price if draw_price and draw_price > 0 else None,
                                 bookmaker=bm_name,
                             )
                         )
@@ -661,6 +759,8 @@ class OddsAPIFeed:
         totals: list[float] = []
         pinnacle_home: float | None = None
         pinnacle_away: float | None = None
+        pinnacle_draw: float | None = None
+        h2h_draw: list[float] = []
 
         for bookmaker in game.bookmakers:
             bm_key = str(bookmaker.get("key", "")).lower()
@@ -671,6 +771,7 @@ class OddsAPIFeed:
                 if key == "h2h":
                     home_price: float | None = None
                     away_price: float | None = None
+                    draw_price: float | None = None
                     for outcome in outcomes:
                         try:
                             price = float(outcome.get("price", 0))
@@ -682,10 +783,14 @@ class OddsAPIFeed:
                         elif outcome.get("name") == game.away_team:
                             h2h_away.append(price)
                             away_price = price
+                        elif outcome.get("name") == "Draw":
+                            h2h_draw.append(price)
+                            draw_price = price
 
                     if bm_key == "pinnacle":
                         pinnacle_home = home_price
                         pinnacle_away = away_price
+                        pinnacle_draw = draw_price
 
                 elif key == "spreads":
                     for outcome in outcomes:
@@ -706,8 +811,10 @@ class OddsAPIFeed:
         return {
             "consensus_home": sum(h2h_home) / len(h2h_home) if h2h_home else None,
             "consensus_away": sum(h2h_away) / len(h2h_away) if h2h_away else None,
+            "consensus_draw": sum(h2h_draw) / len(h2h_draw) if h2h_draw else None,
             "pinnacle_home": pinnacle_home,
             "pinnacle_away": pinnacle_away,
+            "pinnacle_draw": pinnacle_draw,
             "spread": sum(spread_home) / len(spread_home) if spread_home else None,
             "total": sum(totals) / len(totals) if totals else None,
         }
@@ -720,6 +827,7 @@ class OddsAPIFeed:
         """Extract one bookmaker's line snapshot for a game."""
         home_price: float | None = None
         away_price: float | None = None
+        draw_price: float | None = None
         spread_home: float | None = None
         total: float | None = None
 
@@ -737,6 +845,8 @@ class OddsAPIFeed:
                         home_price = price
                     elif outcome.get("name") == game.away_team:
                         away_price = price
+                    elif outcome.get("name") == "Draw":
+                        draw_price = price
 
             elif key == "spreads":
                 for outcome in outcomes:
@@ -759,6 +869,7 @@ class OddsAPIFeed:
         return {
             "home_price": home_price,
             "away_price": away_price,
+            "draw_price": draw_price,
             "spread_home": spread_home,
             "total": total,
         }
@@ -791,6 +902,7 @@ class OddsAPIFeed:
                         "commence_time": self._parse_timestamp(game.commence_time),
                         "home_price": home_price,
                         "away_price": away_price,
+                        "draw_price": line.get("draw_price"),
                         "spread_home": line["spread_home"],
                         "total": line["total"],
                         "captured_at": captured_at,
@@ -833,6 +945,8 @@ class OddsAPIFeed:
             "soccer_germany_bundesliga": "soccer",
             "soccer_italy_serie_a": "soccer",
             "soccer_france_ligue_one": "soccer",
+            "ufc": "mma",
+            "mma": "mma",
         }
         sport = sport_lookup.get(league.lower())
         if sport is None:

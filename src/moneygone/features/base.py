@@ -69,8 +69,10 @@ class FeatureContext:
     market_state: Market | None = None
     orderbook: OrderbookSnapshot | None = None
     weather_ensemble: Any | None = None  # ForecastEnsemble when available
-    weather_threshold: float | None = None  # Market threshold for weather (e.g., 36°F)
+    weather_threshold: float | None = None  # Market threshold for weather (e.g., 36°F in °C)
     weather_direction: float | None = None  # 1.0 = above threshold, -1.0 = below threshold
+    weather_location: str | None = None     # Location name for bias correction
+    weather_variable: str | None = None     # "high" or "low" for bias correction
     crypto_snapshot: dict[str, Any] | None = None
     sports_snapshot: dict[str, Any] | None = None
     store: Any | None = None  # DataStore when available

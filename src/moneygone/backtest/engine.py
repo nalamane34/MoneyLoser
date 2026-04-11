@@ -181,6 +181,10 @@ class BacktestEngine:
             logger.warning("backtest.no_events")
             return self._empty_result(bankroll)
 
+        for event in events:
+            if event.event_type == EventType.SETTLEMENT:
+                self._guard.add_settlement_time(event.ticker, event.timestamp)
+
         # Initialize simulated exchange
         exchange = SimulatedExchange(
             initial_cash=bankroll,

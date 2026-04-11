@@ -36,7 +36,16 @@ SUPPORTED_LEAGUES: dict[str, str] = {
     "mlb": "baseball/mlb",
     "nhl": "hockey/nhl",
     "mls": "soccer/usa.1",
+    "soccer_usa_mls": "soccer/usa.1",
+    "soccer_epl": "soccer/eng.1",
+    "soccer_spain_la_liga": "soccer/esp.1",
+    "soccer_germany_bundesliga": "soccer/ger.1",
+    "soccer_italy_serie_a": "soccer/ita.1",
+    "soccer_france_ligue_one": "soccer/fra.1",
     "ufc": "mma/ufc",
+    "tennis_atp": "tennis/atp",
+    "tennis_wta": "tennis/wta",
+    "golf_pga": "golf/pga",
 }
 
 

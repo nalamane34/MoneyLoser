@@ -12,6 +12,8 @@ from moneygone.exchange.types import Market, MarketResult, MarketStatus
 from moneygone.execution.artifact_runtime import (
     ArtifactBackedModel,
     ArtifactFeaturePipeline,
+    build_universal_artifact_fallbacks,
+    fallback_categories_for_config,
     universal_category_id,
 )
 from moneygone.features.base import FeatureContext
@@ -123,3 +125,53 @@ def test_artifact_backed_model_loads_joblib_artifact(tmp_path) -> None:
     assert prediction.raw_probability == pytest.approx(0.70)
     assert prediction.probability == pytest.approx(0.65)
     assert prediction.model_name == "market_universal"
+
+
+def test_build_universal_artifact_fallbacks_returns_per_category_pipelines(tmp_path) -> None:
+    model_dir = tmp_path / "models"
+    artifact_path = model_dir / "trained" / "gbm_universal" / "model.pkl"
+    artifact_path.parent.mkdir(parents=True)
+    joblib.dump(
+        {
+            "model": _FakeModel(),
+            "feature_names": ["last_price", "category_id"],
+            "trained_at": "2026-04-10T12:00:00+00:00",
+        },
+        artifact_path,
+    )
+
+    fallbacks = build_universal_artifact_fallbacks(
+        model_dir,
+        [MarketCategory.POLITICS, MarketCategory.COMPANIES],
+    )
+
+    assert set(fallbacks) == {MarketCategory.POLITICS, MarketCategory.COMPANIES}
+    politics_model, politics_pipeline = fallbacks[MarketCategory.POLITICS]
+    companies_model, companies_pipeline = fallbacks[MarketCategory.COMPANIES]
+    assert politics_model is companies_model
+    assert politics_pipeline.compute(
+        FeatureContext(
+            ticker="T",
+            observation_time=datetime.now(timezone.utc),
+            market_state=_market(category="politics"),
+        )
+    )["category_id"] == universal_category_id(MarketCategory.POLITICS)
+    assert companies_pipeline.compute(
+        FeatureContext(
+            ticker="T",
+            observation_time=datetime.now(timezone.utc),
+            market_state=_market(category="companies"),
+        )
+    )["category_id"] == universal_category_id(MarketCategory.COMPANIES)
+
+
+def test_fallback_categories_for_config_respects_disabled_optional_categories() -> None:
+    categories = fallback_categories_for_config(
+        weather_enabled=False,
+        crypto_enabled=False,
+    )
+
+    assert MarketCategory.WEATHER not in categories
+    assert MarketCategory.CRYPTO not in categories
+    assert MarketCategory.POLITICS in categories
+    assert MarketCategory.ENTERTAINMENT in categories

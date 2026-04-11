@@ -12,9 +12,7 @@ Three strategies are provided:
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -25,7 +23,6 @@ from moneygone.exchange.types import (
     Action,
     Order,
     OrderRequest,
-    OrderStatus,
     OrderbookSnapshot,
     Side,
     TimeInForce,
@@ -181,14 +178,14 @@ class PassiveStrategy(ExecutionStrategy):
         to yes_price via ``1 - no_bid``.
         """
         if edge.side == "yes":
-            if not orderbook.yes_levels:
+            if not orderbook.no_levels:
                 return None
             # target_price = YES ask = 1 - best NO bid
             # Post one tick below the ask
             price = edge.target_price - Decimal("0.01") + self._improve
             price = max(Decimal("0.01"), min(Decimal("0.99"), price))
         else:
-            if not orderbook.no_levels:
+            if not orderbook.yes_levels:
                 return None
             # target_price = NO ask = 1 - best YES bid
             # Desired NO bid = NO ask - 1 tick
@@ -315,6 +312,8 @@ class DryRunStrategy(ExecutionStrategy):
         return None
 
 
+# NOTE: AdaptiveStrategy is currently unused in production code but retained
+# for potential future use (passive-then-aggressive fallback pattern).
 class AdaptiveStrategy(ExecutionStrategy):
     """Start passive, switch to aggressive if not filled within timeout.
 

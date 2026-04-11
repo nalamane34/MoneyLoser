@@ -7,6 +7,7 @@ legacy cent-denominated fields are deprecated).
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -23,7 +24,7 @@ from moneygone.exchange.errors import (
     OrderError,
     RateLimitError,
 )
-from moneygone.exchange.rate_limiter import AsyncRateLimiter
+from moneygone.exchange.rate_limiter import AsyncRateLimiter, DualRateLimiter
 from moneygone.exchange.types import (
     AccountLimits,
     Action,
@@ -158,19 +159,34 @@ class KalshiRestClient:
     def __init__(self, config: ExchangeConfig) -> None:
         self._config = config
         self._base_url = config.base_url.rstrip("/")
+        self._subaccount = int(getattr(config, "subaccount", 0) or 0)
         self._auth = KalshiAuth(config.api_key_id, config.private_key_path)
-        self._limiter = AsyncRateLimiter(config.rate_limit_rps)
+        self._limiter = DualRateLimiter(
+            order_rps=min(config.rate_limit_rps, 10.0),
+            data_rps=config.rate_limit_rps,
+        )
         self._client: httpx.AsyncClient | None = None
         log.info(
             "rest_client.initialized",
             base_url=self._base_url,
             demo_mode=config.demo_mode,
+            subaccount=self._subaccount,
         )
 
     @property
     def max_batch_cancel_size(self) -> int:
         """Return a conservative batch-cancel size for the current rate limit."""
         return max(1, min(20, int(self._config.rate_limit_rps)))
+
+    def _with_subaccount_param(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        merged = dict(params or {})
+        merged.setdefault("subaccount", self._subaccount)
+        return merged
+
+    def _with_subaccount_body(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        merged = dict(body or {})
+        merged.setdefault("subaccount", self._subaccount)
+        return merged
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -216,9 +232,20 @@ class KalshiRestClient:
         # Kalshi signs only the request path; query parameters are excluded.
         sign_path = urlparse(self._base_url).path.rstrip("/") + "/" + path.lstrip("/")
 
+        # Pick the appropriate rate-limiter bucket: order-mutating
+        # endpoints use the tighter "orders" bucket; everything else
+        # (reads, market data) uses the "data" bucket.
+        _is_order_endpoint = (
+            method.upper() in ("POST", "DELETE", "PUT")
+            and "/orders" in path
+        )
+
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
-            await self._limiter.acquire()
+            if _is_order_endpoint:
+                await self._limiter.acquire_order()
+            else:
+                await self._limiter.acquire_data()
 
             headers = self._auth.get_headers(method.upper(), sign_path)
 
@@ -245,8 +272,18 @@ class KalshiRestClient:
             # Map specific HTTP status codes to typed errors.
             if response.status_code == 429:
                 retry_after = float(response.headers.get("Retry-After", _BACKOFF_BASE * (2**attempt)))
+                if attempt < max_retries - 1:
+                    log.warning(
+                        "rest_client.rate_limited",
+                        attempt=attempt + 1,
+                        retry_after=retry_after,
+                        method=method,
+                        path=path,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
                 raise RateLimitError(
-                    "Rate limit exceeded",
+                    "Rate limit exceeded after retries",
                     retry_after=retry_after,
                     status_code=429,
                     response_body=response.text,
@@ -429,7 +466,10 @@ class KalshiRestClient:
         return Settlement(
             ticker=data["ticker"],
             market_result=_market_result(data.get("market_result")),
-            revenue=_dec(data.get("revenue", 0)),
+            revenue=_money(
+                data.get("revenue_dollars"),
+                data.get("revenue"),
+            ),
             settled_time=_ts(data.get("settled_time")),
             event_ticker=data.get("event_ticker", ""),
             yes_count=int(float(str(data.get("yes_count_fp", 0)))),
@@ -584,7 +624,11 @@ class KalshiRestClient:
 
     async def get_balance(self) -> Balance:
         """Fetch the account balance."""
-        data = await self._request("GET", "/portfolio/balance")
+        data = await self._request(
+            "GET",
+            "/portfolio/balance",
+            params=self._with_subaccount_param(),
+        )
         available = _money(
             data.get("available_balance_dollars"),
             data.get("available_balance", data.get("balance")),
@@ -609,7 +653,11 @@ class KalshiRestClient:
         Filters: ``ticker``, ``event_ticker``, ``settlement_status``,
         ``cursor``, ``limit``.
         """
-        data = await self._request("GET", "/portfolio/positions", params=filters)
+        data = await self._request(
+            "GET",
+            "/portfolio/positions",
+            params=self._with_subaccount_param(filters),
+        )
         return [
             self._parse_position(p)
             for p in data.get("market_positions", [])
@@ -620,7 +668,11 @@ class KalshiRestClient:
 
         Filters: ``ticker``, ``order_id``, ``cursor``, ``limit``.
         """
-        data = await self._request("GET", "/portfolio/fills", params=filters)
+        data = await self._request(
+            "GET",
+            "/portfolio/fills",
+            params=self._with_subaccount_param(filters),
+        )
         return [self._parse_fill(f) for f in data.get("fills", [])]
 
     async def get_settlements(self, **filters: Any) -> list[Settlement]:
@@ -628,7 +680,11 @@ class KalshiRestClient:
 
         Filters: ``ticker``, ``cursor``, ``limit``.
         """
-        data = await self._request("GET", "/portfolio/settlements", params=filters)
+        data = await self._request(
+            "GET",
+            "/portfolio/settlements",
+            params=self._with_subaccount_param(filters),
+        )
         return [self._parse_settlement(s) for s in data.get("settlements", [])]
 
     # ------------------------------------------------------------------
@@ -645,6 +701,7 @@ class KalshiRestClient:
             "yes_price_dollars": _fixed_point_dollars(request.yes_price),
             "time_in_force": request.time_in_force.api_value,
         }
+        body = self._with_subaccount_body(body)
         if request.post_only:
             body["post_only"] = True
         if request.client_order_id is not None:
@@ -664,7 +721,11 @@ class KalshiRestClient:
     async def cancel_order(self, order_id: str) -> None:
         """Cancel a single resting order."""
         try:
-            await self._request("DELETE", f"/portfolio/orders/{order_id}")
+            await self._request(
+                "DELETE",
+                f"/portfolio/orders/{order_id}",
+                params=self._with_subaccount_param(),
+            )
         except KalshiAPIError as exc:
             raise OrderError(
                 f"Failed to cancel order {order_id}: {exc}",
@@ -678,7 +739,10 @@ class KalshiRestClient:
     async def batch_cancel_orders(self, order_ids: list[str]) -> None:
         """Cancel multiple orders in a single request (up to 20)."""
         body: dict[str, Any] = {
-            "orders": [{"order_id": order_id} for order_id in order_ids]
+            "orders": [
+                {"order_id": order_id, "subaccount": self._subaccount}
+                for order_id in order_ids
+            ]
         }
         try:
             await self._request(
@@ -697,7 +761,11 @@ class KalshiRestClient:
 
     async def get_order(self, order_id: str) -> Order:
         """Fetch a single order by ID."""
-        data = await self._request("GET", f"/portfolio/orders/{order_id}")
+        data = await self._request(
+            "GET",
+            f"/portfolio/orders/{order_id}",
+            params=self._with_subaccount_param(),
+        )
         return self._parse_order(data.get("order", data))
 
     async def get_orders(self, **filters: Any) -> list[Order]:
@@ -707,7 +775,11 @@ class KalshiRestClient:
         ``min_ts``, ``max_ts``, ``status`` (resting|canceled|executed),
         ``limit`` (1-1000), ``cursor``, ``subaccount``.
         """
-        data = await self._request("GET", "/portfolio/orders", params=filters)
+        data = await self._request(
+            "GET",
+            "/portfolio/orders",
+            params=self._with_subaccount_param(filters),
+        )
         return [self._parse_order(o) for o in data.get("orders", [])]
 
     async def amend_order(self, request: AmendOrderRequest) -> tuple[Order, Order]:
@@ -720,6 +792,7 @@ class KalshiRestClient:
             "side": request.side.value,
             "action": request.action.value,
         }
+        body = self._with_subaccount_body(body)
         if request.yes_price is not None:
             body["yes_price_dollars"] = _fixed_point_dollars(request.yes_price)
         if request.count is not None:
@@ -757,6 +830,7 @@ class KalshiRestClient:
         if reduce_by is None and reduce_to is None:
             raise ValueError("Exactly one of reduce_by or reduce_to is required")
         body: dict[str, Any] = {}
+        body = self._with_subaccount_body(body)
         if reduce_by is not None:
             body["reduce_by"] = reduce_by
         else:
@@ -794,6 +868,7 @@ class KalshiRestClient:
                 "count": req.count,
                 "yes_price_dollars": _fixed_point_dollars(req.yes_price),
                 "time_in_force": req.time_in_force.api_value,
+                "subaccount": self._subaccount,
             }
             if req.post_only:
                 item["post_only"] = True
@@ -873,7 +948,7 @@ class KalshiRestClient:
         """
         data = await self._request(
             "POST", "/portfolio/order_groups/create",
-            json_body={"contracts_limit": contracts_limit},
+            json_body=self._with_subaccount_body({"contracts_limit": contracts_limit}),
         )
         gid = data.get("order_group_id", "")
         log.info("rest_client.order_group_created", order_group_id=gid)
@@ -884,6 +959,8 @@ class KalshiRestClient:
         params: dict[str, Any] = {}
         if subaccount is not None:
             params["subaccount"] = subaccount
+        elif self._subaccount:
+            params["subaccount"] = self._subaccount
         data = await self._request("GET", "/portfolio/order_groups", params=params)
         return [
             OrderGroup(
@@ -897,21 +974,27 @@ class KalshiRestClient:
     async def trigger_order_group(self, order_group_id: str) -> None:
         """Manually trigger an order group to release its orders."""
         await self._request(
-            "PUT", f"/portfolio/order_groups/{order_group_id}/trigger"
+            "PUT",
+            f"/portfolio/order_groups/{order_group_id}/trigger",
+            params=self._with_subaccount_param(),
         )
         log.info("rest_client.order_group_triggered", order_group_id=order_group_id)
 
     async def delete_order_group(self, order_group_id: str) -> None:
         """Delete an order group (cancels all associated resting orders)."""
         await self._request(
-            "DELETE", f"/portfolio/order_groups/{order_group_id}"
+            "DELETE",
+            f"/portfolio/order_groups/{order_group_id}",
+            params=self._with_subaccount_param(),
         )
         log.info("rest_client.order_group_deleted", order_group_id=order_group_id)
 
     async def reset_order_group(self, order_group_id: str) -> None:
         """Reset an order group's fill counter back to zero."""
         await self._request(
-            "PUT", f"/portfolio/order_groups/{order_group_id}/reset"
+            "PUT",
+            f"/portfolio/order_groups/{order_group_id}/reset",
+            params=self._with_subaccount_param(),
         )
         log.info("rest_client.order_group_reset", order_group_id=order_group_id)
 
@@ -921,7 +1004,7 @@ class KalshiRestClient:
         """Update the contract limit on an existing order group."""
         await self._request(
             "PUT", f"/portfolio/order_groups/{order_group_id}/limit",
-            json_body={"contracts_limit": contracts_limit},
+            json_body=self._with_subaccount_body({"contracts_limit": contracts_limit}),
         )
         log.info(
             "rest_client.order_group_limit_updated",
@@ -940,11 +1023,48 @@ class KalshiRestClient:
         buying power before orders fill.
         """
         data = await self._request(
-            "GET", "/portfolio/summary/total_resting_order_value"
+            "GET",
+            "/portfolio/summary/total_resting_order_value",
+            params=self._with_subaccount_param(),
         )
         # API returns cents integer
         cents = int(data.get("total_resting_order_value", 0))
         return Decimal(cents) / 100
+
+    async def create_subaccount(self) -> int:
+        """Create a new subaccount and return its number."""
+        data = await self._request(
+            "POST",
+            "/portfolio/subaccounts",
+            json_body={},
+        )
+        return int(data.get("subaccount_number", 0))
+
+    async def get_subaccount_balances(self) -> list[dict[str, Any]]:
+        """Fetch balances for all subaccounts including primary."""
+        data = await self._request("GET", "/portfolio/subaccounts/balances")
+        return list(data.get("subaccount_balances", []))
+
+    async def transfer_subaccount_funds(
+        self,
+        *,
+        from_subaccount: int,
+        to_subaccount: int,
+        amount_cents: int,
+        client_transfer_id: str | None = None,
+    ) -> None:
+        """Transfer funds between subaccounts."""
+        body = {
+            "client_transfer_id": client_transfer_id or str(uuid.uuid4()),
+            "from_subaccount": from_subaccount,
+            "to_subaccount": to_subaccount,
+            "amount_cents": amount_cents,
+        }
+        await self._request(
+            "POST",
+            "/portfolio/subaccounts/transfer",
+            json_body=body,
+        )
 
     # ------------------------------------------------------------------
     # Exchange info

@@ -105,15 +105,16 @@ class PortfolioTracker:
             fill.ticker, LocalPosition(ticker=fill.ticker)
         )
         cost = Decimal(fill.count) * fill.price
+        fees = fill.fee_cost
 
         if fill.action == Action.BUY:
             if fill.side == Side.YES:
                 pos.yes_count += fill.count
-                pos.yes_cost_basis += cost
+                pos.yes_cost_basis += cost + fees
             else:
                 pos.no_count += fill.count
-                pos.no_cost_basis += cost
-            self._cash -= cost
+                pos.no_cost_basis += cost + fees
+            self._cash -= cost + fees
             logger.debug(
                 "fill_buy",
                 ticker=fill.ticker,
@@ -128,7 +129,7 @@ class PortfolioTracker:
                     sold_count = min(fill.count, pos.yes_count)
                     avg_cost = pos.yes_cost_basis / Decimal(pos.yes_count)
                     sold_cost = avg_cost * Decimal(sold_count)
-                    pnl = Decimal(sold_count) * fill.price - sold_cost
+                    pnl = (Decimal(sold_count) * fill.price - fees) - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
                     pos.yes_cost_basis -= sold_cost
@@ -138,12 +139,12 @@ class PortfolioTracker:
                     sold_count = min(fill.count, pos.no_count)
                     avg_cost = pos.no_cost_basis / Decimal(pos.no_count)
                     sold_cost = avg_cost * Decimal(sold_count)
-                    pnl = Decimal(sold_count) * fill.price - sold_cost
+                    pnl = (Decimal(sold_count) * fill.price - fees) - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
                     pos.no_cost_basis -= sold_cost
                 pos.no_count = max(0, pos.no_count - fill.count)
-            self._cash += cost
+            self._cash += cost - fees
             logger.debug(
                 "fill_sell",
                 ticker=fill.ticker,
@@ -161,16 +162,25 @@ class PortfolioTracker:
     def on_settlement(self, settlement: Settlement) -> None:
         """Update realized PnL when a market settles.
 
-        Revenue (cents) is the net settlement P&L from the API.
+        Settlement revenue is normalized to payout dollars by the REST client.
         """
         pos = self._positions.get(settlement.ticker)
-        revenue_dollars = _dec(settlement.revenue) / 100  # API revenue is in cents
+        payout_dollars = settlement.revenue
+        if pos is not None:
+            realized_delta = payout_dollars - pos.cost_basis
+        else:
+            realized_delta = (
+                payout_dollars
+                - settlement.yes_total_cost
+                - settlement.no_total_cost
+                - settlement.fee_cost
+            )
 
-        self._cash += revenue_dollars
-        self._realized_pnl += revenue_dollars
+        self._cash += payout_dollars
+        self._realized_pnl += realized_delta
 
         if pos is not None:
-            pos.realized_pnl += revenue_dollars
+            pos.realized_pnl += realized_delta
             pos.yes_count = 0
             pos.no_count = 0
             pos.yes_cost_basis = _ZERO
@@ -180,7 +190,8 @@ class PortfolioTracker:
             "settlement",
             ticker=settlement.ticker,
             result=settlement.market_result.value,
-            revenue=str(revenue_dollars),
+            payout=str(payout_dollars),
+            pnl=str(realized_delta),
         )
 
     # ------------------------------------------------------------------

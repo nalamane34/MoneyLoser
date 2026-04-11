@@ -30,7 +30,7 @@ execution:
   min_edge_threshold: 0.03
   max_edge_sanity: 0.20
   prefer_maker: true
-  max_order_staleness_seconds: 90
+  max_order_staleness_seconds: 30
   evaluation_interval_seconds: 15.0
   max_model_market_disagreement: 0.06
 

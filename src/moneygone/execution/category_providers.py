@@ -419,7 +419,18 @@ class WeatherDataProvider:
             return None
 
         direction = _extract_direction(market)
-        snapshot: dict[str, Any] = {"ensemble": ensemble, "direction": direction}
+
+        # Determine weather variable type (high/low) for bias correction
+        weather_var = "high"  # default
+        if "KXLOW" in ticker_upper or "low" in text:
+            weather_var = "low"
+
+        snapshot: dict[str, Any] = {
+            "ensemble": ensemble,
+            "direction": direction,
+            "location_name": loc_name,
+            "weather_variable": weather_var,
+        }
         if threshold is not None:
             snapshot["threshold"] = threshold
         if hours is not None:

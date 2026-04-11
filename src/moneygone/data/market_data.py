@@ -141,6 +141,10 @@ class MarketDataRecorder:
             "volume": data.get("volume"),
             "open_interest": data.get("open_interest"),
             "close_time": data.get("close_time", datetime.now(tz=timezone.utc).isoformat()),
+            "snapshot_time": data.get(
+                "snapshot_time",
+                datetime.now(tz=timezone.utc).isoformat(),
+            ),
             "result": data.get("result"),
             "category": data.get("category"),
         }

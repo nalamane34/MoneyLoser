@@ -2,15 +2,16 @@
 exchange:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
-  api_key_id: "1883dced-c29c-45ce-b4ae-86489918843e"
+  # api_key_id loaded from KALSHI_API_KEY_ID env var
   private_key_path: "kalshi_key.pem"
+  subaccount: 0
   demo_mode: false
 
 weather:
   enabled: true
 
 crypto:
-  enabled: true
+  enabled: false
 
 sportsbook:
   enabled: true
@@ -24,6 +25,11 @@ sportsbook:
     - "soccer_germany_bundesliga"
     - "soccer_italy_serie_a"
     - "soccer_france_ligue_one"
+    # Tennis — auto-discovers active tournament keys
+    - "tennis_atp"
+    - "tennis_wta"
+    # MMA / UFC
+    - "ufc"
   bookmakers:
     - "pinnacle"
     - "fanduel"
@@ -39,7 +45,7 @@ execution:
   min_edge_threshold: 0.03
   max_edge_sanity: 0.20
   prefer_maker: true
-  max_order_staleness_seconds: 90
+  max_order_staleness_seconds: 30
   evaluation_interval_seconds: 15.0
   max_model_market_disagreement: 0.06
 
@@ -51,7 +57,37 @@ risk:
   daily_loss_limit_pct: 0.01
   max_drawdown_pct: 0.05
   min_contract_price: 0.20
-  max_contract_price: 0.80
+  max_contract_price: 0.95
   max_tail_exposure_pct: 0.02
+
+# --- Live closer strategies (resolution sniper + live event edge) ---
+closer:
+  enabled: true
+  # Resolution sniper: buys AFTER outcome is known (game final, temp crossed)
+  sniper:
+    min_confidence: 0.95
+    max_entry_price: 0.95
+    min_entry_price: 0.75
+    min_profit_after_fees: 0.005
+    max_contracts_per_snipe: 20
+    max_daily_snipes: 40
+    cooldown_seconds: 3.0
+  # Live event edge: buys BEFORE final when state implies outcome
+  live_edge:
+    min_edge: 0.05
+    scan_interval_seconds: 15.0
+    max_contracts_per_trade: 20
+    sports_enabled: true
+    weather_enabled: true
+    crypto_enabled: false
+    sports_leagues: ["nba", "nhl", "mlb", "ufc", "mls", "soccer_epl", "soccer_spain_la_liga", "soccer_germany_bundesliga", "soccer_italy_serie_a", "soccer_france_ligue_one", "tennis_atp", "tennis_wta", "golf_pga"]
+    # Tiered confidence: price 75-84 → 90%, 85-89 → 95%, 90-95 → 97%
+    min_confidence_low: 0.90    # for contracts priced 75-84c
+    min_confidence_mid: 0.95    # for contracts priced 85-89c
+    min_confidence_high: 0.97   # for contracts priced 90-95c
+  # Kill switch: pause closer strategies after N consecutive losses
+  kill_switch:
+    max_consecutive_losses: 4
+    cooldown_hours: 12
 
 log_level: "INFO"

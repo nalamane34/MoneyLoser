@@ -182,6 +182,12 @@ def candlestick_to_market_state(
     candle: Candlestick,
 ) -> dict[str, Any]:
     """Convert a candlestick into a market_states row."""
+    ts = candle.end_period_ts
+    if isinstance(ts, datetime):
+        snapshot_time = ts.replace(tzinfo=None) if ts.tzinfo else ts
+    else:
+        snapshot_time = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
+
     yes_bid = float(candle.yes_bid_ohlc.close) if candle.yes_bid_ohlc else float(candle.close) - 0.01
     yes_ask = float(candle.yes_ask_ohlc.close) if candle.yes_ask_ohlc else float(candle.close) + 0.01
 
@@ -202,6 +208,7 @@ def candlestick_to_market_state(
         "volume": candle.volume,
         "open_interest": candle.open_interest,
         "close_time": close_time if isinstance(close_time, datetime) else datetime.fromisoformat(str(close_time).replace("Z", "+00:00")).replace(tzinfo=None),
+        "snapshot_time": snapshot_time,
         "result": result,
         "category": category,
     }

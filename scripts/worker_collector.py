@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from moneygone.config import load_config
 from moneygone.data.schemas import COLLECTOR_TABLES
-from moneygone.data.sports.odds import OddsAPIFeed
+from moneygone.data.sports.odds import OddsAPIFeed, TENNIS_TOURNAMENT_KEYS
+from moneygone.data.sports.esports_odds import EsportsOddsFeed
 from moneygone.data.sports.stats import PlayerStatsFeed
 from moneygone.data.store import DataStore
 from moneygone.utils.logging import setup_logging
@@ -96,44 +97,122 @@ async def collect_once(
         return
 
     now = reference_time or datetime.now(timezone.utc)
+
+    # Expand tennis shorthands into active tournament keys.
+    expanded_leagues: list[str] = []
+    active_tennis_keys: list[str] | None = None
     for league in leagues:
+        if league in TENNIS_TOURNAMENT_KEYS:
+            if active_tennis_keys is None:
+                active_tennis_keys = await odds_feed.get_active_tennis_keys()
+                log.info("collector.active_tennis", keys=active_tennis_keys)
+            prefix = league.replace("tennis_", "tennis_")  # e.g. "tennis_atp" or "tennis_wta"
+            matching = [k for k in active_tennis_keys if k.startswith(prefix)]
+            if matching:
+                expanded_leagues.extend(matching)
+            else:
+                log.info("collector.no_active_tennis", league=league)
+        else:
+            expanded_leagues.append(league)
+
+    for league in expanded_leagues:
         remaining = odds_feed.requests_remaining
         if remaining is not None and remaining <= reserve:
             log.warning("collector.stop_for_quota", league=league, remaining=remaining)
             break
 
-        try:
-            has_games = await asyncio.wait_for(
-                _league_has_games_within_window(
-                    stats_feed,
-                    league,
-                    config.sportsbook.lookahead_hours,
-                    reference_time=now,
-                ),
-                timeout=15.0,
-            )
-        except asyncio.TimeoutError:
-            log.warning("collector.espn_check_timeout", league=league)
-            has_games = True
+        # Skip ESPN schedule check for tennis tournaments and MMA — those
+        # don't have standard ESPN schedule pages.
+        is_special = league.startswith("tennis_") or league in ("ufc", "mma")
+        if not is_special:
+            try:
+                has_games = await asyncio.wait_for(
+                    _league_has_games_within_window(
+                        stats_feed,
+                        league,
+                        config.sportsbook.lookahead_hours,
+                        reference_time=now,
+                    ),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("collector.espn_check_timeout", league=league)
+                has_games = True
 
-        if not has_games:
-            log.info("collector.skip_no_games", league=league)
-            continue
+            if not has_games:
+                log.info("collector.skip_no_games", league=league)
+                continue
 
+        # For tennis tournament keys, the league IS the full API key already.
         games = await odds_feed.get_upcoming_games(
             league,
             bookmakers=list(config.sportsbook.bookmakers),
             markets=list(config.sportsbook.markets),
         )
-        rows = odds_feed.build_line_history_rows(league, games, captured_at=now)
+
+        # Map tennis tournament keys back to generic sport for storage.
+        storage_league = league
+        if league.startswith("tennis_atp_"):
+            storage_league = "tennis_atp"
+        elif league.startswith("tennis_wta_"):
+            storage_league = "tennis_wta"
+
+        rows = odds_feed.build_line_history_rows(storage_league, games, captured_at=now)
         store.insert_sportsbook_game_lines(rows)
         log.info(
             "collector.recorded",
-            league=league,
+            league=storage_league,
+            api_key=league,
             games=len(games),
             rows=len(rows),
             remaining=odds_feed.requests_remaining,
         )
+
+    # Collect esports odds from OddsPapi (if key available).
+    # Budget: 250 req/month free tier.  With 3 sports × 4 calls each = 12 per run.
+    # Run esports collection only every 6th cycle (every 3 hours with 30-min interval).
+    esports_feed = EsportsOddsFeed()
+    if esports_feed.has_api_key:
+        # Check if we should run this cycle — use a simple file-based counter
+        esports_counter_file = data_dir / ".esports_counter"
+        run_esports = False
+        try:
+            if esports_counter_file.exists():
+                counter = int(esports_counter_file.read_text().strip())
+            else:
+                counter = 0
+            counter += 1
+            esports_counter_file.write_text(str(counter))
+            # Run every 6th cycle (3 hours at 30-min interval)
+            run_esports = counter % 6 == 1
+        except Exception:
+            run_esports = True  # fallback: always run
+
+        if run_esports:
+            try:
+                # Focus on CS2, LoL, Valorant — highest Kalshi volume
+                all_esports = await esports_feed.get_all_esports_odds(
+                    max_fixtures_per_sport=5,
+                    sports=["esports_cs2", "esports_lol", "esports_valorant"],
+                )
+                for sport, lines in all_esports.items():
+                    rows = esports_feed.build_line_history_rows(lines, captured_at=now)
+                    store.insert_sportsbook_game_lines(rows)
+                    log.info(
+                        "collector.esports_recorded",
+                        sport=sport,
+                        lines=len(lines),
+                        rows=len(rows),
+                        api_calls=esports_feed.requests_used,
+                    )
+            except Exception:
+                log.warning("collector.esports_error", exc_info=True)
+            finally:
+                await esports_feed.close()
+        else:
+            log.debug("collector.esports_skipped_not_this_cycle", counter=counter)
+    else:
+        log.debug("collector.esports_skipped_no_key")
 
     try:
         parquet_path = data_dir / "sportsbook_lines.parquet"

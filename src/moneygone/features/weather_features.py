@@ -220,15 +220,15 @@ class EnsembleExceedanceProb(Feature):
             # temperature or 0.5 for other variables.
             ticker_upper = (context.ticker or "").upper()
             if "TEMP" in ticker_upper or "LOWT" in ticker_upper or "HIGHT" in ticker_upper:
-                min_std = 1.0  # 1°C minimum spread for temperature
+                min_std = 1.5  # 1.5°C (~2.7°F) minimum spread for temperature
             else:
                 min_std = 0.5  # generic minimum for other variables
             effective_std = max(std, min_std)
             if effective_std > 1e-9:
                 # P(X >= threshold) via normal CDF
                 exceedance = float(1.0 - stats.norm.cdf(threshold, loc=mean, scale=effective_std))
-                # Clip to [0.02, 0.98] — parametric tails can be extreme
-                exceedance = max(0.02, min(0.98, exceedance))
+                # Clip to [0.05, 0.95] — parametric tails can be extreme
+                exceedance = max(0.05, min(0.95, exceedance))
                 log.debug(
                     "exceedance_parametric",
                     ticker=context.ticker,
@@ -252,6 +252,73 @@ class EnsembleExceedanceProb(Feature):
             # "Below X" market: P(YES) = P(value < threshold) = 1 - P(value >= threshold)
             return 1.0 - exceedance
         return exceedance
+
+
+class StationBiasExceedance(Feature):
+    """Bias-corrected exceedance probability using Gaussian model.
+
+    Instead of counting raw ensemble members, this uses the station-specific
+    bias and RMSE to model the true station observation as a Gaussian.
+    This accounts for:
+    - Systematic grid-point vs station offset (bias)
+    - Non-systematic forecast error (RMSE residual)
+    - NWS rounding uncertainty (~0.5°F)
+
+    Falls back to raw exceedance if location/variable info is unavailable.
+    """
+
+    name = "station_bias_exceedance"
+    dependencies = ()
+    lookback = timedelta(0)
+
+    def compute(self, context: FeatureContext) -> float | None:
+        from moneygone.models.weather_ensemble import bias_corrected_exceedance
+
+        members = _get_members(context)
+        if members is None:
+            return None
+
+        threshold = getattr(context, "weather_threshold", None)
+        if threshold is None:
+            return None
+
+        direction = getattr(context, "weather_direction", None)
+        if direction is None:
+            direction = 1.0
+
+        location = getattr(context, "weather_location", None)
+        variable = getattr(context, "weather_variable", None)
+
+        if location is None or variable is None:
+            # Fall back to raw exceedance
+            return None
+
+        arr = np.array(members)
+        ens_mean = float(np.mean(arr))
+        ens_std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+
+        prob = bias_corrected_exceedance(
+            ensemble_mean_c=ens_mean,
+            ensemble_std_c=ens_std,
+            threshold_c=threshold,
+            direction=direction,
+            location=location,
+            variable=variable,
+        )
+
+        log.info(
+            "station_bias_exceedance",
+            ticker=context.ticker,
+            location=location,
+            variable=variable,
+            threshold=round(threshold, 2),
+            direction=direction,
+            raw_mean=round(ens_mean, 2),
+            raw_std=round(ens_std, 2),
+            bias_prob=round(prob, 4),
+        )
+
+        return prob
 
 
 class ForecastRevisionMagnitude(Feature):

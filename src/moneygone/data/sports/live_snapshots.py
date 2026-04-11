@@ -50,15 +50,44 @@ def recommended_max_line_age(fetch_interval_minutes: int) -> timedelta:
 
 # Map Kalshi ticker prefixes to sportsbook sport keys
 _TICKER_SPORT_MAP: dict[str, str] = {
+    # US majors
     "kxmlb": "mlb", "kxnba": "nba", "kxnhl": "nhl", "kxnfl": "nfl",
-    "kxncaabb": "ncaab", "kxncaafb": "ncaaf",
+    "kxncaabb": "ncaab", "kxncaafb": "ncaaf", "kxncaamb": "ncaab",
+    "kxncaawb": "ncaab", "kxncaaf": "ncaaf",
+    "kxwnba": "wnba", "kxahl": "ahl",
+    # Soccer (order matters — longer prefixes first)
     "kxepl": "soccer_epl", "kxmls": "soccer_usa_mls",
     "kxlaliga": "soccer_spain_la_liga", "kxbundesliga": "soccer_germany_bundesliga",
-    "kxseriea": "soccer_italy_serie_a", "kxligue1": "soccer_france_ligue_one",
-    "kxucl": "soccer_ucl",
-    "kxkbo": "kbo", "kxnpb": "npb", "kxelh": "elh",
-    "kxipl": "ipl", "kxpsl": "psl",
-    "kxpga": "pga", "kxlpga": "lpga", "kxtennis": "tennis",
+    "kxseriea": "soccer_italy_serie_a", "kxserieb": "soccer_italy_serie_b",
+    "kxligue1": "soccer_france_ligue_one",
+    "kxucl": "soccer_ucl", "kxuel": "soccer_uel",
+    "kxbrasileiro": "soccer_brazil", "kxligamx": "soccer_liga_mx",
+    "kxeredivisie": "soccer_eredivisie", "kxligaportugal": "soccer_portugal",
+    "kxsuperlig": "soccer_turkey", "kxscottishprem": "soccer_scotland",
+    "kxswissleague": "soccer_switzerland", "kxbelgianpl": "soccer_belgium",
+    "kxekstraklasa": "soccer_poland", "kxdensuperliga": "soccer_denmark",
+    "kxsaudipl": "soccer_saudi", "kxchnsl": "soccer_china",
+    "kxkleague": "soccer_korea", "kxjleague": "soccer_japan",
+    "kxaleague": "soccer_australia",
+    "kxwc": "soccer_wc", "kxconcacaf": "soccer_concacaf",
+    "kxhnl": "soccer_croatia",
+    # Tennis
+    "kxatp": "tennis_atp", "kxwta": "tennis_wta",
+    "kxitf": "tennis_itf", "kxmc": "tennis_atp",
+    # Asian baseball
+    "kxkbo": "kbo", "kxnpb": "npb",
+    # Cricket
+    "kxipl": "cricket_ipl", "kxt20": "cricket_t20",
+    # Other
+    "kxpsl": "psl", "kxelh": "elh",
+    "kxpga": "pga", "kxlpga": "lpga",
+    "kxafl": "afl", "kxrugbynrl": "rugby_nrl",
+    "kxboxing": "boxing", "kxufc": "ufc",
+    # Esports
+    "kxcs2": "esports_cs2", "kxlol": "esports_lol",
+    "kxvalorant": "esports_valorant", "kxdota2": "esports_dota2",
+    "kxow": "esports_overwatch", "kxr6": "esports_r6",
+    "kxrl": "esports_rl",
 }
 
 
@@ -251,15 +280,35 @@ def _extract_priced_team(
     return ""
 
 
-def _implied_prob(home_price: float | None, away_price: float | None) -> float | None:
+def _implied_prob(
+    home_price: float | None,
+    away_price: float | None,
+    draw_price: float | None = None,
+) -> float | None:
+    """Compute implied home win probability from decimal odds.
+
+    For 3-way markets (soccer with draw_price): vig-adjusted P(home) using
+    all three outcomes, giving the true P(home wins outright).
+    For 2-way markets: normalize home+away to sum to 1.0.
+    """
     if home_price is None or away_price is None or home_price <= 1.0 or away_price <= 1.0:
         return None
     raw_home = 1.0 / home_price
     raw_away = 1.0 / away_price
-    total = raw_home + raw_away
-    if total <= 0:
-        return None
-    return raw_home / total
+
+    if draw_price is not None and draw_price > 1.0:
+        # 3-way: total includes draw, so home prob is properly discounted
+        raw_draw = 1.0 / draw_price
+        total = raw_home + raw_away + raw_draw
+        if total <= 0:
+            return None
+        return raw_home / total
+    else:
+        # 2-way: just home vs away
+        total = raw_home + raw_away
+        if total <= 0:
+            return None
+        return raw_home / total
 
 
 class StoreBackedSportsSnapshotProvider:
@@ -479,9 +528,11 @@ class StoreBackedSportsSnapshotProvider:
 
         current_home = self._float_or_none(match.get("home_price"))
         current_away = self._float_or_none(match.get("away_price"))
+        current_draw = self._float_or_none(match.get("draw_price"))
         opening_home = self._float_or_none(opening.get("home_price"))
         opening_away = self._float_or_none(opening.get("away_price"))
-        pinnacle_prob = _implied_prob(current_home, current_away)
+        # Use 3-way draw price if available (soccer) for accurate probabilities
+        pinnacle_prob = _implied_prob(current_home, current_away, current_draw)
 
         # Consensus (non-Pinnacle) probability for sportsbook_home_win_prob
         event_id_str = str(match.get("event_id", ""))
@@ -489,7 +540,8 @@ class StoreBackedSportsSnapshotProvider:
         if consensus_row is not None:
             cons_home = self._float_or_none(consensus_row.get("home_price"))
             cons_away = self._float_or_none(consensus_row.get("away_price"))
-            consensus_prob = _implied_prob(cons_home, cons_away)
+            cons_draw = self._float_or_none(consensus_row.get("draw_price"))
+            consensus_prob = _implied_prob(cons_home, cons_away, cons_draw)
         else:
             consensus_prob = None
 
@@ -504,8 +556,10 @@ class StoreBackedSportsSnapshotProvider:
             "pinnacle_home_win_prob": pinnacle_prob,
             "pinnacle_moneyline_home": current_home,
             "pinnacle_moneyline_away": current_away,
+            "pinnacle_moneyline_draw": current_draw,
             "current_moneyline_home": current_home,
             "current_moneyline_away": current_away,
+            "current_moneyline_draw": current_draw,
             "opening_moneyline_home": opening_home,
             "opening_moneyline_away": opening_away,
             "spread": self._float_or_none(match.get("spread_home")),
@@ -517,6 +571,8 @@ class StoreBackedSportsSnapshotProvider:
             "home_injury_severity": home_injury.injury_severity if home_injury is not None else None,
             "away_injury_severity": away_injury.injury_severity if away_injury is not None else None,
             "line_captured_at": captured_at.isoformat(),
+            "line_age_hours": (datetime.now(timezone.utc) - captured_at).total_seconds() / 3600.0,
+            "match_score": match.get("match_score", 4),  # default to max if not tracked
             "line_source": "store:pinnacle",
         }, None
 

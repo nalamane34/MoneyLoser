@@ -61,6 +61,7 @@ from moneygone.features.weather_features import (
     ForecastRevisionDirection,
     ForecastRevisionMagnitude,
     ModelDisagreement,
+    StationBiasExceedance,
 )
 
 __all__ = [

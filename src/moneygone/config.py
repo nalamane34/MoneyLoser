@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -15,8 +16,17 @@ class ExchangeConfig(BaseModel):
     ws_url: str = "wss://demo-api.kalshi.co/trade-api/ws/v2"
     api_key_id: str = ""
     private_key_path: Path = Path("key.pem")
+    subaccount: int = 0
     demo_mode: bool = True
     rate_limit_rps: float = 10.0
+
+    @model_validator(mode="after")
+    def _load_api_key_id_from_env(self) -> "ExchangeConfig":
+        """Prefer KALSHI_API_KEY_ID env var over config file value."""
+        env_val = os.environ.get("KALSHI_API_KEY_ID")
+        if env_val:
+            self.api_key_id = env_val
+        return self
 
 
 class WeatherConfig(BaseModel):
@@ -55,9 +65,10 @@ class ModelConfig(BaseModel):
 
 class ExecutionConfig(BaseModel):
     min_edge_threshold: float = 0.02
+    min_conviction_score: float = 0.02
     max_edge_sanity: float = 0.30
     prefer_maker: bool = True
-    max_order_staleness_seconds: int = 60
+    max_order_staleness_seconds: int = 30
     evaluation_interval_seconds: float = 5.0
     max_model_market_disagreement: float = 0.08
 
@@ -132,7 +143,13 @@ def load_config(
             overlay_data = yaml.safe_load(f) or {}
         base_data = _deep_merge(base_data, overlay_data)
 
-    config = AppConfig(**base_data)
+    # Strip keys not in the Pydantic model (e.g. closer strategy config)
+    # to avoid 'extra inputs not permitted' errors.  These are read
+    # directly from the YAML by the worker scripts that need them.
+    _extra_keys = {"closer"}
+    filtered_data = {k: v for k, v in base_data.items() if k not in _extra_keys}
+
+    config = AppConfig(**filtered_data)
 
     # Safety: refuse to start if demo_mode is set but production URLs are used.
     # This catches misconfigurations where someone thinks they're in demo mode

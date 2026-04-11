@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Union
 
 import structlog
 
-from moneygone.data.economic.releases import EconomicRelease, EconomicSignal
+from moneygone.data.economic.releases import EconomicSignal
 from moneygone.data.sports.espn import ESPNLiveFeed, GameState, OutcomeSignal
 from moneygone.data.sports.live_weather import (
     LiveWeatherFeed,
@@ -32,7 +32,6 @@ from moneygone.exchange.types import (
     Fill,
     Market,
     MarketStatus,
-    OrderbookSnapshot,
     OrderRequest,
     Side,
     TimeInForce,
@@ -41,6 +40,7 @@ from moneygone.utils.time import now_utc
 
 if TYPE_CHECKING:
     from moneygone.exchange.rest_client import KalshiRestClient
+    from moneygone.execution.fill_tracker import FillTracker
     from moneygone.execution.order_manager import OrderManager
     from moneygone.signals.fees import KalshiFeeCalculator
 
@@ -98,6 +98,7 @@ class SnipeConfig:
     max_contracts_per_snipe: int = 50
     max_daily_snipes: int = 20
     cooldown_seconds: float = 5.0
+    max_exposure_per_event: float = 20.0  # max $ exposure per game/event
 
 
 @dataclass
@@ -221,11 +222,13 @@ class ResolutionSniper:
         fee_calculator: KalshiFeeCalculator,
         contract_mappings: list[ContractMapping] | None = None,
         config: SnipeConfig | None = None,
+        fill_tracker: FillTracker | None = None,
     ) -> None:
         self._client = rest_client
         self._order_manager = order_manager
         self._fees = fee_calculator
         self._config = config or SnipeConfig()
+        self._fill_tracker = fill_tracker
         self._mappings: dict[str, ContractMapping] = {
             m.ticker: m for m in (contract_mappings or [])
         }
@@ -242,6 +245,8 @@ class ResolutionSniper:
         self._daily_reset_date: str = ""
         self._last_snipe_time: dict[str, datetime] = {}
         self._opportunity_log: list[SnipeOpportunity] = []
+        # Per-event exposure tracking: event_ticker -> total $ spent
+        self._event_exposure: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -685,6 +690,13 @@ class ResolutionSniper:
                 exc_info=True,
             )
 
+        # Track per-event exposure.
+        event_ticker = self._event_ticker_from_ticker(opportunity.ticker)
+        cost = float(price) * contracts
+        self._event_exposure[event_ticker] = (
+            self._event_exposure.get(event_ticker, 0.0) + cost
+        )
+
         # Record the snipe.
         record = SnipeRecord(
             ticker=opportunity.ticker,
@@ -699,6 +711,20 @@ class ResolutionSniper:
         )
         self._snipe_history.append(record)
 
+        # Record in the shared fill tracker for audit trail
+        if fill is not None and self._fill_tracker is not None:
+            self._fill_tracker.on_closer_fill(
+                fill,
+                strategy="sniper",
+                signal_source=opportunity.signal_source,
+                confidence=opportunity.confidence,
+                expected_profit=float(opportunity.expected_profit),
+                entry_price=float(price),
+                contracts=contracts,
+                category=opportunity.signal_data.get("category", "unknown"),
+                signal_data=opportunity.signal_data,
+            )
+
         logger.info(
             "sniper.executed",
             ticker=opportunity.ticker,
@@ -707,6 +733,7 @@ class ResolutionSniper:
             price=str(price),
             order_id=order.order_id,
             fill_obtained=fill is not None,
+            event_exposure=round(self._event_exposure.get(event_ticker, 0.0), 2),
         )
 
         return fill
@@ -730,13 +757,89 @@ class ResolutionSniper:
         matched = self._find_matching_mappings(signal)
         return matched[0] if matched else None
 
+    @staticmethod
+    def _extract_ticker_date(ticker: str) -> str | None:
+        """Extract the date portion from a Kalshi ticker.
+
+        Examples:
+            KXNHLTOTAL-26APR13DETTB-5  -> "26APR13"
+            KXMLBGAME-26APR111310MIADET-MIA -> "26APR11"
+            KXNHLGAME-26APR12PITWSH-PIT -> "26APR12"
+
+        Returns the YYMONDD portion or None if not parseable.
+        """
+        # Look for YYMONDD pattern (e.g. 26APR13, 26APR11)
+        match = re.search(r"(\d{2}[A-Z]{3}\d{2})", ticker.upper())
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _signal_date_str(signal: "OutcomeSignal") -> str | None:
+        """Get the YYMONDD string for when a signal's game occurred."""
+        # detected_at is when the outcome was observed (≈ game end time)
+        dt = signal.detected_at
+        if dt is None:
+            return None
+        months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+        return f"{dt.year % 100}{months[dt.month - 1]}{dt.day:02d}"
+
     def _find_matching_mappings(self, signal: AnySignal) -> list[ContractMapping]:
-        """Find all contract mappings that match a signal."""
+        """Find all contract mappings that match a signal.
+
+        SAFETY: For sports signals, requires BOTH:
+          1. Same sport (basketball->basketball, hockey->hockey, etc.)
+          2. Ticker date matches the signal date (game day)
+        This prevents cross-sport and cross-date false matches.
+        """
         results: list[ContractMapping] = []
 
         for mapping in self._mappings.values():
             if isinstance(signal, OutcomeSignal) and mapping.category == "sports":
-                # Match by team names.
+                # ---- SPORT VALIDATION ----
+                # The mapping's sport must match the signal's sport.
+                # e.g. an NBA outcome must NOT match an NHL contract.
+                mapping_sport = mapping.source_params.get("sport", "").lower()
+                signal_sport = (signal.sport or "").lower()
+
+                if not mapping_sport or not signal_sport:
+                    continue  # Can't validate sport — skip for safety
+
+                # Normalize sport names for comparison
+                sport_aliases = {
+                    "basketball": "basketball", "nba": "basketball",
+                    "football": "football", "nfl": "football",
+                    "baseball": "baseball", "mlb": "baseball",
+                    "hockey": "hockey", "nhl": "hockey",
+                    "soccer": "soccer", "mls": "soccer",
+                    "mma": "mma", "ufc": "mma",
+                    "tennis": "tennis",
+                    "golf": "golf",
+                }
+                norm_mapping = sport_aliases.get(mapping_sport, mapping_sport)
+                norm_signal = sport_aliases.get(signal_sport, signal_sport)
+
+                if norm_mapping != norm_signal:
+                    continue  # Different sport — skip
+
+                # ---- DATE VALIDATION ----
+                # The ticker's date must match the game date.
+                # e.g. a game finishing today (APR11) must NOT match
+                # a contract for APR13.
+                ticker_date = self._extract_ticker_date(mapping.ticker)
+                signal_date = self._signal_date_str(signal)
+
+                if ticker_date and signal_date and ticker_date != signal_date:
+                    logger.debug(
+                        "sniper.date_mismatch",
+                        ticker=mapping.ticker,
+                        ticker_date=ticker_date,
+                        signal_date=signal_date,
+                    )
+                    continue  # Wrong date — skip
+
+                # ---- TEAM / GAME-ID MATCHING ----
                 teams_in_signal = {
                     signal.home_team.lower(),
                     signal.away_team.lower(),
@@ -744,16 +847,15 @@ class ResolutionSniper:
                 team_param = mapping.source_params.get("team", "").lower()
                 game_id_param = mapping.source_params.get("game_id", "")
 
-                # Match if the mapping's team is in the signal, or game_id matches.
-                if team_param and team_param in " ".join(teams_in_signal):
+                if game_id_param and game_id_param == signal.game_id:
                     results.append(mapping)
-                elif game_id_param and game_id_param == signal.game_id:
+                elif team_param and team_param in " ".join(teams_in_signal):
                     results.append(mapping)
                 elif not team_param and not game_id_param:
                     # Generic sports mapping for this league.
-                    sport_param = mapping.source_params.get("sport", "")
                     league_param = mapping.source_params.get("league", "")
-                    if sport_param == signal.sport and league_param == signal.league:
+                    signal_league = (signal.league or "").lower()
+                    if league_param and league_param == signal_league:
                         results.append(mapping)
 
             elif isinstance(signal, ThresholdSignal) and mapping.category == "weather":
@@ -928,6 +1030,16 @@ class ResolutionSniper:
             detected_at=now_utc(),
         )
 
+    @staticmethod
+    def _event_ticker_from_ticker(ticker: str) -> str:
+        """Extract the event ticker (game identifier) from a contract ticker.
+
+        KXNHLTOTAL-26APR13DETTB-5  -> KXNHLTOTAL-26APR13DETTB
+        KXMLBGAME-26APR111310MIADET-MIA -> KXMLBGAME-26APR111310MIADET
+        """
+        parts = ticker.rsplit("-", 1)
+        return parts[0] if len(parts) > 1 else ticker
+
     def _should_execute(self, opp: SnipeOpportunity) -> bool:
         """Determine whether an opportunity should be executed."""
         if not opp.outcome_known:
@@ -959,6 +1071,21 @@ class ResolutionSniper:
                 ticker=opp.ticker,
                 profit=profit_f,
                 min=self._config.min_profit_after_fees,
+            )
+            return False
+
+        # Per-event exposure cap: don't stack too much $ on one game
+        event_ticker = self._event_ticker_from_ticker(opp.ticker)
+        current_exposure = self._event_exposure.get(event_ticker, 0.0)
+        new_cost = price_f * self._config.max_contracts_per_snipe
+        if current_exposure + new_cost > self._config.max_exposure_per_event:
+            logger.warning(
+                "sniper.event_exposure_limit",
+                ticker=opp.ticker,
+                event_ticker=event_ticker,
+                current_exposure=round(current_exposure, 2),
+                new_cost=round(new_cost, 2),
+                max_per_event=self._config.max_exposure_per_event,
             )
             return False
 

@@ -43,7 +43,10 @@ from moneygone.data.weather.nws import NWSFetcher
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.execution.category_providers import WeatherDataProvider
-from moneygone.execution.artifact_runtime import build_universal_artifact_fallbacks
+from moneygone.execution.artifact_runtime import (
+    build_universal_artifact_fallbacks,
+    fallback_categories_for_config,
+)
 from moneygone.execution.engine import CategoryProvider, ExecutionEngine
 from moneygone.execution.fill_tracker import FillTracker
 from moneygone.execution.order_manager import OrderManager
@@ -58,6 +61,7 @@ from moneygone.features import (
     ForecastHorizon,
     ForecastRevisionDirection,
     ForecastRevisionMagnitude,
+    StationBiasExceedance,
     HomeFieldAdvantage,
     KalshiVsSportsbookEdge,
     MidPrice,
@@ -72,6 +76,9 @@ from moneygone.features import (
     TeamInjuryImpact,
     TimeToExpiry,
     WeightedMidPrice,
+    LineAgeHours,
+    IsConsensusFallback,
+    MatchQuality,
 )
 from moneygone.features.pipeline import FeaturePipeline
 from moneygone.monitoring.alerts import AlertManager
@@ -523,7 +530,9 @@ def build_app(config: AppConfig) -> Application:
         )
 
     if sports_only_mode:
-        model = SharpSportsbookModel()
+        model = SharpSportsbookModel(
+            residual_model_dir=Path("models"),
+        )
         pipeline = FeaturePipeline(
             [
                 SportsbookWinProbability(),
@@ -535,6 +544,10 @@ def build_app(config: AppConfig) -> Application:
                 HomeFieldAdvantage(),
                 TeamInjuryImpact(),
                 SpreadImpliedWinProb(),
+                # Data quality features (#9)
+                LineAgeHours(),
+                IsConsensusFallback(),
+                MatchQuality(),
             ],
             store=store,
         )
@@ -586,6 +599,7 @@ def build_app(config: AppConfig) -> Application:
                     EnsembleMean(),
                     EnsembleSpread(),
                     EnsembleExceedanceProb(),
+                    StationBiasExceedance(),
                     ForecastRevisionMagnitude(),
                     ForecastRevisionDirection(),
                     ModelDisagreement(),
@@ -607,16 +621,10 @@ def build_app(config: AppConfig) -> Application:
                 locations=[loc["name"] for loc in weather_locations],
             )
 
-        fallback_categories = [
-            MarketCategory.ECONOMICS,
-            MarketCategory.POLITICS,
-            MarketCategory.FINANCIALS,
-            MarketCategory.COMPANIES,
-            MarketCategory.CRYPTO,
-            MarketCategory.WEATHER,
-            MarketCategory.ENTERTAINMENT,
-            MarketCategory.UNKNOWN,
-        ]
+        fallback_categories = fallback_categories_for_config(
+            weather_enabled=config.weather.enabled,
+            crypto_enabled=config.crypto.enabled,
+        )
         missing_categories = [
             category
             for category in fallback_categories

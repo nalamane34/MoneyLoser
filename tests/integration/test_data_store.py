@@ -56,6 +56,7 @@ class TestMarketStates:
             "volume": 5000,
             "open_interest": 2000,
             "close_time": datetime(2026, 6, 1, 20, 0),
+            "snapshot_time": datetime(2026, 4, 9, 10, 0),
             "result": None,
             "category": "weather",
         }
@@ -70,6 +71,7 @@ class TestMarketStates:
         assert result["ticker"] == "TEST-TICKER"
         assert result["yes_bid"] == pytest.approx(0.60)
         assert result["yes_ask"] == pytest.approx(0.62)
+        assert result["snapshot_time"] == row["snapshot_time"]
 
     def test_point_in_time_query(self, data_store: DataStore) -> None:
         """Insert at t1 and t2, query at t1.5 should return t1 data."""
@@ -82,28 +84,28 @@ class TestMarketStates:
             """
             INSERT INTO market_states
                 (ticker, event_ticker, title, status, yes_bid, yes_ask,
-                 last_price, volume, open_interest, close_time, result,
-                 category, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_price, volume, open_interest, close_time, snapshot_time,
+                 result, category, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 "PIT-TICKER", "EVT", "Test", "open",
                 0.50, 0.52, 0.51, 1000, 500,
-                datetime(2026, 6, 1), None, "weather", t1,
+                datetime(2026, 6, 1), t1, None, "weather", t1,
             ],
         )
         data_store._conn.execute(
             """
             INSERT INTO market_states
                 (ticker, event_ticker, title, status, yes_bid, yes_ask,
-                 last_price, volume, open_interest, close_time, result,
-                 category, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_price, volume, open_interest, close_time, snapshot_time,
+                 result, category, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 "PIT-TICKER", "EVT", "Test", "open",
                 0.60, 0.62, 0.61, 2000, 800,
-                datetime(2026, 6, 1), None, "weather", t2,
+                datetime(2026, 6, 1), t2, None, "weather", t2,
             ],
         )
 

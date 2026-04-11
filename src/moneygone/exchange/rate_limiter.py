@@ -76,3 +76,40 @@ class AsyncRateLimiter:
         """Current (approximate) number of tokens available."""
         self._refill()
         return self._tokens
+
+
+class DualRateLimiter:
+    """Pair of rate limiters separating order traffic from data reads.
+
+    This prevents high-frequency data polling (orderbook snapshots, market
+    discovery) from starving latency-sensitive order submission.
+
+    Parameters:
+        order_rps: Sustained rate for order endpoints (POST/DELETE /orders).
+        data_rps: Sustained rate for data/read endpoints (GET requests, etc.).
+        order_burst: Burst size for orders.  Defaults to ``order_rps``.
+        data_burst: Burst size for data.  Defaults to ``data_rps``.
+    """
+
+    def __init__(
+        self,
+        order_rps: float = 10.0,
+        data_rps: float = 30.0,
+        order_burst: float | None = None,
+        data_burst: float | None = None,
+    ) -> None:
+        self.orders = AsyncRateLimiter(order_rps, burst=order_burst)
+        self.data = AsyncRateLimiter(data_rps, burst=data_burst)
+        log.debug(
+            "dual_rate_limiter.initialized",
+            order_rps=order_rps,
+            data_rps=data_rps,
+        )
+
+    async def acquire_order(self) -> None:
+        """Acquire a token from the *order* bucket."""
+        await self.orders.acquire()
+
+    async def acquire_data(self) -> None:
+        """Acquire a token from the *data* bucket."""
+        await self.data.acquire()

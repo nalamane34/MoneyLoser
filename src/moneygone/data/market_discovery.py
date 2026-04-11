@@ -80,7 +80,7 @@ _SPORTS_PATTERNS = re.compile(
     r"tennis|boxing|mma|ufc|golf|pga|lpga|esports|bundesliga|serie a|la liga|"
     r"ligue 1|premier league|kbo|npb|total runs|spread|team total|"
     r"formula.?1|nascar|cricket|ipl|heavyweight|grand prix|fastest lap)\b|"
-    r"\b(?:vs\.?|at)\b|"
+    r"\bvs\.?\b|"
     r"\bkx(?:nba|mlb|nhl|nfl|ncaa|epl|mls|laliga|bundesliga|seriea|ligue1|ucl|"
     r"kbo|npb|elh|pga|lpga|tennis|esports|"
     r"f1|nascar|brasileiro|ligamx|wcsquad|wbc|ipl|nextteam|heisman|"
@@ -196,8 +196,6 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.CRYPTO
     if _WEATHER_PATTERNS.search(text):
         return MarketCategory.WEATHER
-    if _SPORTS_PATTERNS.search(text):
-        return MarketCategory.SPORTS
     if _POLITICS_PATTERNS.search(text):
         return MarketCategory.POLITICS
     if _ECONOMICS_PATTERNS.search(text):
@@ -208,6 +206,8 @@ def classify_market(market: Market) -> MarketCategory:
         return MarketCategory.FINANCIALS
     if _ENTERTAINMENT_PATTERNS.search(text):
         return MarketCategory.ENTERTAINMENT
+    if _SPORTS_PATTERNS.search(text):
+        return MarketCategory.SPORTS
     return MarketCategory.UNKNOWN
 
 

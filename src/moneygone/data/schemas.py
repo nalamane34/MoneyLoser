@@ -22,10 +22,15 @@ CREATE TABLE IF NOT EXISTS market_states (
     volume        BIGINT,
     open_interest BIGINT,
     close_time    TIMESTAMP NOT NULL,
+    snapshot_time TIMESTAMP,
     result        VARCHAR,
     category      VARCHAR,
     ingested_at   TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
+"""
+
+ALTER_MARKET_STATES_ADD_SNAPSHOT_TIME = """
+ALTER TABLE market_states ADD COLUMN IF NOT EXISTS snapshot_time TIMESTAMP;
 """
 
 CREATE_ORDERBOOK_SNAPSHOTS = """
@@ -108,10 +113,66 @@ CREATE TABLE IF NOT EXISTS sportsbook_game_lines (
     commence_time  TIMESTAMP,
     home_price     DOUBLE NOT NULL,
     away_price     DOUBLE NOT NULL,
+    draw_price     DOUBLE,
     spread_home    DOUBLE,
     total          DOUBLE,
     captured_at    TIMESTAMP NOT NULL,
     ingested_at    TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Sports mapping + training tables
+# ---------------------------------------------------------------------------
+
+CREATE_MARKET_EVENT_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS market_event_mappings (
+    kalshi_ticker       VARCHAR NOT NULL,
+    kalshi_event_ticker VARCHAR,
+    event_id            VARCHAR NOT NULL,
+    sport               VARCHAR NOT NULL,
+    home_team           VARCHAR NOT NULL,
+    away_team           VARCHAR NOT NULL,
+    priced_team         VARCHAR NOT NULL,
+    is_home_team        BOOLEAN NOT NULL,
+    match_score         INTEGER NOT NULL,
+    commence_time       TIMESTAMP,
+    created_at          TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    verified_at         TIMESTAMP
+);
+"""
+
+CREATE_SPORTS_OUTCOMES = """
+CREATE TABLE IF NOT EXISTS sports_outcomes (
+    kalshi_ticker         VARCHAR NOT NULL,
+    event_id              VARCHAR,
+    sport                 VARCHAR NOT NULL,
+    home_team             VARCHAR NOT NULL,
+    away_team             VARCHAR NOT NULL,
+    priced_team           VARCHAR NOT NULL,
+    is_home_team          BOOLEAN NOT NULL,
+    market_result         VARCHAR NOT NULL,
+    kalshi_last_price     DOUBLE,
+    kalshi_volume         BIGINT,
+    close_time            TIMESTAMP,
+    commence_time         TIMESTAMP,
+    pinnacle_home_price   DOUBLE,
+    pinnacle_away_price   DOUBLE,
+    pinnacle_draw_price   DOUBLE,
+    pinnacle_home_prob    DOUBLE,
+    consensus_home_price  DOUBLE,
+    consensus_away_price  DOUBLE,
+    consensus_draw_price  DOUBLE,
+    consensus_home_prob   DOUBLE,
+    opening_home_price    DOUBLE,
+    opening_away_price    DOUBLE,
+    spread_home           DOUBLE,
+    total                 DOUBLE,
+    home_rating           DOUBLE,
+    away_rating           DOUBLE,
+    line_age_hours        DOUBLE,
+    is_consensus_fallback BOOLEAN,
+    created_at            TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 """
 
@@ -188,12 +249,15 @@ COLLECTOR_TABLES: list[str] = [
 
 MARKET_DATA_TABLES: list[str] = [
     CREATE_MARKET_STATES,
+    ALTER_MARKET_STATES_ADD_SNAPSHOT_TIME,
     CREATE_ORDERBOOK_SNAPSHOTS,
     CREATE_TRADES,
 ]
 
 EXECUTION_TABLES: list[str] = [
     CREATE_SPORTSBOOK_GAME_LINES,
+    CREATE_MARKET_EVENT_MAPPINGS,
+    CREATE_SPORTS_OUTCOMES,
     CREATE_FEATURES,
     CREATE_PREDICTIONS,
     CREATE_FILLS_LOG,
@@ -202,12 +266,15 @@ EXECUTION_TABLES: list[str] = [
 
 ALL_TABLES: list[str] = [
     CREATE_MARKET_STATES,
+    ALTER_MARKET_STATES_ADD_SNAPSHOT_TIME,
     CREATE_ORDERBOOK_SNAPSHOTS,
     CREATE_TRADES,
     CREATE_FORECAST_ENSEMBLES,
     CREATE_FUNDING_RATES,
     CREATE_OPEN_INTEREST,
     CREATE_SPORTSBOOK_GAME_LINES,
+    CREATE_MARKET_EVENT_MAPPINGS,
+    CREATE_SPORTS_OUTCOMES,
     CREATE_FEATURES,
     CREATE_PREDICTIONS,
     CREATE_FILLS_LOG,

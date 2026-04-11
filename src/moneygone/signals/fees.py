@@ -20,7 +20,7 @@ due to the quadratic formula.
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_UP, Decimal
 
 import structlog
 
@@ -91,7 +91,7 @@ class KalshiFeeCalculator:
         # Cap at $0.02 per contract
         fee = min(raw, _FEE_CAP_PER_CONTRACT)
         # Round to nearest cent (Kalshi works in cents)
-        return fee.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        return fee.quantize(Decimal("0.01"), rounding=ROUND_UP)
 
     def breakeven_edge(self, price: Decimal, *, is_maker: bool = False) -> Decimal:
         """Minimum edge (in probability units) needed to break even after fees.

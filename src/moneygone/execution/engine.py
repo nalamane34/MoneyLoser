@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ import structlog
 from moneygone.config import ExecutionConfig
 from moneygone.data.market_data import MarketDataRecorder
 from moneygone.data.market_discovery import MarketCategory, classify_market, MarketDiscoveryService
+from moneygone.exchange.errors import OrderError
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.types import (
     Action,
@@ -84,6 +85,7 @@ class TradeDecision:
     timestamp: datetime
     cycle_id: str | None = None
     category: str = ""
+    rank_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +169,17 @@ class ExecutionEngine:
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
+        self._stale_order_task: asyncio.Task[None] | None = None
         self._market_cache: dict[str, Market] = {}
         self._market_categories: dict[str, MarketCategory] = {}
         self._last_eval: dict[str, datetime] = {}
+        self._stale_rechecks_inflight: set[str] = set()
         self._decision_context: dict[str, TradeDecision] = {}
         self._decision_context_by_client_order_id: dict[str, TradeDecision] = {}
         self._last_universe_refresh: datetime | None = None
         self._last_order_reconcile: datetime | None = None
         self._active_cycle_id: str | None = None
+        self._last_prune: datetime = datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -197,15 +202,29 @@ class ExecutionEngine:
         # Sync portfolio with exchange to get current balance + positions
         try:
             await self._risk._portfolio.sync_with_exchange(self._rest)
+            cash = self._risk._portfolio.cash
             logger.info(
                 "engine.portfolio_synced",
-                cash=str(self._risk._portfolio.cash),
+                cash=str(cash),
                 positions=len(self._risk._portfolio.positions),
             )
+            if cash <= 0:
+                logger.critical(
+                    "engine.ZERO_BANKROLL",
+                    cash=str(cash),
+                    msg="Portfolio synced but bankroll is $0 — Kelly sizing will produce zero contracts. "
+                        "Check account balance or deposit funds.",
+                )
         except Exception:
-            logger.warning("engine.portfolio_sync_failed", exc_info=True)
+            logger.critical(
+                "engine.PORTFOLIO_SYNC_FAILED",
+                msg="Could not sync portfolio with exchange. Trading will use bankroll=$0, "
+                    "effectively disabling all position sizing. This is a critical failure.",
+                exc_info=True,
+            )
 
         await self._maybe_reconcile_open_orders(force=True)
+        await self._cancel_stale_open_orders()
 
         self._ws.set_on_event(self.on_event)
         await self._refresh_market_universe(force=True)
@@ -218,7 +237,8 @@ class ExecutionEngine:
         await self._ws.subscribe_fills()
         await self._ws.subscribe_positions()
 
-        # Launch periodic evaluation
+        # Launch periodic maintenance/evaluation loops
+        self._stale_order_task = asyncio.create_task(self._stale_order_loop())
         self._eval_task = asyncio.create_task(self._periodic_evaluation_loop())
 
         logger.info("engine.started")
@@ -239,6 +259,15 @@ class ExecutionEngine:
             except asyncio.CancelledError:
                 pass
             self._eval_task = None
+
+        stale_order_task = getattr(self, "_stale_order_task", None)
+        if stale_order_task is not None:
+            stale_order_task.cancel()
+            try:
+                await stale_order_task
+            except asyncio.CancelledError:
+                pass
+            self._stale_order_task = None
 
         # Cancel all open orders
         try:
@@ -486,11 +515,17 @@ class ExecutionEngine:
         spread_penalty = max(0.1, 1.0 - max(spread or 0.0, 0.0))
         return fee_adjusted_edge * confidence * fill_rate * spread_penalty
 
-    def _candidate_context_fields(self, ticker: str) -> dict[str, Any]:
+    def _candidate_context_fields(
+        self,
+        ticker: str,
+        *,
+        cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        active_cycle_id = cycle_id if cycle_id is not None else self._active_cycle_id
         market = self._market_cache.get(ticker)
         if market is None:
             return {
-                "cycle_id": self._active_cycle_id,
+                "cycle_id": active_cycle_id,
                 "cluster_id": f"ticker:{ticker}",
                 "open_order_count": len(self._orders.get_open_orders()),
             }
@@ -509,7 +544,7 @@ class ExecutionEngine:
             )
         )
         return {
-            "cycle_id": self._active_cycle_id,
+            "cycle_id": active_cycle_id,
             "event_ticker": market.event_ticker or None,
             "series_ticker": market.series_ticker or None,
             "cluster_id": cluster_id,
@@ -517,7 +552,12 @@ class ExecutionEngine:
             "open_order_count": len(self._orders.get_open_orders()),
         }
 
-    async def evaluate_market(self, ticker: str) -> TradeDecision | None:
+    async def evaluate_market(
+        self,
+        ticker: str,
+        *,
+        cycle_id: str | None = None,
+    ) -> TradeDecision | None:
         """Run the full decision pipeline for a single market.
 
         Steps:
@@ -536,7 +576,7 @@ class ExecutionEngine:
         now = datetime.now(timezone.utc)
         category = self._market_categories.get(ticker, MarketCategory.UNKNOWN)
         cat_str = category.value
-        candidate_ctx = self._candidate_context_fields(ticker)
+        candidate_ctx = self._candidate_context_fields(ticker, cycle_id=cycle_id)
 
         if any(order.ticker == ticker for order in self._orders.get_open_orders()):
             self._log_candidate(
@@ -613,6 +653,8 @@ class ExecutionEngine:
                 weather_ensemble=context_data.get("ensemble") if category == MarketCategory.WEATHER else None,
                 weather_threshold=context_data.get("threshold") if category == MarketCategory.WEATHER else None,
                 weather_direction=context_data.get("direction") if category == MarketCategory.WEATHER else None,
+                weather_location=context_data.get("location_name") if category == MarketCategory.WEATHER else None,
+                weather_variable=context_data.get("weather_variable") if category == MarketCategory.WEATHER else None,
                 store=self._store,
             )
             features = provider.pipeline.compute(context)
@@ -682,17 +724,17 @@ class ExecutionEngine:
             orderbook,
             is_maker=self._config.prefer_maker,
         )
+        trade_model_prob = (
+            prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
+        )
+        rank_score = self._candidate_rank_score(
+            fee_adjusted_edge=edge.fee_adjusted_edge,
+            confidence=prediction.confidence,
+            fill_rate=edge.estimated_fill_rate,
+            spread=ob_spread,
+        )
 
         if not edge.is_actionable:
-            trade_model_prob = (
-                prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
-            )
-            rank_score = self._candidate_rank_score(
-                fee_adjusted_edge=edge.fee_adjusted_edge,
-                confidence=prediction.confidence,
-                fill_rate=edge.estimated_fill_rate,
-                spread=ob_spread,
-            )
             self._log_candidate(
                 ticker=ticker, category=cat_str,
                 status="rejected",
@@ -715,6 +757,26 @@ class ExecutionEngine:
             )
             return None
 
+        if rank_score < getattr(self._config, "min_conviction_score", 0.0):
+            self._log_candidate(
+                ticker=ticker, category=cat_str,
+                status="rejected",
+                reject_reason="conviction_below_threshold",
+                model_prob=trade_model_prob,
+                market_prob=edge.implied_probability,
+                raw_edge=edge.raw_edge,
+                fee_adjusted_edge=edge.fee_adjusted_edge,
+                confidence=prediction.confidence,
+                side=edge.side,
+                spread=ob_spread,
+                liquidity=edge.available_liquidity,
+                fill_rate=edge.estimated_fill_rate,
+                features=features,
+                rank_score=rank_score,
+                **candidate_ctx,
+            )
+            return None
+
         duplicate = await self._find_duplicate_exposure(
             ticker,
             edge.side,
@@ -722,15 +784,6 @@ class ExecutionEngine:
             sports_snapshot=sports_snapshot,
         )
         if duplicate is not None:
-            trade_model_prob = (
-                prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
-            )
-            rank_score = self._candidate_rank_score(
-                fee_adjusted_edge=edge.fee_adjusted_edge,
-                confidence=prediction.confidence,
-                fill_rate=edge.estimated_fill_rate,
-                spread=ob_spread,
-            )
             self._log_candidate(
                 ticker=ticker, category=cat_str,
                 status="rejected", reject_reason=f"duplicate_exposure:{duplicate['kind']}",
@@ -760,15 +813,6 @@ class ExecutionEngine:
         )
 
         if size.contracts <= 0:
-            trade_model_prob = (
-                prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
-            )
-            rank_score = self._candidate_rank_score(
-                fee_adjusted_edge=edge.fee_adjusted_edge,
-                confidence=prediction.confidence,
-                fill_rate=edge.estimated_fill_rate,
-                spread=ob_spread,
-            )
             self._log_candidate(
                 ticker=ticker, category=cat_str,
                 status="rejected", reject_reason=f"zero_size:{size.capped_by or 'kelly'}",
@@ -807,15 +851,6 @@ class ExecutionEngine:
             actual_contracts = risk_check.adjusted_size
 
         if not risk_check.approved:
-            trade_model_prob = (
-                prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
-            )
-            rank_score = self._candidate_rank_score(
-                fee_adjusted_edge=edge.fee_adjusted_edge,
-                confidence=prediction.confidence,
-                fill_rate=edge.estimated_fill_rate,
-                spread=ob_spread,
-            )
             self._log_candidate(
                 ticker=ticker, category=cat_str,
                 status="rejected",
@@ -858,20 +893,12 @@ class ExecutionEngine:
             risk_check=risk_check,
             prediction=prediction,
             timestamp=now,
-            cycle_id=self._active_cycle_id,
+            cycle_id=cycle_id if cycle_id is not None else self._active_cycle_id,
             category=cat_str,
+            rank_score=rank_score,
         )
 
         # Log as selected candidate with full metadata
-        trade_model_prob = (
-            prediction.probability if edge.side == "yes" else 1.0 - prediction.probability
-        )
-        rank_score = self._candidate_rank_score(
-            fee_adjusted_edge=edge.fee_adjusted_edge,
-            confidence=prediction.confidence,
-            fill_rate=edge.estimated_fill_rate,
-            spread=ob_spread,
-        )
         self._log_candidate(
             ticker=ticker, category=cat_str,
             status="selected",
@@ -938,12 +965,24 @@ class ExecutionEngine:
         # Record submission for fill-rate tracking
         self._fills.record_submission()
 
-        order = await self._strategy.execute(
-            decision.edge_result,
-            decision.size_result,
-            self._orders,
-            orderbook,
-        )
+        try:
+            order = await self._strategy.execute(
+                decision.edge_result,
+                decision.size_result,
+                self._orders,
+                orderbook,
+            )
+        except OrderError as exc:
+            logger.error(
+                "engine.order_execution_failed",
+                ticker=decision.ticker,
+                cycle_id=decision.cycle_id,
+                category=decision.category,
+                status_code=exc.status_code,
+                subaccount=getattr(self._rest, "_subaccount", 0),
+                error=str(exc),
+            )
+            return
 
         if order is not None:
             self._decision_context[order.order_id] = decision
@@ -972,32 +1011,58 @@ class ExecutionEngine:
                 await asyncio.sleep(interval)
                 await self._refresh_market_universe()
                 await self._maybe_reconcile_open_orders()
+                await self._cancel_stale_open_orders()
 
-                cycle_evaluated = 0
+                # Prune settled/closed tickers every 10 minutes
+                if (datetime.now(timezone.utc) - self._last_prune).total_seconds() >= 600:
+                    self._prune_settled_tickers()
+
                 cycle_selected = 0
                 cycle_start = datetime.now(timezone.utc)
                 self._active_cycle_id = cycle_start.isoformat()
 
+                # Build list of tickers eligible for evaluation this cycle
+                eligible_tickers: list[str] = []
+                now = datetime.now(timezone.utc)
                 for ticker in self._watched:
                     if not self._running:
                         break
-
-                    now = datetime.now(timezone.utc)
+                    if ticker in self._stale_rechecks_inflight:
+                        continue
                     last = self._last_eval.get(ticker)
-
-                    # Skip if recently evaluated
-                    if last is not None:
-                        elapsed = (now - last).total_seconds()
-                        if elapsed < interval:
-                            continue
-
+                    if last is not None and (now - last).total_seconds() < interval:
+                        continue
                     self._last_eval[ticker] = now
-                    cycle_evaluated += 1
+                    eligible_tickers.append(ticker)
 
-                    decision = await self.evaluate_market(ticker)
-                    if decision is not None:
+                cycle_evaluated = len(eligible_tickers)
+
+                # Evaluate markets concurrently with bounded parallelism
+                sem = asyncio.Semaphore(8)
+
+                async def _eval_one(t: str) -> object | None:
+                    async with sem:
+                        if not self._running:
+                            return None
+                        try:
+                            return await self.evaluate_market(t)
+                        except Exception:
+                            logger.exception("engine.parallel_eval_error", ticker=t)
+                            return None
+
+                results = await asyncio.gather(
+                    *[_eval_one(t) for t in eligible_tickers],
+                    return_exceptions=True,
+                )
+
+                # Execute decisions sequentially to preserve risk accounting
+                for result in results:
+                    if isinstance(result, BaseException):
+                        logger.error("engine.gather_exception", error=str(result))
+                        continue
+                    if result is not None:
                         cycle_selected += 1
-                        await self.execute_decision(decision)
+                        await self.execute_decision(result)
 
                 # Per-cycle summary for stress test analysis
                 if cycle_evaluated > 0:
@@ -1020,6 +1085,42 @@ class ExecutionEngine:
                 logger.exception("engine.periodic_eval_error")
                 await asyncio.sleep(1.0)
 
+    async def _stale_order_loop(self) -> None:
+        """Cancel stale maker orders on wall-clock cadence, independent of eval speed."""
+        while self._running:
+            try:
+                await asyncio.sleep(1.0)
+                await self._cancel_stale_open_orders()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("engine.stale_order_loop_error")
+                await asyncio.sleep(1.0)
+
+    async def _recheck_ticker_after_stale_cancel(self, ticker: str) -> None:
+        """Re-evaluate a ticker immediately after its stale order is cancelled."""
+        if not getattr(self, "_running", False):
+            return
+        inflight = getattr(self, "_stale_rechecks_inflight", None)
+        if inflight is None:
+            return
+        if ticker in inflight:
+            return
+        watched = getattr(self, "_watched", [])
+        market_cache = getattr(self, "_market_cache", {})
+        if ticker not in watched or ticker not in market_cache:
+            return
+
+        recheck_cycle_id = f"stale-recheck:{datetime.now(timezone.utc).isoformat()}"
+        inflight.add(ticker)
+        self._last_eval[ticker] = datetime.now(timezone.utc)
+        try:
+            decision = await self.evaluate_market(ticker, cycle_id=recheck_cycle_id)
+            if decision is not None:
+                await self.execute_decision(decision)
+        finally:
+            inflight.discard(ticker)
+
     # ------------------------------------------------------------------
     # Ticker management
     # ------------------------------------------------------------------
@@ -1035,6 +1136,44 @@ class ExecutionEngine:
         if ticker in self._watched:
             self._watched.remove(ticker)
             logger.info("engine.ticker_removed", ticker=ticker)
+
+    def _prune_settled_tickers(self) -> int:
+        """Remove settled/closed tickers from the watch list.
+
+        Prevents unbounded growth of ``_watched`` over multi-day runs by
+        dropping tickers whose market has closed (close_time in the past)
+        or whose status is settled/closed.
+
+        Returns the number of tickers pruned.
+        """
+        now = datetime.now(timezone.utc)
+        to_remove: list[str] = []
+
+        for ticker in self._watched:
+            market = self._market_cache.get(ticker)
+            if market is None:
+                continue
+            if market.status in (MarketStatus.SETTLED, MarketStatus.CLOSED):
+                to_remove.append(ticker)
+            elif market.close_time < now:
+                to_remove.append(ticker)
+
+        for ticker in to_remove:
+            self._watched.remove(ticker)
+            self._market_cache.pop(ticker, None)
+            self._market_categories.pop(ticker, None)
+            self._last_eval.pop(ticker, None)
+            self._decision_context.pop(ticker, None)
+
+        if to_remove:
+            logger.info(
+                "engine.pruned_settled_tickers",
+                pruned=len(to_remove),
+                watched_remaining=len(self._watched),
+            )
+
+        self._last_prune = now
+        return len(to_remove)
 
     async def _refresh_market_universe(self, *, force: bool = False) -> None:
         """Refresh watched markets across all enabled categories.
@@ -1143,6 +1282,60 @@ class ExecutionEngine:
             cache_used=cache_used,
         )
 
+    async def _cancel_stale_open_orders(self) -> int:
+        """Cancel lingering resting orders so they don't block fresh decisions."""
+        max_age_seconds = int(getattr(self._config, "max_order_staleness_seconds", 0) or 0)
+        if max_age_seconds <= 0:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=max_age_seconds)
+        stale_orders = []
+        for order in self._orders.get_open_orders():
+            created_time = order.created_time
+            if created_time.tzinfo is None:
+                created_time = created_time.replace(tzinfo=timezone.utc)
+            else:
+                created_time = created_time.astimezone(timezone.utc)
+            if created_time <= cutoff:
+                stale_orders.append((order, int((now - created_time).total_seconds())))
+
+        if not stale_orders:
+            return 0
+
+        logger.info(
+            "engine.cancelling_stale_orders",
+            count=len(stale_orders),
+            max_age_seconds=max_age_seconds,
+            oldest_age_seconds=max(age for _, age in stale_orders),
+        )
+
+        cancelled = 0
+        cancelled_tickers: list[str] = []
+        for order, age_seconds in stale_orders:
+            try:
+                await self._orders.cancel_order(order.order_id)
+                cancelled += 1
+                cancelled_tickers.append(order.ticker)
+            except Exception:
+                logger.warning(
+                    "engine.cancel_stale_order_failed",
+                    order_id=order.order_id,
+                    ticker=order.ticker,
+                    age_seconds=age_seconds,
+                    exc_info=True,
+                )
+
+        if cancelled:
+            logger.info(
+                "engine.stale_orders_cancelled",
+                count=cancelled,
+                remaining_open=len(self._orders.get_open_orders()),
+            )
+            for ticker in dict.fromkeys(cancelled_tickers):
+                await self._recheck_ticker_after_stale_cancel(ticker)
+        return cancelled
+
     async def _get_sports_snapshot(self, ticker: str) -> dict[str, Any] | None:
         if self._sports is None:
             return None
@@ -1166,6 +1359,11 @@ class ExecutionEngine:
             if market is not None
             else None
         )
+        event_cluster_key = (
+            self._event_cluster_key_for_market(market)
+            if market is not None
+            else None
+        )
 
         for order in self._orders.get_open_orders():
             if order.ticker == ticker:
@@ -1182,18 +1380,20 @@ class ExecutionEngine:
             action=action,
             sports_snapshot=sports_snapshot,
         )
-        if outcome_key is None:
+        if outcome_key is None and event_cluster_key is None:
             return None
 
         for order in self._orders.get_open_orders():
             if order.ticker == ticker:
                 continue
-            other_key = await self._outcome_key_for_trade(
-                order.ticker,
-                order.side.value,
-                action=order.action.value,
-            )
-            if other_key == outcome_key:
+            other_key = None
+            if outcome_key is not None:
+                other_key = await self._outcome_key_for_trade(
+                    order.ticker,
+                    order.side.value,
+                    action=order.action.value,
+                )
+            if outcome_key is not None and other_key == outcome_key:
                 return {
                     "kind": "equivalent_open_order",
                     "ticker": order.ticker,
@@ -1209,24 +1409,40 @@ class ExecutionEngine:
                         "side": order.side.value,
                         "action": order.action.value,
                     }
+            if event_cluster_key is not None:
+                other_event_cluster_key = await self._event_cluster_key_for_ticker(order.ticker)
+                if other_event_cluster_key == event_cluster_key:
+                    return {
+                        "kind": "event_cluster_open_order",
+                        "ticker": order.ticker,
+                        "side": order.side.value,
+                        "action": order.action.value,
+                    }
 
         for decision in self._decision_context.values():
             if decision.ticker == ticker:
                 continue
-            if binary_event_key is None:
-                continue
-            other_binary_event_key = await self._binary_event_key_for_ticker(decision.ticker)
-            if other_binary_event_key == binary_event_key:
-                return {
-                    "kind": "binary_event_pending_order",
-                    "ticker": decision.ticker,
-                    "category": getattr(decision, "category", ""),
-                }
+            if binary_event_key is not None:
+                other_binary_event_key = await self._binary_event_key_for_ticker(decision.ticker)
+                if other_binary_event_key == binary_event_key:
+                    return {
+                        "kind": "binary_event_pending_order",
+                        "ticker": decision.ticker,
+                        "category": getattr(decision, "category", ""),
+                    }
+            if event_cluster_key is not None:
+                other_event_cluster_key = await self._event_cluster_key_for_ticker(decision.ticker)
+                if other_event_cluster_key == event_cluster_key:
+                    return {
+                        "kind": "event_cluster_pending_order",
+                        "ticker": decision.ticker,
+                        "category": getattr(decision, "category", ""),
+                    }
 
         for other_ticker, position in self._risk._portfolio.positions.items():
             if other_ticker == ticker:
                 continue
-            if position.yes_count > 0:
+            if outcome_key is not None and position.yes_count > 0:
                 other_key = await self._outcome_key_for_trade(
                     other_ticker,
                     "yes",
@@ -1239,7 +1455,7 @@ class ExecutionEngine:
                         "side": "yes",
                         "contracts": position.yes_count,
                     }
-            if position.no_count > 0:
+            if outcome_key is not None and position.no_count > 0:
                 other_key = await self._outcome_key_for_trade(
                     other_ticker,
                     "no",
@@ -1257,6 +1473,14 @@ class ExecutionEngine:
                 if other_binary_event_key == binary_event_key:
                     return {
                         "kind": "binary_event_position",
+                        "ticker": other_ticker,
+                        "contracts": position.yes_count + position.no_count,
+                    }
+            if event_cluster_key is not None and (position.yes_count > 0 or position.no_count > 0):
+                other_event_cluster_key = await self._event_cluster_key_for_ticker(other_ticker)
+                if other_event_cluster_key == event_cluster_key:
+                    return {
+                        "kind": "event_cluster_position",
                         "ticker": other_ticker,
                         "contracts": position.yes_count + position.no_count,
                     }
@@ -1347,6 +1571,15 @@ class ExecutionEngine:
             return None
         return await self._binary_event_key_for_market(market)
 
+    async def _event_cluster_key_for_ticker(
+        self,
+        ticker: str,
+    ) -> tuple[str, str] | None:
+        market = await self._get_market(ticker)
+        if market is None:
+            return None
+        return self._event_cluster_key_for_market(market)
+
     async def _binary_event_key_for_market(
         self,
         market: Market,
@@ -1365,6 +1598,15 @@ class ExecutionEngine:
         if len(labels) != 2 or own_label not in labels:
             return None
         return ("binary_event", event_ticker)
+
+    @staticmethod
+    def _event_cluster_key_for_market(
+        market: Market,
+    ) -> tuple[str, str] | None:
+        event_ticker = (market.event_ticker or "").strip()
+        if not event_ticker:
+            return None
+        return ("event_cluster", event_ticker)
 
     async def _get_event_markets(self, event_ticker: str) -> list[Market]:
         cached = {

@@ -377,7 +377,7 @@ class Settlement:
 
     ticker: str
     market_result: MarketResult
-    revenue: Decimal  # revenue in cents (legacy)
+    revenue: Decimal  # normalized to dollars
     settled_time: datetime
     event_ticker: str = ""
     yes_count: int = 0  # from yes_count_fp

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from moneygone.config import RiskConfig
-from moneygone.exchange.types import Action, Fill, Side
+from moneygone.exchange.types import Action, Fill, MarketResult, Settlement, Side
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
 from moneygone.risk.manager import RiskManager
@@ -22,6 +22,7 @@ def _fill(
     action: Action,
     count: int,
     price: str,
+    fee_cost: str = "0",
 ) -> Fill:
     return Fill(
         fill_id=trade_id,
@@ -31,7 +32,7 @@ def _fill(
         count=count,
         price=Decimal(price),
         no_price=Decimal("1") - Decimal(price),
-        fee_cost=Decimal("0"),
+        fee_cost=Decimal(fee_cost),
         is_taker=True,
         created_time=datetime(2026, 4, 9, tzinfo=timezone.utc),
     )
@@ -95,6 +96,59 @@ def test_yes_and_no_legs_keep_separate_cost_basis() -> None:
     assert portfolio.realized_pnl == Decimal("1.50")
 
 
+def test_fees_reduce_cash_and_realized_pnl() -> None:
+    portfolio = PortfolioTracker(initial_cash=Decimal("100"))
+
+    portfolio.on_fill(
+        _fill(
+            trade_id="buy-yes",
+            side=Side.YES,
+            action=Action.BUY,
+            count=10,
+            price="0.40",
+            fee_cost="0.10",
+        )
+    )
+    portfolio.on_fill(
+        _fill(
+            trade_id="sell-yes",
+            side=Side.YES,
+            action=Action.SELL,
+            count=10,
+            price="0.70",
+            fee_cost="0.05",
+        )
+    )
+
+    assert portfolio.cash == Decimal("102.85")
+    assert portfolio.realized_pnl == Decimal("2.85")
+
+
+def test_settlement_adds_payout_and_realizes_remaining_pnl() -> None:
+    portfolio = PortfolioTracker(initial_cash=Decimal("10"))
+    portfolio.on_fill(
+        _fill(
+            trade_id="buy-yes",
+            side=Side.YES,
+            action=Action.BUY,
+            count=1,
+            price="0.40",
+        )
+    )
+
+    portfolio.on_settlement(
+        Settlement(
+            ticker="TEST-TICKER",
+            market_result=MarketResult.YES,
+            revenue=Decimal("1.00"),
+            settled_time=datetime(2026, 4, 10, tzinfo=timezone.utc),
+        )
+    )
+
+    assert portfolio.cash == Decimal("10.60")
+    assert portfolio.realized_pnl == Decimal("0.60")
+
+
 def test_daily_pnl_uses_realized_delta_for_loss_checks(
     risk_config: RiskConfig,
 ) -> None:
@@ -135,4 +189,3 @@ def test_daily_pnl_uses_realized_delta_for_loss_checks(
 
     assert not result.approved
     assert result.limit_triggered == "daily_loss_limit"
-
