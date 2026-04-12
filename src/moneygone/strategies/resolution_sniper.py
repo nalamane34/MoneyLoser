@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any, Union
 
@@ -80,7 +80,7 @@ class SnipeOpportunity:
     outcome_known: bool
     predicted_resolution: str  # "yes" or "no"
     confidence: float
-    current_market_price: Decimal  # current YES price (best ask)
+    current_market_price: Decimal  # economic entry price in the traded side's frame
     expected_payout: Decimal  # $1.00 if correct
     expected_profit: Decimal  # payout - cost - fees
     signal_source: str
@@ -100,6 +100,8 @@ class SnipeConfig:
     max_daily_snipes: int = 20
     cooldown_seconds: float = 5.0
     max_exposure_per_event: float = 20.0  # max $ exposure per game/event
+    sports_lookback_days: int = 1  # allow recently finished games around midnight
+    sports_lookahead_days: int = 1  # focus on today/tomorrow game markets
 
 
 @dataclass
@@ -283,7 +285,7 @@ class ResolutionSniper:
             if mapping.category == "sports" and mapping.data_source == "espn":
                 sport = mapping.source_params.get("sport", "")
                 league = mapping.source_params.get("league", "")
-                if sport and league:
+                if sport and league and sport != "multi" and league != "multi":
                     sports_leagues.add((sport, league))
 
             elif mapping.category == "weather":
@@ -632,21 +634,18 @@ class ResolutionSniper:
             )
             return None
 
-        # Determine side: if we predict "yes", buy YES; if "no", buy NO.
-        if opportunity.predicted_resolution == "yes":
-            side = Side.YES
-            price = opportunity.current_market_price
-        else:
-            side = Side.NO
-            # For buying NO, the price is (1 - yes_price).
-            price = _ONE - opportunity.current_market_price
+        # ``current_market_price`` is already stored in the traded side's
+        # economic frame. Kalshi still expects ``yes_price_dollars`` on the API.
+        side = Side.YES if opportunity.predicted_resolution == "yes" else Side.NO
+        contract_price = opportunity.current_market_price
+        yes_price = contract_price if side == Side.YES else _ONE - contract_price
 
         # Validate price range.
-        if price <= _ZERO or price >= _ONE:
+        if contract_price <= _ZERO or contract_price >= _ONE:
             logger.warning(
                 "sniper.invalid_price",
                 ticker=opportunity.ticker,
-                price=str(price),
+                price=str(contract_price),
             )
             return None
 
@@ -655,7 +654,7 @@ class ResolutionSniper:
             side=side,
             action=Action.BUY,
             count=contracts,
-            yes_price=price if side == Side.YES else _ONE - price,
+            yes_price=yes_price,
             time_in_force=TimeInForce.IOC,
             post_only=False,
         )
@@ -665,7 +664,8 @@ class ResolutionSniper:
             ticker=opportunity.ticker,
             side=side.value,
             contracts=contracts,
-            price=str(price),
+            price=str(contract_price),
+            yes_price=str(yes_price),
             expected_profit=str(opportunity.expected_profit),
         )
 
@@ -680,14 +680,14 @@ class ResolutionSniper:
                 ticker=opportunity.ticker,
                 category=self._category_for_ticker(opportunity.ticker),
                 contracts=contracts,
-                price=price,
+                price=contract_price,
             )
             if not reserved:
                 logger.warning(
                     "sniper.capital_reservation_rejected",
                     ticker=opportunity.ticker,
                     contracts=contracts,
-                    price=str(price),
+                    price=str(contract_price),
                 )
                 return None
 
@@ -716,71 +716,110 @@ class ResolutionSniper:
                 logger.warning("sniper.capital_sync_failed", ticker=opportunity.ticker, exc_info=True)
 
         # Attempt to get the fill for this order.
-        fill: Fill | None = None
+        fills: list[Fill] = []
         try:
-            fills = await self._client.get_fills(ticker=opportunity.ticker)
-            for f in fills:
-                if (
-                    f.side == side
-                    and f.action == Action.BUY
-                    and abs(f.price - price) < Decimal("0.01")
-                ):
-                    fill = f
-                    break
+            fills = await self._client.get_fills(order_id=order.order_id)
         except Exception:
             logger.warning(
                 "sniper.fill_fetch_error",
                 ticker=opportunity.ticker,
+                order_id=order.order_id,
                 exc_info=True,
             )
 
-        # Track per-event exposure.
-        event_ticker = self._event_ticker_from_ticker(opportunity.ticker)
-        cost = float(price) * contracts
-        self._event_exposure[event_ticker] = (
-            self._event_exposure.get(event_ticker, 0.0) + cost
+        fills = [
+            fill
+            for fill in fills
+            if fill.side == side and fill.action == Action.BUY
+        ]
+        if not fills:
+            logger.info(
+                "sniper.unfilled",
+                ticker=opportunity.ticker,
+                side=side.value,
+                contracts=contracts,
+                price=str(contract_price),
+                yes_price=str(yes_price),
+                order_id=order.order_id,
+                order_status=order.status.value,
+            )
+            return None
+
+        filled_contracts = sum(fill.count for fill in fills)
+        if filled_contracts <= 0:
+            logger.info(
+                "sniper.unfilled",
+                ticker=opportunity.ticker,
+                side=side.value,
+                contracts=contracts,
+                price=str(contract_price),
+                yes_price=str(yes_price),
+                order_id=order.order_id,
+                order_status=order.status.value,
+            )
+            return None
+
+        filled_notional = sum(
+            (fill.contract_price * Decimal(fill.count) for fill in fills),
+            _ZERO,
+        )
+        average_fill_price = (filled_notional / Decimal(filled_contracts)).quantize(
+            Decimal("0.0001"), rounding=ROUND_HALF_UP
         )
 
-        # Record the snipe.
+        # Track per-event exposure using actual filled dollars.
+        event_ticker = self._event_ticker_from_ticker(opportunity.ticker)
+        self._event_exposure[event_ticker] = (
+            self._event_exposure.get(event_ticker, 0.0) + float(filled_notional)
+        )
+
+        # Record the actual filled trade, not just the attempt.
         record = SnipeRecord(
             ticker=opportunity.ticker,
             side=side.value,
-            contracts=contracts,
-            entry_price=price,
-            expected_profit=opportunity.expected_profit,
+            contracts=filled_contracts,
+            entry_price=average_fill_price,
+            expected_profit=(
+                opportunity.expected_profit * Decimal(filled_contracts)
+            ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
             signal_source=opportunity.signal_source,
             confidence=opportunity.confidence,
             executed_at=now_utc(),
-            fill=fill,
+            fill=fills[0],
         )
         self._snipe_history.append(record)
 
         # Record in the shared fill tracker for audit trail
-        if fill is not None and self._fill_tracker is not None:
-            self._fill_tracker.on_closer_fill(
-                fill,
-                strategy="sniper",
-                signal_source=opportunity.signal_source,
-                confidence=opportunity.confidence,
-                expected_profit=float(opportunity.expected_profit),
-                entry_price=float(price),
-                contracts=contracts,
-                category=opportunity.signal_data.get("category", "unknown"),
-                signal_data=opportunity.signal_data,
-            )
+        if self._fill_tracker is not None:
+            for fill in fills:
+                self._fill_tracker.on_closer_fill(
+                    fill,
+                    strategy="sniper",
+                    signal_source=opportunity.signal_source,
+                    confidence=opportunity.confidence,
+                    expected_profit=float(
+                        self.calculate_profit(fill.contract_price, is_taker=fill.is_taker)
+                    ),
+                    entry_price=float(fill.contract_price),
+                    contracts=fill.count,
+                    category=opportunity.signal_data.get("category", "unknown"),
+                    signal_data=opportunity.signal_data,
+                )
 
         logger.info(
             "sniper.executed",
             ticker=opportunity.ticker,
             side=side.value,
-            contracts=contracts,
-            price=str(price),
+            contracts=filled_contracts,
+            requested_contracts=contracts,
+            price=str(average_fill_price),
+            yes_price=str(yes_price),
             order_id=order.order_id,
-            fill_obtained=fill is not None,
+            fill_obtained=True,
             event_exposure=round(self._event_exposure.get(event_ticker, 0.0), 2),
         )
 
-        return fill
+        return fills[0]
 
     # ------------------------------------------------------------------
     # Mapping and matching
@@ -817,6 +856,42 @@ class ResolutionSniper:
         if match:
             return match.group(1)
         return None
+
+    @staticmethod
+    def _parse_ticker_date(date_code: str | None) -> date | None:
+        """Parse ``YYMONDD`` into a UTC date."""
+        if not date_code:
+            return None
+        try:
+            year = 2000 + int(date_code[:2])
+            month_code = date_code[2:5]
+            day = int(date_code[5:7])
+        except (TypeError, ValueError):
+            return None
+
+        months = {
+            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
+            "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
+            "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+        }
+        month = months.get(month_code.upper())
+        if month is None:
+            return None
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    def _is_near_term_sports_ticker(self, ticker: str) -> bool:
+        """Whether a sports ticker is close enough in time to be snipeable."""
+        event_date = self._parse_ticker_date(self._extract_ticker_date(ticker))
+        if event_date is None:
+            return False
+
+        today = now_utc().date()
+        earliest = today - timedelta(days=self._config.sports_lookback_days)
+        latest = today + timedelta(days=self._config.sports_lookahead_days)
+        return earliest <= event_date <= latest
 
     @staticmethod
     def _signal_date_str(signal: "OutcomeSignal") -> str | None:
@@ -871,10 +946,16 @@ class ResolutionSniper:
                 # The ticker's date must match the game date.
                 # e.g. a game finishing today (APR11) must NOT match
                 # a contract for APR13.
+                if not self._is_near_term_sports_ticker(mapping.ticker):
+                    continue
+
                 ticker_date = self._extract_ticker_date(mapping.ticker)
                 signal_date = self._signal_date_str(signal)
 
-                if ticker_date and signal_date and ticker_date != signal_date:
+                if not ticker_date or not signal_date:
+                    continue
+
+                if ticker_date != signal_date:
                     logger.debug(
                         "sniper.date_mismatch",
                         ticker=mapping.ticker,
@@ -1291,6 +1372,8 @@ class ResolutionSniper:
 
             mapping = self._infer_mapping_from_ticker(market)
             if mapping is not None:
+                if mapping.category == "sports" and not self._is_near_term_sports_ticker(mapping.ticker):
+                    continue
                 self._mappings[mapping.ticker] = mapping
                 discovered += 1
 

@@ -14,17 +14,18 @@ from typing import TYPE_CHECKING
 import structlog
 
 from moneygone.exchange.errors import OrderError
-from moneygone.exchange.types import (
-    Fill,
-    Order,
-    OrderRequest,
-    OrderStatus,
-)
+from moneygone.exchange.types import Fill, Order, OrderRequest, OrderStatus, Side
 
 if TYPE_CHECKING:
     from moneygone.exchange.rest_client import KalshiRestClient
 
 logger = structlog.get_logger(__name__)
+
+_ACTIVE_ORDER_STATUSES = {
+    OrderStatus.RESTING,
+    OrderStatus.PARTIAL,
+    OrderStatus.PENDING,
+}
 
 
 class OrderManager:
@@ -90,21 +91,26 @@ class OrderManager:
             action=request.action.value,
             count=request.count,
             price=str(request.yes_price),
+            economic_price=str(
+                request.yes_price if request.side == Side.YES else (1 - request.yes_price)
+            ),
             client_order_id=coid,
         )
 
         order = await self._client.create_order(request)
 
-        # Track the order locally
-        self._open_orders[order.order_id] = order
-        self._client_order_ids[coid] = order.order_id
-        self._order_client_order_ids[order.order_id] = coid
+        # Only keep exchange-active orders in the local open-order map.
+        if order.status in _ACTIVE_ORDER_STATUSES:
+            self._open_orders[order.order_id] = order
+            self._client_order_ids[coid] = order.order_id
+            self._order_client_order_ids[order.order_id] = coid
 
         logger.info(
             "order_manager.submitted",
             order_id=order.order_id,
             status=order.status.value,
             ticker=order.ticker,
+            tracked=order.status in _ACTIVE_ORDER_STATUSES,
         )
         return order
 

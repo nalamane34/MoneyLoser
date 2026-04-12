@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from moneygone.exchange.types import Action, Fill, Order, OrderStatus, Side
+from moneygone.exchange.types import Action, Fill, Order, OrderRequest, OrderStatus, Side
 from moneygone.execution.order_manager import OrderManager
 
 
@@ -148,6 +148,16 @@ class _CancelClient:
         return self.refreshed_order
 
 
+class _SubmitClient:
+    def __init__(self, order: Order) -> None:
+        self.order = order
+        self.requests = []
+
+    async def create_order(self, request):
+        self.requests.append(request)
+        return self.order
+
+
 class TestOrderManagerReconcile:
     def test_reconcile_fetches_paginated_active_orders_not_just_resting(self) -> None:
         client = _ReconcileClient(
@@ -220,3 +230,30 @@ class TestOrderManagerCancelLifecycle:
         assert client.cancelled == ["order-1"]
         assert "order-1" not in manager._open_orders  # type: ignore[attr-defined]
         assert "order-1" not in manager._pending_cancel_order_ids  # type: ignore[attr-defined]
+
+
+class TestOrderManagerSubmissionTracking:
+    def test_submit_order_does_not_track_terminal_ioc_response(self) -> None:
+        client = _SubmitClient(
+            _make_order(order_id="ioc-order", status=OrderStatus.CANCELED)
+        )
+        manager = OrderManager(client)  # type: ignore[arg-type]
+
+        import asyncio
+
+        order = asyncio.run(
+            manager.submit_order(
+                OrderRequest(
+                    ticker="TEST",
+                    side=Side.NO,
+                    action=Action.BUY,
+                    count=4,
+                    yes_price=Decimal("0.05"),
+                    client_order_id="coid-1",
+                )
+            )
+        )
+
+        assert order.status is OrderStatus.CANCELED
+        assert manager.open_order_count == 0
+        assert manager._client_order_ids == {}  # type: ignore[attr-defined]

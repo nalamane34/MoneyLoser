@@ -594,6 +594,8 @@ async def main() -> None:
                 max_contracts_per_snipe=sniper_cfg.get("max_contracts_per_snipe", 20),
                 max_daily_snipes=sniper_cfg.get("max_daily_snipes", 40),
                 cooldown_seconds=sniper_cfg.get("cooldown_seconds", 3.0),
+                sports_lookback_days=sniper_cfg.get("sports_lookback_days", 1),
+                sports_lookahead_days=sniper_cfg.get("sports_lookahead_days", 1),
             ),
         )
 
