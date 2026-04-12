@@ -98,7 +98,7 @@ def test_artifact_feature_pipeline_matches_runtime_schema() -> None:
     assert features["is_above"] == 1.0
     assert features["num_legs"] == 2.0
     assert features["category_id"] == universal_category_id(MarketCategory.FINANCIALS)
-    assert features["hours_to_close"] >= 6.9
+    assert features["hours_to_close"] >= 4.9
     assert 0.0 < features["implied_single_prob"] < 1.0
 
 

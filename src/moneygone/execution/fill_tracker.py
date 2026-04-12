@@ -147,7 +147,7 @@ class FillTracker:
         edge:
             The edge calculation at the time of the trade decision.
         """
-        slippage = float(fill.price - edge.target_price)
+        slippage = float(fill.contract_price - edge.target_price)
 
         record = FillRecord(
             fill=fill,
@@ -172,7 +172,7 @@ class FillTracker:
                         "side": fill.side.value,
                         "action": fill.action.value,
                         "count": fill.count,
-                        "price": float(fill.price),
+                        "price": float(fill.contract_price),
                         "is_taker": fill.is_taker,
                         "fill_time": fill.created_time.isoformat(),
                     }
@@ -190,7 +190,7 @@ class FillTracker:
             ticker=fill.ticker,
             cycle_id=cycle_id,
             category=category,
-            price=str(fill.price),
+            price=str(fill.contract_price),
             target_price=str(edge.target_price),
             slippage=round(slippage, 4),
             model_prob=round(prediction.probability, 4),

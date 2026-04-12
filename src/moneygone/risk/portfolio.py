@@ -104,7 +104,8 @@ class PortfolioTracker:
         pos = self._positions.setdefault(
             fill.ticker, LocalPosition(ticker=fill.ticker)
         )
-        cost = Decimal(fill.count) * fill.price
+        contract_price = fill.contract_price
+        cost = Decimal(fill.count) * contract_price
         fees = fill.fee_cost
 
         if fill.action == Action.BUY:
@@ -120,7 +121,7 @@ class PortfolioTracker:
                 ticker=fill.ticker,
                 side=fill.side.value,
                 count=fill.count,
-                price=str(fill.price),
+                price=str(contract_price),
                 cash_remaining=str(self._cash),
             )
         elif fill.action == Action.SELL:
@@ -129,7 +130,7 @@ class PortfolioTracker:
                     sold_count = min(fill.count, pos.yes_count)
                     avg_cost = pos.yes_cost_basis / Decimal(pos.yes_count)
                     sold_cost = avg_cost * Decimal(sold_count)
-                    pnl = (Decimal(sold_count) * fill.price - fees) - sold_cost
+                    pnl = (Decimal(sold_count) * contract_price - fees) - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
                     pos.yes_cost_basis -= sold_cost
@@ -139,7 +140,7 @@ class PortfolioTracker:
                     sold_count = min(fill.count, pos.no_count)
                     avg_cost = pos.no_cost_basis / Decimal(pos.no_count)
                     sold_cost = avg_cost * Decimal(sold_count)
-                    pnl = (Decimal(sold_count) * fill.price - fees) - sold_cost
+                    pnl = (Decimal(sold_count) * contract_price - fees) - sold_cost
                     pos.realized_pnl += pnl
                     self._realized_pnl += pnl
                     pos.no_cost_basis -= sold_cost
@@ -150,7 +151,7 @@ class PortfolioTracker:
                 ticker=fill.ticker,
                 side=fill.side.value,
                 count=fill.count,
-                price=str(fill.price),
+                price=str(contract_price),
                 cash_remaining=str(self._cash),
             )
 

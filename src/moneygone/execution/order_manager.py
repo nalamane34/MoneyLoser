@@ -44,6 +44,7 @@ class OrderManager:
         self._open_orders: dict[str, Order] = {}
         self._client_order_ids: dict[str, str] = {}  # client_order_id -> order_id
         self._order_client_order_ids: dict[str, str] = {}  # order_id -> client_order_id
+        self._pending_cancel_order_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Order submission
@@ -279,6 +280,7 @@ class OrderManager:
     def _forget_order(self, order_id: str) -> None:
         """Remove an order from local tracking and clear identifier indexes."""
         self._open_orders.pop(order_id, None)
+        self._pending_cancel_order_ids.discard(order_id)
         client_order_id = self._order_client_order_ids.pop(order_id, None)
         if client_order_id is not None:
             self._client_order_ids.pop(client_order_id, None)
@@ -344,12 +346,22 @@ class OrderManager:
     async def reconcile(self) -> None:
         """Synchronize local order state with the exchange.
 
-        Fetches all resting orders from the exchange and replaces the
-        local map.  Logs discrepancies.
+        Fetches the full order set with cursor pagination, filters to
+        exchange-active orders, and replaces local tracking.  This avoids
+        dropping partially filled or pending orders simply because they
+        are not returned by the resting-only view.
         """
         logger.info("order_manager.reconciling")
 
-        exchange_orders = await self._client.get_orders(status="resting")
+        exchange_orders = await self._client.get_orders(limit=1_000, paginate=True)
+        active_statuses = {
+            OrderStatus.RESTING,
+            OrderStatus.PARTIAL,
+            OrderStatus.PENDING,
+        }
+        exchange_orders = [
+            order for order in exchange_orders if order.status in active_statuses
+        ]
         exchange_map = {o.order_id: o for o in exchange_orders}
 
         # Find orders we track locally but the exchange doesn't know about

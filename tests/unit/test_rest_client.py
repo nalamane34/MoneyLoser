@@ -285,6 +285,69 @@ def test_get_orders_uses_default_subaccount_when_not_overridden() -> None:
     }
 
 
+def test_get_orders_can_follow_cursor_pagination() -> None:
+    client = KalshiRestClient.__new__(KalshiRestClient)
+    client._subaccount = 4  # type: ignore[attr-defined]
+    calls: list[dict[str, object]] = []
+
+    async def _fake_request(method: str, path: str, params=None):
+        assert method == "GET"
+        assert path == "/portfolio/orders"
+        calls.append(dict(params or {}))
+        if not params or not params.get("cursor"):
+            return {
+                "orders": [
+                    {
+                        "order_id": "ord-1",
+                        "ticker": "KXTEST-1",
+                        "side": "yes",
+                        "action": "buy",
+                        "status": "resting",
+                        "initial_count_fp": "1.00",
+                        "remaining_count_fp": "1.00",
+                        "yes_price_dollars": "0.5700",
+                        "taker_fees_dollars": "0.0000",
+                        "maker_fees_dollars": "0.0000",
+                        "created_time": "2026-04-09T18:00:00Z",
+                    }
+                ],
+                "cursor": "next-page",
+            }
+        return {
+            "orders": [
+                {
+                    "order_id": "ord-2",
+                    "ticker": "KXTEST-2",
+                    "side": "no",
+                    "action": "buy",
+                    "status": "partial",
+                    "initial_count_fp": "2.00",
+                    "remaining_count_fp": "1.00",
+                    "yes_price_dollars": "0.4300",
+                    "no_price_dollars": "0.5700",
+                    "taker_fees_dollars": "0.0000",
+                    "maker_fees_dollars": "0.0000",
+                    "created_time": "2026-04-09T18:01:00Z",
+                }
+            ],
+            "cursor": None,
+        }
+
+    client._request = _fake_request  # type: ignore[attr-defined]
+
+    import asyncio
+
+    orders = asyncio.run(
+        KalshiRestClient.get_orders(client, limit=1000, paginate=True)
+    )
+
+    assert [order.order_id for order in orders] == ["ord-1", "ord-2"]
+    assert calls == [
+        {"limit": 1000, "subaccount": 4},
+        {"limit": 1000, "cursor": "next-page", "subaccount": 4},
+    ]
+
+
 def test_request_signs_path_without_query_parameters() -> None:
     client = KalshiRestClient.__new__(KalshiRestClient)
 

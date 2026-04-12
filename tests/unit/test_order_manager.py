@@ -15,6 +15,9 @@ _NOW = datetime(2026, 4, 9, 14, 30, tzinfo=timezone.utc)
 class _NullClient:
     """No-op client for on_fill tests."""
 
+    async def get_orders(self, **_filters):
+        return []
+
 
 def _make_order(
     *,
@@ -119,3 +122,37 @@ class TestOrderManagerFillReconciliation:
 
         assert manager._open_orders == before  # type: ignore[attr-defined]
         assert manager.open_order_count == 2
+
+
+class _ReconcileClient:
+    def __init__(self, orders: list[Order]) -> None:
+        self.orders = orders
+        self.calls: list[dict[str, object]] = []
+
+    async def get_orders(self, **filters):
+        self.calls.append(dict(filters))
+        return list(self.orders)
+
+
+class TestOrderManagerReconcile:
+    def test_reconcile_fetches_paginated_active_orders_not_just_resting(self) -> None:
+        client = _ReconcileClient(
+            [
+                _make_order(order_id="resting-order", status=OrderStatus.RESTING),
+                _make_order(order_id="partial-order", status=OrderStatus.PARTIAL),
+                _make_order(order_id="pending-order", status=OrderStatus.PENDING),
+                _make_order(order_id="done-order", status=OrderStatus.EXECUTED),
+            ]
+        )
+        manager = OrderManager(client)  # type: ignore[arg-type]
+
+        import asyncio
+
+        asyncio.run(manager.reconcile())
+
+        assert set(manager._open_orders) == {  # type: ignore[attr-defined]
+            "resting-order",
+            "partial-order",
+            "pending-order",
+        }
+        assert client.calls == [{"limit": 1000, "paginate": True}]

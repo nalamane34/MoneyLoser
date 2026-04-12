@@ -13,9 +13,9 @@ The quadratic term ``price * (1 - price)`` peaks at price = 0.50 and is
 symmetric around it, so contracts near 50/50 carry the highest fees while
 extreme-probability contracts cost less.
 
-The cap at $0.02 per contract means that for any price between ~0.18 and ~0.82,
-the effective fee is exactly $0.02/contract.  Outside that band the fee is lower
-due to the quadratic formula.
+With the current constants, the quadratic peaks at $0.0175/contract when price
+is $0.50, so the cap is a guardrail rather than an active branch for normal
+binary prices.
 """
 
 from __future__ import annotations
@@ -88,10 +88,9 @@ class KalshiFeeCalculator:
         if is_maker:
             return _ZERO
         raw = _TAKER_FEE_RATE * price * (_ONE - price)
-        # Cap at $0.02 per contract
+        # Cap at $0.02 per contract, then preserve fixed-point precision.
         fee = min(raw, _FEE_CAP_PER_CONTRACT)
-        # Round to nearest cent (Kalshi works in cents)
-        return fee.quantize(Decimal("0.01"), rounding=ROUND_UP)
+        return fee.quantize(Decimal("0.0001"), rounding=ROUND_UP)
 
     def breakeven_edge(self, price: Decimal, *, is_maker: bool = False) -> Decimal:
         """Minimum edge (in probability units) needed to break even after fees.

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from moneygone.exchange.errors import OrderError
-from moneygone.exchange.types import Action, Market, MarketResult, MarketStatus, Order, OrderStatus, Side
+from moneygone.exchange.types import Action, Fill, Market, MarketResult, MarketStatus, Order, OrderStatus, Side, WSEvent
 from moneygone.execution.engine import CategoryProvider, ExecutionEngine, TradeDecision
 from moneygone.models.base import ModelPrediction, ProbabilityModel
 from moneygone.data.market_discovery import MarketCategory
@@ -458,6 +458,106 @@ async def test_cancel_stale_open_orders_rechecks_ticker_immediately() -> None:
     assert calls[0][1] == "KXMLBGAME-PHI"
     assert str(calls[0][2]).startswith("stale-recheck:")
     assert calls[1] == ("execute", "decision")
+
+
+@pytest.mark.asyncio
+async def test_handle_fill_event_ignores_duplicate_fill_ids() -> None:
+    engine = object.__new__(ExecutionEngine)
+    engine._seen_fill_ids = set()
+    from collections import deque
+    engine._recent_fill_ids = deque()
+    engine._orders = SimpleNamespace(on_fill=lambda _fill: (_ for _ in ()).throw(AssertionError("should not reprocess")))
+    engine._risk = SimpleNamespace(post_trade_update=lambda _fill: (_ for _ in ()).throw(AssertionError("should not reprocess")))
+    engine._fills = SimpleNamespace(on_fill=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not reprocess")))
+    engine._resolve_decision_context = lambda _fill: None
+
+    event = WSEvent(
+        channel="fill",
+        type="fill",
+        data={
+            "fill_id": "fill-1",
+            "market_ticker": "KXTEST-1",
+            "side": "yes",
+            "action": "buy",
+            "count_fp": "1.00",
+            "yes_price_dollars": "0.55",
+            "fee_cost": "0.00",
+        },
+        seq=1,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    engine._seen_fill_ids.add("fill-1")
+
+    await engine._handle_fill_event(event)
+
+
+@pytest.mark.asyncio
+async def test_on_event_market_positions_resyncs_portfolio() -> None:
+    engine = object.__new__(ExecutionEngine)
+    synced: list[str] = []
+
+    async def _sync_with_exchange(_rest) -> None:
+        synced.append("sync")
+
+    engine._risk = SimpleNamespace(
+        _portfolio=SimpleNamespace(
+            sync_with_exchange=_sync_with_exchange,
+            positions={},
+            cash=Decimal("10"),
+        )
+    )
+    engine._rest = SimpleNamespace()
+    engine._last_portfolio_sync = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+    await engine.on_event(
+        WSEvent(
+            channel="market_positions",
+            type="position",
+            data={"market_ticker": "KXTEST-1"},
+            seq=1,
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+
+    assert synced == ["sync"]
+
+
+def test_prune_settled_tickers_cleans_decision_context_by_ticker() -> None:
+    engine = object.__new__(ExecutionEngine)
+    now = datetime.now(timezone.utc)
+    engine._watched = ["KXSETTLED-1"]
+    engine._market_cache = {
+        "KXSETTLED-1": Market(
+            ticker="KXSETTLED-1",
+            event_ticker="KXEVENT-1",
+            series_ticker="KXSERIES-1",
+            title="Settled market",
+            subtitle="",
+            yes_sub_title="Yes",
+            no_sub_title="No",
+            status=MarketStatus.SETTLED,
+            yes_bid=Decimal("0.50"),
+            yes_ask=Decimal("0.52"),
+            last_price=Decimal("0.51"),
+            volume=10,
+            open_interest=5,
+            close_time=now - timedelta(minutes=1),
+            result=MarketResult.YES,
+            category="politics",
+        )
+    }
+    engine._market_categories = {"KXSETTLED-1": MarketCategory.POLITICS}
+    engine._last_eval = {"KXSETTLED-1": now}
+    decision = _make_decision(ticker="KXSETTLED-1")
+    engine._decision_context = {"order-1": decision}
+    engine._decision_context_by_client_order_id = {"coid-1": decision}
+
+    pruned = engine._prune_settled_tickers()
+
+    assert pruned == 1
+    assert engine._decision_context == {}
+    assert engine._decision_context_by_client_order_id == {}
 
 
 # ---------------------------------------------------------------------------

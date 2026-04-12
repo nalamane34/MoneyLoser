@@ -349,6 +349,23 @@ class Fill:
     client_order_id: str | None = None
     trade_id: str = ""  # legacy alias for fill_id
 
+    @property
+    def contract_price(self) -> Decimal:
+        """Economic contract price in the traded side's native frame.
+
+        Kalshi fills expose ``yes_price_dollars`` and may also include
+        ``no_price_dollars``.  Local accounting should debit/credit the
+        price of the actual contract that traded:
+
+        - YES fill -> ``yes_price_dollars``
+        - NO fill -> ``no_price_dollars`` when present, otherwise ``1 - yes_price``
+        """
+        if self.side == Side.YES:
+            return self.price
+        if self.no_price > Decimal("0"):
+            return self.no_price
+        return Decimal("1") - self.price
+
 
 @dataclass(frozen=True, slots=True)
 class Trade:

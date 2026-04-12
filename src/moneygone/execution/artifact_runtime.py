@@ -210,13 +210,20 @@ def fallback_categories_for_config(
     crypto_enabled: bool,
 ) -> list[MarketCategory]:
     """Return the categories eligible for artifact fallback under the current config.
-
-    DISABLED: The universal artifact model has no real edge on politics,
-    entertainment, economics, etc. — it outputs constant probabilities
-    and burns cash.  Only specialist models (weather ensemble, sharp
-    sportsbook) should trade.
     """
-    return []
+    categories = [
+        MarketCategory.POLITICS,
+        MarketCategory.ECONOMICS,
+        MarketCategory.COMPANIES,
+        MarketCategory.ENTERTAINMENT,
+        MarketCategory.FINANCIALS,
+        MarketCategory.UNKNOWN,
+    ]
+    if weather_enabled:
+        categories.append(MarketCategory.WEATHER)
+    if crypto_enabled:
+        categories.append(MarketCategory.CRYPTO)
+    return categories
 
 
 def build_universal_artifact_fallbacks(

@@ -51,6 +51,7 @@ class _TradeRecord:
     action: str
     count: int
     price: float
+    fee_paid: float
     is_taker: bool
     fill_time: datetime
     predicted_prob: float
@@ -134,7 +135,8 @@ class PnLTracker:
             side=fill.side.value,
             action=fill.action.value,
             count=fill.count,
-            price=float(fill.price),
+            price=float(fill.contract_price),
+            fee_paid=float(fill.fee_cost),
             is_taker=fill.is_taker,
             fill_time=fill.created_time,
             predicted_prob=prediction.probability,
@@ -148,7 +150,7 @@ class PnLTracker:
             "pnl.trade_recorded",
             ticker=fill.ticker,
             side=fill.side.value,
-            price=float(fill.price),
+            price=float(fill.contract_price),
             edge=round(edge.fee_adjusted_edge, 4),
         )
 
@@ -160,7 +162,7 @@ class PnLTracker:
         settlement:
             Exchange settlement object.
         """
-        revenue_dollars = float(settlement.revenue) / 100  # cents to dollars
+        revenue_dollars = float(settlement.revenue)
         self._settlements[settlement.ticker] = (
             settlement.market_result.value,
             revenue_dollars,
@@ -220,7 +222,7 @@ class PnLTracker:
             trade_pnl = self._estimate_trade_pnl(t)
             fee = self._estimate_fee(t)
 
-            gross_pnl += trade_pnl + fee  # gross = before fees
+            gross_pnl += trade_pnl
             fees_paid += fee
             trade_pnls.append(trade_pnl)
 
@@ -336,46 +338,22 @@ class PnLTracker:
         """
         if trade.settlement_result is not None:
             # Settled: compute exact PnL
-            is_yes_side = trade.side == "yes"
             is_buy = trade.action == "buy"
-
-            if is_buy and is_yes_side:
-                if trade.settlement_result in ("yes", "all_yes"):
-                    return (1.0 - trade.price) * trade.count
-                else:
-                    return -trade.price * trade.count
-            elif is_buy and not is_yes_side:
-                if trade.settlement_result in ("no", "all_no"):
-                    return (1.0 - (1.0 - trade.price)) * trade.count
-                else:
-                    return -(1.0 - trade.price) * trade.count
+            winning_result = "yes" if trade.side == "yes" else "no"
+            alternate_winning_result = "all_yes" if trade.side == "yes" else "all_no"
+            if trade.settlement_result in (winning_result, alternate_winning_result):
+                buy_pnl = (1.0 - trade.price) * trade.count
             else:
-                # Sell: inverse of buy
-                return -self._estimate_trade_pnl(
-                    _TradeRecord(
-                        trade_id=trade.trade_id,
-                        ticker=trade.ticker,
-                        side=trade.side,
-                        action="buy",
-                        count=trade.count,
-                        price=trade.price,
-                        is_taker=trade.is_taker,
-                        fill_time=trade.fill_time,
-                        predicted_prob=trade.predicted_prob,
-                        predicted_confidence=trade.predicted_confidence,
-                        raw_edge=trade.raw_edge,
-                        fee_adjusted_edge=trade.fee_adjusted_edge,
-                        category=trade.category,
-                        settlement_result=trade.settlement_result,
-                        settlement_payout=trade.settlement_payout,
-                    )
-                )
+                buy_pnl = -trade.price * trade.count
+            return buy_pnl if is_buy else -buy_pnl
 
         # Unsettled: use expected PnL from edge
         return trade.fee_adjusted_edge * trade.count
 
     def _estimate_fee(self, trade: _TradeRecord) -> float:
         """Estimate fee for a trade."""
+        if trade.fee_paid > 0:
+            return trade.fee_paid
         if trade.is_taker:
             p = trade.price
             raw = 0.07 * p * (1 - p)

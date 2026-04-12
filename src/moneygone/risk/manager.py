@@ -28,6 +28,8 @@ from moneygone.sizing.risk_limits import (
 logger = structlog.get_logger(__name__)
 
 _ZERO = Decimal("0")
+_TAIL_LOW = Decimal("0.15")
+_TAIL_HIGH = Decimal("0.85")
 
 
 @dataclass(frozen=True)
@@ -270,12 +272,11 @@ class RiskManager:
                 positions, market_prices
             )
         else:
-            equity = self._portfolio.get_equity()
-            total_exposure = self._portfolio.get_total_exposure()
-            cat_exposure = self._portfolio.get_exposure_by_category(
-                self._categories
-            )
-            tail_exposure = _ZERO
+            portfolio_state = self._build_portfolio_state()
+            equity = portfolio_state.current_equity
+            total_exposure = portfolio_state.total_exposure
+            cat_exposure = portfolio_state.category_exposure
+            tail_exposure = portfolio_state.tail_exposure
 
         exposure_pct = (
             float(total_exposure / equity) if equity > _ZERO else 0.0
@@ -317,15 +318,27 @@ class RiskManager:
     def _build_portfolio_state(self) -> PortfolioState:
         """Build a PortfolioState snapshot from current tracker state."""
         positions: dict[str, int] = {}
+        gross_positions: dict[str, int] = {}
         position_costs: dict[str, Decimal] = {}
+        tail_exposure = _ZERO
         for ticker, pos in self._portfolio.positions.items():
             positions[ticker] = pos.net_count
+            gross_positions[ticker] = pos.yes_count + pos.no_count
             position_costs[ticker] = pos.cost_basis
+            if pos.yes_count > 0:
+                yes_avg_cost = pos.yes_cost_basis / Decimal(pos.yes_count)
+                if yes_avg_cost < _TAIL_LOW or yes_avg_cost > _TAIL_HIGH:
+                    tail_exposure += pos.yes_cost_basis
+            if pos.no_count > 0:
+                no_avg_cost = pos.no_cost_basis / Decimal(pos.no_count)
+                if no_avg_cost < _TAIL_LOW or no_avg_cost > _TAIL_HIGH:
+                    tail_exposure += pos.no_cost_basis
 
         equity = self._portfolio.get_equity()
 
         return PortfolioState(
             positions=positions,
+            gross_positions=gross_positions,
             position_costs=position_costs,
             category_exposure=self._portfolio.get_exposure_by_category(
                 self._categories
@@ -335,6 +348,7 @@ class RiskManager:
             daily_pnl=self._daily_pnl,
             peak_equity=self._drawdown.peak_equity,
             current_equity=equity,
+            tail_exposure=tail_exposure,
         )
 
     def _get_category_tickers(self) -> dict[str, list[str]]:

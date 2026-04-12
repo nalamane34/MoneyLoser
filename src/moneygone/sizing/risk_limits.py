@@ -59,6 +59,9 @@ class PortfolioState:
     positions: dict[str, int] = field(default_factory=dict)
     """ticker -> net contract count (positive = long, negative = short)."""
 
+    gross_positions: dict[str, int] = field(default_factory=dict)
+    """ticker -> total contracts held across YES and NO legs."""
+
     position_costs: dict[str, Decimal] = field(default_factory=dict)
     """ticker -> total cost basis."""
 
@@ -79,6 +82,9 @@ class PortfolioState:
 
     current_equity: Decimal = _ZERO
     """Current equity value."""
+
+    tail_exposure: Decimal = _ZERO
+    """Existing tail-contract exposure in dollars."""
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +260,11 @@ class RiskLimits:
         portfolio: PortfolioState,
     ) -> RiskCheckResult:
         """Limit contracts in any single market."""
-        current = portfolio.positions.get(proposed.ticker, 0)
-        new_total = abs(current) + proposed.contracts
+        current = portfolio.gross_positions.get(
+            proposed.ticker,
+            abs(portfolio.positions.get(proposed.ticker, 0)),
+        )
+        new_total = current + proposed.contracts
 
         if new_total > self._config.max_position_per_market:
             allowed = self._config.max_position_per_market - abs(current)
@@ -370,19 +379,18 @@ class RiskLimits:
         if not is_tail:
             return _APPROVED
 
-        # Compute current tail exposure (approximation from portfolio state)
-        # The full calculation uses ExposureCalculator; here we do a quick check
+        existing_tail = portfolio.tail_exposure
         trade_cost = Decimal(proposed.contracts) * proposed.price
-        # Assume portfolio.total_exposure includes any existing tail positions
-        # For a precise check, the RiskManager orchestrator uses ExposureCalculator
-        tail_pct = float(trade_cost / portfolio.bankroll)
+        new_tail_exposure = existing_tail + trade_cost
+        tail_pct = float(new_tail_exposure / portfolio.bankroll)
 
         if tail_pct > self._config.max_tail_exposure_pct:
             max_dollar = Decimal(
                 str(self._config.max_tail_exposure_pct)
             ) * portfolio.bankroll
-            if proposed.price > _ZERO:
-                allowed = int(max_dollar / proposed.price)
+            remaining = max_dollar - existing_tail
+            if remaining > _ZERO and proposed.price > _ZERO:
+                allowed = int(remaining / proposed.price)
                 if allowed > 0:
                     return RiskCheckResult(
                         approved=True,

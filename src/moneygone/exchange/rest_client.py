@@ -774,13 +774,29 @@ class KalshiRestClient:
         Filters: ``ticker``, ``event_ticker`` (comma-sep, max 10),
         ``min_ts``, ``max_ts``, ``status`` (resting|canceled|executed),
         ``limit`` (1-1000), ``cursor``, ``subaccount``.
+
+        Special local-only filter:
+        ``paginate=True`` follows API cursors until exhausted.
         """
-        data = await self._request(
-            "GET",
-            "/portfolio/orders",
-            params=self._with_subaccount_param(filters),
-        )
-        return [self._parse_order(o) for o in data.get("orders", [])]
+        paginate = bool(filters.pop("paginate", False))
+        cursor = str(filters.pop("cursor", "") or "")
+        orders: list[Order] = []
+
+        while True:
+            params = dict(filters)
+            if cursor:
+                params["cursor"] = cursor
+            data = await self._request(
+                "GET",
+                "/portfolio/orders",
+                params=self._with_subaccount_param(params),
+            )
+            orders.extend(self._parse_order(o) for o in data.get("orders", []))
+            cursor = str(data.get("cursor", "") or "")
+            if not paginate or not cursor:
+                break
+
+        return orders
 
     async def amend_order(self, request: AmendOrderRequest) -> tuple[Order, Order]:
         """Amend a resting order's price and/or size.

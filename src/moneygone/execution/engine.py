@@ -19,6 +19,7 @@ Also runs periodic re-evaluation of watched markets on a timer.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -181,6 +182,8 @@ class ExecutionEngine:
         self._active_cycle_id: str | None = None
         self._last_prune: datetime = datetime.now(timezone.utc)
         self._last_portfolio_sync: datetime = datetime.now(timezone.utc)
+        self._seen_fill_ids: set[str] = set()
+        self._recent_fill_ids: deque[str] = deque()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -295,6 +298,8 @@ class ExecutionEngine:
         try:
             if event.channel == "fill":
                 await self._handle_fill_event(event)
+            elif event.channel == "market_positions":
+                await self._handle_position_event(event)
             elif event.channel == "ticker":
                 await self._handle_ticker_event(event)
             elif event.channel == "orderbook_delta":
@@ -312,6 +317,10 @@ class ExecutionEngine:
         """Process a fill notification from the WebSocket."""
         data = event.data
         fill_id = data.get("fill_id", data.get("trade_id", ""))
+        if fill_id and self._fill_already_processed(fill_id):
+            logger.warning("engine.duplicate_fill_ignored", fill_id=fill_id)
+            return
+
         count_raw = data.get("count_fp", data.get("count", 0))
         fill = Fill(
             fill_id=fill_id,
@@ -349,8 +358,25 @@ class ExecutionEngine:
             fill_id=fill.fill_id,
             ticker=fill.ticker,
             count=fill.count,
-            price=str(fill.price),
+            price=str(fill.contract_price),
         )
+
+    async def _handle_position_event(self, event: WSEvent) -> None:
+        """Resync portfolio state when the exchange pushes a position update."""
+        now = datetime.now(timezone.utc)
+        if (now - self._last_portfolio_sync).total_seconds() < 5:
+            return
+        try:
+            await self._risk._portfolio.sync_with_exchange(self._rest)
+            self._last_portfolio_sync = now
+            logger.info(
+                "engine.position_resynced",
+                ticker=event.data.get("market_ticker", event.data.get("ticker", "")),
+                positions=len(self._risk._portfolio.positions),
+                cash=str(self._risk._portfolio.cash),
+            )
+        except Exception:
+            logger.warning("engine.position_resync_failed", exc_info=True)
 
     async def _handle_ticker_event(self, event: WSEvent) -> None:
         """Process a ticker update from the WebSocket."""
@@ -601,10 +627,15 @@ class ExecutionEngine:
             market = self._market_cache.get(ticker)
             if market is not None and market.yes_bid > 0 and market.yes_ask > 0:
                 from moneygone.exchange.types import OrderbookLevel
+                implied_no_bid = market.no_bid
+                if implied_no_bid <= 0:
+                    implied_no_bid = Decimal("1") - market.yes_ask
                 orderbook = OrderbookSnapshot(
                     ticker=ticker,
                     yes_bids=(OrderbookLevel(price=market.yes_bid, contracts=Decimal("100")),),
-                    no_bids=(),
+                    no_bids=(
+                        OrderbookLevel(price=implied_no_bid, contracts=Decimal("100")),
+                    ),
                     seq=0,
                     timestamp=now,
                 )
@@ -1177,7 +1208,7 @@ class ExecutionEngine:
             self._market_cache.pop(ticker, None)
             self._market_categories.pop(ticker, None)
             self._last_eval.pop(ticker, None)
-            self._decision_context.pop(ticker, None)
+            self._drop_decision_context_for_ticker(ticker)
 
         if to_remove:
             logger.info(
@@ -1739,6 +1770,34 @@ class ExecutionEngine:
                 self._decision_context_by_client_order_id.pop(k, None)
 
         return decision
+
+    def _fill_already_processed(self, fill_id: str) -> bool:
+        if fill_id in self._seen_fill_ids:
+            return True
+        self._seen_fill_ids.add(fill_id)
+        self._recent_fill_ids.append(fill_id)
+        max_seen = 10_000
+        while len(self._recent_fill_ids) > max_seen:
+            old_fill_id = self._recent_fill_ids.popleft()
+            self._seen_fill_ids.discard(old_fill_id)
+        return False
+
+    def _drop_decision_context_for_ticker(self, ticker: str) -> None:
+        stale_order_ids = [
+            order_id
+            for order_id, decision in self._decision_context.items()
+            if decision.ticker == ticker
+        ]
+        for order_id in stale_order_ids:
+            self._decision_context.pop(order_id, None)
+
+        stale_client_order_ids = [
+            client_order_id
+            for client_order_id, decision in self._decision_context_by_client_order_id.items()
+            if decision.ticker == ticker
+        ]
+        for client_order_id in stale_client_order_ids:
+            self._decision_context_by_client_order_id.pop(client_order_id, None)
 
     def _merge_market_update(
         self,

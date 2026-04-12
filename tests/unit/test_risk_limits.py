@@ -27,11 +27,14 @@ def _make_portfolio(
     peak_equity: str = "10000",
     current_equity: str = "10000",
     positions: dict[str, int] | None = None,
+    gross_positions: dict[str, int] | None = None,
     category_exposure: dict[str, str] | None = None,
     total_exposure: str = "0",
+    tail_exposure: str = "0",
 ) -> PortfolioState:
     return PortfolioState(
         positions=positions or {},
+        gross_positions=gross_positions or {},
         position_costs={},
         category_exposure={
             k: Decimal(v) for k, v in (category_exposure or {}).items()
@@ -41,6 +44,7 @@ def _make_portfolio(
         daily_pnl=Decimal(daily_pnl),
         peak_equity=Decimal(peak_equity),
         current_equity=Decimal(current_equity),
+        tail_exposure=Decimal(tail_exposure),
     )
 
 
@@ -119,6 +123,26 @@ class TestRiskLimits:
         assert not result.approved
         assert result.limit_triggered == "min_contract_price"
 
+    def test_tail_limit_uses_existing_portfolio_tail_exposure(
+        self, risk_config: RiskConfig
+    ) -> None:
+        """Existing tail exposure should reduce remaining tail capacity."""
+        tail_config = risk_config.model_copy(
+            update={"max_tail_exposure_pct": 0.20}
+        )
+        limits = RiskLimits(tail_config)
+        trade = _make_trade(contracts=1, price="0.90")
+        portfolio = _make_portfolio(
+            bankroll="10",
+            tail_exposure="1.50",
+        )
+
+        result = limits.check(trade, portfolio)
+
+        assert not result.approved
+        assert result.adjusted_size is None
+        assert result.limit_triggered == "max_tail_exposure_pct"
+
     def test_partial_approval(self, risk_config: RiskConfig) -> None:
         """When position limit would be exceeded, size should be reduced."""
         limits = RiskLimits(risk_config)
@@ -131,6 +155,23 @@ class TestRiskLimits:
         assert result.approved
         assert result.adjusted_size is not None
         assert result.adjusted_size == 10  # 50 - 40
+        assert result.limit_triggered == "max_position_per_market"
+
+    def test_gross_position_limit_counts_mixed_yes_no_inventory(
+        self, risk_config: RiskConfig
+    ) -> None:
+        """Mixed YES/NO inventory should still count toward the market cap."""
+        limits = RiskLimits(risk_config)
+        trade = _make_trade(ticker="EXISTING", contracts=20, price="0.50")
+        portfolio = _make_portfolio(
+            positions={"EXISTING": 0},
+            gross_positions={"EXISTING": 40},
+        )
+
+        result = limits.check(trade, portfolio)
+
+        assert result.approved
+        assert result.adjusted_size == 10
         assert result.limit_triggered == "max_position_per_market"
 
     def test_drawdown_circuit_breaker(self, risk_config: RiskConfig) -> None:
