@@ -180,6 +180,7 @@ class ExecutionEngine:
         self._last_order_reconcile: datetime | None = None
         self._active_cycle_id: str | None = None
         self._last_prune: datetime = datetime.now(timezone.utc)
+        self._last_portfolio_sync: datetime = datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1012,6 +1013,19 @@ class ExecutionEngine:
                 await self._refresh_market_universe()
                 await self._maybe_reconcile_open_orders()
                 await self._cancel_stale_open_orders()
+
+                # Sync portfolio with exchange every 2 minutes for fresh cash balance
+                if (datetime.now(timezone.utc) - self._last_portfolio_sync).total_seconds() >= 120:
+                    try:
+                        await self._risk._portfolio.sync_with_exchange(self._rest)
+                        self._last_portfolio_sync = datetime.now(timezone.utc)
+                        logger.info(
+                            "engine.portfolio_resynced",
+                            cash=str(self._risk._portfolio.cash),
+                            positions=len(self._risk._portfolio.positions),
+                        )
+                    except Exception:
+                        logger.warning("engine.portfolio_resync_failed", exc_info=True)
 
                 # Prune settled/closed tickers every 10 minutes
                 if (datetime.now(timezone.utc) - self._last_prune).total_seconds() >= 600:

@@ -28,9 +28,11 @@ from moneygone.monitoring.alerts import AlertManager
 from moneygone.monitoring.calibration_monitor import CalibrationMonitor
 from moneygone.monitoring.drift import DriftDetector
 from moneygone.monitoring.pnl import PnLTracker
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("worker.monitor")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def _monitoring_loop(
@@ -109,11 +111,14 @@ async def main() -> None:
     parser.add_argument("--overlay", default="config/paper-soak.yaml")
     args = parser.parse_args()
 
+    loaded_env = load_repo_env(REPO_ROOT)
     config = load_config(
         base_path=Path(args.config),
         overlay_path=Path(args.overlay),
     )
     setup_logging(config.log_level)
+    if loaded_env:
+        log.info("worker_monitor.repo_env_loaded", keys=sorted(loaded_env))
 
     data_dir = Path(config.data_dir)
     exec_db_path = data_dir / "execution.duckdb"

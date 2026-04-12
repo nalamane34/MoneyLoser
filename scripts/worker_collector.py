@@ -30,9 +30,11 @@ from moneygone.data.sports.odds import OddsAPIFeed, TENNIS_TOURNAMENT_KEYS
 from moneygone.data.sports.esports_odds import EsportsOddsFeed
 from moneygone.data.sports.stats import PlayerStatsFeed
 from moneygone.data.store import DataStore
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("worker.collector")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def _league_has_games_within_window(
@@ -272,11 +274,14 @@ async def main() -> None:
     parser.add_argument("--overlay", default="config/paper-soak.yaml")
     args = parser.parse_args()
 
+    loaded_env = load_repo_env(REPO_ROOT)
     config = load_config(
         base_path=Path(args.config),
         overlay_path=Path(args.overlay),
     )
     setup_logging(config.log_level)
+    if loaded_env:
+        log.info("worker_collector.repo_env_loaded", keys=sorted(loaded_env))
 
     data_dir = Path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)

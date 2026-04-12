@@ -9,6 +9,67 @@ exchange:
 
 weather:
   enabled: true
+  locations:
+    - name: "New York City"
+      lat: 40.7668
+      lon: -73.9829
+    - name: "Chicago"
+      lat: 41.7856
+      lon: -87.7527
+    - name: "Los Angeles"
+      lat: 33.9425
+      lon: -118.4080
+    - name: "Miami"
+      lat: 25.7954
+      lon: -80.2901
+    - name: "Dallas"
+      lat: 32.8972
+      lon: -97.0377
+    - name: "Denver"
+      lat: 39.8617
+      lon: -104.6732
+    - name: "Seattle"
+      lat: 47.4499
+      lon: -122.3118
+    - name: "Atlanta"
+      lat: 33.6367
+      lon: -84.4279
+    - name: "Houston"
+      lat: 29.9844
+      lon: -95.3414
+    - name: "Phoenix"
+      lat: 33.4343
+      lon: -112.0116
+    - name: "Philadelphia"
+      lat: 39.8744
+      lon: -75.2424
+    - name: "Boston"
+      lat: 42.3656
+      lon: -71.0096
+    - name: "Washington DC"
+      lat: 38.8512
+      lon: -77.0402
+    - name: "Las Vegas"
+      lat: 36.0801
+      lon: -115.1522
+    - name: "San Francisco"
+      lat: 37.6213
+      lon: -122.3790
+    - name: "San Antonio"
+      lat: 29.5337
+      lon: -98.4698
+    - name: "Oklahoma City"
+      lat: 35.3931
+      lon: -97.6007
+    - name: "Austin"
+      lat: 30.1945
+      lon: -97.6699
+    - name: "New Orleans"
+      lat: 29.9934
+      lon: -90.2580
+    - name: "Minneapolis"
+      lat: 44.8848
+      lon: -93.2223
 
 crypto:
   enabled: false
@@ -38,7 +99,7 @@ sportsbook:
   markets:
     - "h2h"
   fetch_interval_minutes: 30
-  lookahead_hours: 24
+  lookahead_hours: 48
   min_requests_remaining: 250
 
 execution:

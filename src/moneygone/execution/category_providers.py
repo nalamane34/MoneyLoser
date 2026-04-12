@@ -275,12 +275,24 @@ class WeatherDataProvider:
     _LOCATION_ALIASES: dict[str, list[str]] = {
         "new york": ["nyc", "new york", "manhattan", "ny"],
         "chicago": ["chicago", "chi"],
-        "los angeles": ["los angeles", "la ", "l.a."],
+        "los angeles": ["los angeles", "lax", "la ", "l.a."],
         "miami": ["miami", "mia"],
         "dallas": ["dallas", "dfw"],
         "denver": ["denver", "den"],
         "seattle": ["seattle", "sea"],
         "atlanta": ["atlanta", "atl"],
+        "houston": ["houston", "hou"],
+        "phoenix": ["phoenix", "phx"],
+        "philadelphia": ["philadelphia", "philly", "phi", "phil"],
+        "boston": ["boston", "bos"],
+        "washington dc": ["washington dc", "washington", "wdc", "dca", "hightdc", "lowtdc"],
+        "las vegas": ["las vegas", "vegas", "hightlv", "lowtlv", "lv"],
+        "san francisco": ["san francisco", "sfo", "hightsfo", "lowtsfo"],
+        "san antonio": ["san antonio", "satx", "hightsatx", "lowtsatx"],
+        "oklahoma city": ["oklahoma city", "okc"],
+        "austin": ["austin", "aus"],
+        "new orleans": ["new orleans", "nola"],
+        "minneapolis": ["minneapolis", "min"],
     }
 
     def __init__(
@@ -299,6 +311,7 @@ class WeatherDataProvider:
 
     def _match_location(self, text: str) -> dict[str, Any] | None:
         """Match market text to a configured location."""
+        text = text.lower()
         for name, loc in self._locations.items():
             if name in text or name.split(",")[0] in text:
                 return loc

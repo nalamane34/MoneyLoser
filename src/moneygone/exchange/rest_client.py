@@ -272,7 +272,7 @@ class KalshiRestClient:
             # Map specific HTTP status codes to typed errors.
             if response.status_code == 429:
                 retry_after = float(response.headers.get("Retry-After", _BACKOFF_BASE * (2**attempt)))
-                if attempt < max_retries - 1:
+                if attempt < _MAX_RETRIES - 1:
                     log.warning(
                         "rest_client.rate_limited",
                         attempt=attempt + 1,

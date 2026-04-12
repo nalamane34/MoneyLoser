@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import duckdb
 import pytest
 
 from moneygone.data.store import DataStore
@@ -246,3 +247,43 @@ class TestSportsbookLines:
         assert latest["evt-1"]["home_price"] == pytest.approx(1.48)
         assert latest["evt-1"]["away_price"] == pytest.approx(2.75)
         assert latest_as_of_t1["evt-1"]["home_price"] == pytest.approx(1.62)
+
+    def test_load_parquet_handles_schema_drift_with_missing_columns(
+        self,
+        data_store: DataStore,
+        tmp_path,
+    ) -> None:
+        """Parquet loads should tolerate missing newer columns like draw_price."""
+        parquet_path = tmp_path / "sportsbook_lines.parquet"
+        conn = duckdb.connect()
+        conn.execute(
+            """
+            CREATE TABLE old_lines AS
+            SELECT
+                'evt-legacy'::VARCHAR AS event_id,
+                'nba'::VARCHAR AS sport,
+                'Chicago Bulls'::VARCHAR AS home_team,
+                'Boston Celtics'::VARCHAR AS away_team,
+                'pinnacle'::VARCHAR AS bookmaker,
+                TIMESTAMP '2026-04-10 00:00:00' AS commence_time,
+                1.62::DOUBLE AS home_price,
+                2.45::DOUBLE AS away_price,
+                -4.5::DOUBLE AS spread_home,
+                229.5::DOUBLE AS total,
+                TIMESTAMP '2026-04-09 09:00:00' AS captured_at,
+                TIMESTAMP '2026-04-09 09:00:01' AS ingested_at
+            """
+        )
+        conn.execute(f"COPY old_lines TO '{parquet_path}' (FORMAT PARQUET)")
+        conn.close()
+
+        loaded = data_store.load_parquet_into_table(
+            "sportsbook_game_lines",
+            parquet_path,
+        )
+        rows = data_store.query(
+            "SELECT event_id, draw_price, home_price, away_price FROM sportsbook_game_lines"
+        )
+
+        assert loaded == 1
+        assert rows == [("evt-legacy", None, 1.62, 2.45)]

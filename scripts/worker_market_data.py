@@ -32,9 +32,11 @@ from moneygone.data.store import DataStore
 from moneygone.exchange.rest_client import KalshiRestClient
 from moneygone.exchange.ws_client import KalshiWebSocket
 from moneygone.exchange.types import WSEvent
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("worker.market_data")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def _ws_event_handler(
@@ -198,11 +200,14 @@ async def main() -> None:
     parser.add_argument("--no-ws", action="store_true", help="Disable WebSocket, use REST-only polling")
     args = parser.parse_args()
 
+    loaded_env = load_repo_env(REPO_ROOT)
     config = load_config(
         base_path=Path(args.config),
         overlay_path=Path(args.overlay),
     )
     setup_logging(config.log_level)
+    if loaded_env:
+        log.info("worker_market_data.repo_env_loaded", keys=sorted(loaded_env))
 
     data_dir = Path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)

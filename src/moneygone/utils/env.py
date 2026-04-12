@@ -6,13 +6,8 @@ import os
 from pathlib import Path
 
 
-def load_repo_env(repo_root: Path, *, override: bool = False) -> list[str]:
-    """Load simple KEY=VALUE entries from ``repo_root/.env`` into ``os.environ``.
-
-    Supports blank lines, comments, and optional ``export`` prefixes.
-    Returns the list of keys that were set during this call.
-    """
-    env_path = repo_root / ".env"
+def _load_env_file(env_path: Path, *, override: bool = False) -> list[str]:
+    """Load a single env file into ``os.environ``."""
     if not env_path.exists():
         return []
 
@@ -38,5 +33,18 @@ def load_repo_env(repo_root: Path, *, override: bool = False) -> list[str]:
         if override or key not in os.environ:
             os.environ[key] = value
             loaded.append(key)
+    return loaded
 
+
+def load_repo_env(repo_root: Path, *, override: bool = False) -> list[str]:
+    """Load common repo-local env files into ``os.environ``.
+
+    We load ``.env`` first, then runtime/deploy overlays if present, while
+    preserving already-set keys by default. Supports blank lines, comments,
+    and optional ``export`` prefixes. Returns the list of keys set during
+    this call.
+    """
+    loaded: list[str] = []
+    for filename in (".env", ".env.runtime", ".deploy.env"):
+        loaded.extend(_load_env_file(repo_root / filename, override=override))
     return loaded

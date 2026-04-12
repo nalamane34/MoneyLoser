@@ -223,12 +223,14 @@ class ResolutionSniper:
         contract_mappings: list[ContractMapping] | None = None,
         config: SnipeConfig | None = None,
         fill_tracker: FillTracker | None = None,
+        portfolio: PortfolioTracker | None = None,
     ) -> None:
         self._client = rest_client
         self._order_manager = order_manager
         self._fees = fee_calculator
         self._config = config or SnipeConfig()
         self._fill_tracker = fill_tracker
+        self._portfolio = portfolio
         self._mappings: dict[str, ContractMapping] = {
             m.ticker: m for m in (contract_mappings or [])
         }
@@ -247,6 +249,7 @@ class ResolutionSniper:
         self._opportunity_log: list[SnipeOpportunity] = []
         # Per-event exposure tracking: event_ticker -> total $ spent
         self._event_exposure: dict[str, float] = {}
+        self._last_portfolio_sync: datetime | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -613,6 +616,8 @@ class ResolutionSniper:
         Fill | None
             The resulting fill, or ``None`` if execution failed.
         """
+        await self._maybe_sync_portfolio(force=True)
+
         contracts = min(
             self._config.max_contracts_per_snipe,
             self._estimate_safe_size(opportunity),
@@ -1074,18 +1079,10 @@ class ResolutionSniper:
             )
             return False
 
-        # Per-event exposure cap: don't stack too much $ on one game
-        event_ticker = self._event_ticker_from_ticker(opp.ticker)
-        current_exposure = self._event_exposure.get(event_ticker, 0.0)
-        new_cost = price_f * self._config.max_contracts_per_snipe
-        if current_exposure + new_cost > self._config.max_exposure_per_event:
-            logger.warning(
-                "sniper.event_exposure_limit",
+        if self._estimate_safe_size(opp) <= 0:
+            logger.debug(
+                "sniper.no_affordable_size",
                 ticker=opp.ticker,
-                event_ticker=event_ticker,
-                current_exposure=round(current_exposure, 2),
-                new_cost=round(new_cost, 2),
-                max_per_event=self._config.max_exposure_per_event,
             )
             return False
 
@@ -1103,12 +1100,64 @@ class ResolutionSniper:
     def _estimate_safe_size(self, opp: SnipeOpportunity) -> int:
         """Estimate a safe position size for a snipe.
 
-        Conservative sizing: uses the configured max or a fraction of
-        available capital, whichever is smaller.
+        Uses the smaller of:
+        - configured max_contracts_per_snipe
+        - what available cash can afford (with 10% reserve)
+        - per-event exposure remaining
         """
-        # For now, use the configured max.  In production, this would
-        # query account balance and compute a risk-limited size.
-        return self._config.max_contracts_per_snipe
+        max_contracts = self._config.max_contracts_per_snipe
+
+        # Cash-aware sizing: don't try to buy more than we can afford
+        price_f = float(opp.current_market_price)
+        if price_f <= 0:
+            return 0
+
+        cash = float(self._portfolio.cash) if self._portfolio is not None else 0.0
+        # Keep 10% reserve so we don't drain the account completely
+        usable_cash = cash * 0.9
+        if usable_cash <= 0:
+            logger.warning(
+                "sniper.insufficient_cash",
+                ticker=opp.ticker,
+                cash=round(cash, 2),
+            )
+            return 0
+        cash_limited = int(usable_cash / price_f)
+
+        # Per-event exposure remaining
+        event_ticker = self._event_ticker_from_ticker(opp.ticker)
+        current_exposure = self._event_exposure.get(event_ticker, 0.0)
+        remaining_exposure = self._config.max_exposure_per_event - current_exposure
+        if remaining_exposure <= 0:
+            return 0
+        exposure_limited = int(remaining_exposure / price_f)
+
+        result = min(max_contracts, cash_limited, exposure_limited)
+        return max(result, 0)
+
+    async def _maybe_sync_portfolio(self, *, force: bool = False) -> None:
+        """Refresh available cash before sizing fast closer trades."""
+        if self._portfolio is None:
+            return
+
+        now = now_utc()
+        if (
+            not force
+            and self._last_portfolio_sync is not None
+            and (now - self._last_portfolio_sync).total_seconds() < 30
+        ):
+            return
+
+        try:
+            await self._portfolio.sync_with_exchange(self._client)
+            self._last_portfolio_sync = now
+            logger.debug(
+                "sniper.portfolio_synced",
+                cash=str(self._portfolio.cash),
+                positions=len(self._portfolio.positions),
+            )
+        except Exception:
+            logger.warning("sniper.portfolio_sync_failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Auto-discovery

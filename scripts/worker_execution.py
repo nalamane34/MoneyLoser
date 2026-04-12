@@ -27,7 +27,7 @@ import structlog
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from moneygone.config import load_config
+from moneygone.config import default_weather_locations, load_config
 from moneygone.data.schemas import EXECUTION_TABLES
 from moneygone.data.sports.live_snapshots import (
     StoreBackedSportsSnapshotProvider,
@@ -117,9 +117,11 @@ from moneygone.strategies.closer_killswitch import (
 )
 from moneygone.strategies.live_event_edge import LiveEdgeConfig, LiveEventEdge
 from moneygone.strategies.resolution_sniper import ResolutionSniper, SnipeConfig
+from moneygone.utils.env import load_repo_env
 from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("worker.execution")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 async def main() -> None:
@@ -128,11 +130,14 @@ async def main() -> None:
     parser.add_argument("--overlay", default="config/paper-soak.yaml")
     args = parser.parse_args()
 
+    loaded_env = load_repo_env(REPO_ROOT)
     config = load_config(
         base_path=Path(args.config),
         overlay_path=Path(args.overlay),
     )
     setup_logging(config.log_level)
+    if loaded_env:
+        log.info("worker_execution.repo_env_loaded", keys=sorted(loaded_env))
 
     data_dir = Path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -310,18 +315,25 @@ async def main() -> None:
 
     if config.weather.enabled:
         try:
-            from moneygone.data.weather.noaa import NOAAEnsembleFetcher
             from moneygone.data.weather.ecmwf import ECMWFOpenDataFetcher
+            from moneygone.data.weather.noaa import NOAAEnsembleFetcher
+            from moneygone.data.weather.nws import NWSFetcher
 
             noaa_fetcher = NOAAEnsembleFetcher(
                 api_key=config.weather.open_meteo_api_key,
             )
             ecmwf_fetcher = ECMWFOpenDataFetcher()
+            nws_fetcher = NWSFetcher()
             weather_locations = [
                 {"name": loc["name"], "lat": loc["lat"], "lon": loc["lon"]}
-                for loc in config.weather.locations
+                for loc in (config.weather.locations or default_weather_locations())
             ]
-            weather_provider = WeatherDataProvider(noaa_fetcher, ecmwf_fetcher, weather_locations)
+            weather_provider = WeatherDataProvider(
+                noaa_fetcher,
+                ecmwf_fetcher,
+                weather_locations,
+                nws_fetcher=nws_fetcher,
+            )
             weather_model = WeatherEnsembleModel()
             weather_pipeline = FeaturePipeline(
                 [
@@ -487,6 +499,7 @@ async def main() -> None:
             order_manager=order_manager,
             fee_calculator=fee_calculator,
             fill_tracker=fill_tracker,
+            portfolio=portfolio_tracker,
             config=SnipeConfig(
                 min_confidence=sniper_cfg.get("min_confidence", 0.95),
                 max_entry_price=sniper_cfg.get("max_entry_price", 0.95),

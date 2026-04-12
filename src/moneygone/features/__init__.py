@@ -25,7 +25,10 @@ from moneygone.features.market_features import (
 from moneygone.features.game_winner_features import (
     HomeFieldAdvantage,
     InjuryAdjustedSpread,
+    IsConsensusFallback,
     KalshiVsSportsbookEdge,
+    LineAgeHours,
+    MatchQuality,
     MoneylineMovement,
     PinnacleVsMarketEdge,
     PinnacleWinProbability,
@@ -123,6 +126,9 @@ __all__ = [
     "InjuryAdjustedSpread",
     "SpreadImpliedWinProb",
     "PublicBettingLoad",
+    "LineAgeHours",
+    "IsConsensusFallback",
+    "MatchQuality",
     # Temporal
     "TimeToExpiryHours",
     "DayOfWeek",

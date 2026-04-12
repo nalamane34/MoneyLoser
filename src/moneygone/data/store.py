@@ -21,6 +21,12 @@ logger = structlog.get_logger(__name__)
 _NAMED_PARAM_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
+def _quote_ident(identifier: str) -> str:
+    """Quote an identifier for DuckDB SQL."""
+    escaped = identifier.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def _strip_tz(dt: datetime) -> datetime:
     """Convert a timezone-aware datetime to a naive UTC datetime.
 
@@ -175,9 +181,27 @@ class DataStore:
         p = Path(path)
         if not p.exists():
             return 0
+        parquet_columns = [
+            str(row[0])
+            for row in self._conn.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{p}')"
+            ).fetchall()
+        ]
+        table_columns = [
+            str(row[1])
+            for row in self._conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+        ]
+        common_columns = [col for col in table_columns if col in parquet_columns]
+        if not common_columns:
+            raise ValueError(
+                f"No compatible columns found between parquet {p} and table {table}"
+            )
+
+        quoted_columns = ", ".join(_quote_ident(col) for col in common_columns)
         self._conn.execute(f"DELETE FROM {table}")
         self._conn.execute(
-            f"INSERT INTO {table} SELECT * FROM read_parquet('{p}')"
+            f"INSERT INTO {_quote_ident(table)} ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM read_parquet('{p}')"
         )
         result = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
         count = result[0] if result else 0

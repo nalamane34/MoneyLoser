@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 import structlog
 
-from moneygone.config import AppConfig
+from moneygone.config import AppConfig, default_weather_locations
 from moneygone.data.crypto.ccxt_feed import CryptoDataFeed
 from moneygone.data.market_data import MarketDataRecorder
 from moneygone.data.market_discovery import MarketCategory
@@ -501,6 +501,8 @@ def build_app(config: AppConfig) -> Application:
             fee_calculator=fee_calculator,
             contract_mappings=[],  # auto-discovered at start()
             config=SnipeConfig(),
+            fill_tracker=fill_tracker,
+            portfolio=portfolio_tracker,
         )
 
         live_event_edge = LiveEventEdge(
@@ -575,14 +577,7 @@ def build_app(config: AppConfig) -> Application:
         # Weather category provider — NWS + NOAA + ECMWF
         category_providers: dict[MarketCategory, CategoryProvider] = {}
         if config.weather.enabled:
-            weather_locations = config.weather.locations or [
-                {"name": "New York", "lat": 40.7128, "lon": -74.0060},
-                {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
-                {"name": "Los Angeles", "lat": 34.0522, "lon": -118.2437},
-                {"name": "Miami", "lat": 25.7617, "lon": -80.1918},
-                {"name": "Dallas", "lat": 32.7767, "lon": -96.7970},
-                {"name": "Denver", "lat": 39.7392, "lon": -104.9903},
-            ]
+            weather_locations = config.weather.locations or default_weather_locations()
             nws_fetcher = NWSFetcher()
             noaa_fetcher = NOAAEnsembleFetcher(
                 api_key=config.weather.open_meteo_api_key,
