@@ -1229,16 +1229,25 @@ class ResolutionSniper:
         """Attempt to discover contract mappings from Kalshi market tickers.
 
         Fetches open markets and matches tickers against known patterns
-        to create ContractMapping objects automatically.
+        to create ContractMapping objects automatically.  Also includes
+        markets from current portfolio positions so the sniper watches
+        contracts we already hold.
         """
         try:
-            markets = await self._client.get_all_markets(status="open", limit=100)
+            # Fetch a broader set of markets — weather/sports are spread
+            # across thousands of tickers, so 100 is insufficient.
+            markets = await self._client.get_all_markets(status="open", limit=1000)
         except Exception:
             logger.warning(
                 "sniper.auto_discover_failed",
                 exc_info=True,
             )
             return
+
+        logger.info(
+            "sniper.auto_discover_scan",
+            markets_fetched=len(markets),
+        )
 
         discovered = 0
         for market in markets:
@@ -1250,6 +1259,12 @@ class ResolutionSniper:
                 self._mappings[mapping.ticker] = mapping
                 discovered += 1
 
+        logger.info(
+            "sniper.auto_discover_result",
+            markets_scanned=len(markets),
+            new_mappings=discovered,
+            total_mappings=len(self._mappings),
+        )
         if discovered:
             logger.info(
                 "sniper.auto_discovered",
