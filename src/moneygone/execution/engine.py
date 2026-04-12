@@ -250,6 +250,10 @@ class ExecutionEngine:
             self._risk._drawdown.track(equity)
             self._risk._drawdown.reset_peak_to_current()
 
+            # Reset daily P&L so settlements from previous days that get
+            # replayed at startup don't count against today's limit.
+            self._risk.reset_daily_pnl()
+
             if cash <= 0:
                 logger.critical(
                     "engine.ZERO_BANKROLL",
