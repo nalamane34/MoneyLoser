@@ -299,9 +299,29 @@ class ESPNLiveFeed:
             interval=interval,
         )
 
+        # First poll is warmup: populate previous states without emitting
+        # outcome signals.  Otherwise every already-final game triggers a
+        # false "newly final" signal on startup.
+        warmed_up = False
+
         while True:
             try:
                 games = await self.get_live_scores(sport, league)
+
+                if not warmed_up:
+                    for game in games:
+                        self._previous_states[game.game_id] = game
+                    warmed_up = True
+                    logger.info(
+                        "espn.warmup_complete",
+                        sport=sport,
+                        league=league,
+                        games=len(games),
+                        already_final=sum(1 for g in games if g.is_final),
+                    )
+                    await asyncio.sleep(interval)
+                    continue
+
                 changed: list[GameState] = []
                 new_outcomes: list[OutcomeSignal] = []
 
