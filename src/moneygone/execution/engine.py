@@ -1196,7 +1196,7 @@ class ExecutionEngine:
                 cycle_evaluated = len(eligible_tickers)
 
                 # Evaluate markets concurrently with bounded parallelism
-                sem = asyncio.Semaphore(8)
+                sem = asyncio.Semaphore(20)
 
                 async def _eval_one(t: str) -> object | None:
                     async with sem:
@@ -1418,8 +1418,12 @@ class ExecutionEngine:
             category_counts["sports"] = len(matched)
 
         # Phase 2: Other categories — use pre-classified data
-        # Only watch markets with minimum liquidity (volume > 0, has bid/ask)
+        # Only watch markets that are liquid, have a category provider,
+        # and close within a reasonable timeframe.  This keeps the watched
+        # set under ~2000 markets so eval cycles complete in minutes, not
+        # hours.
         skipped = 0
+        max_expiry_hours = 720  # 30 days — skip far-future markets
         for market, category in classified:
             if market.ticker in self._market_cache:
                 continue  # Already matched as sports
@@ -1431,6 +1435,13 @@ class ExecutionEngine:
             if market.volume < 10 or market.yes_bid <= 0 or market.yes_ask <= 0:
                 skipped += 1
                 continue
+
+            # Skip far-future markets that won't resolve soon
+            if market.close_time is not None:
+                hours_to_close = (market.close_time - now).total_seconds() / 3600
+                if hours_to_close > max_expiry_hours:
+                    skipped += 1
+                    continue
 
             self._market_cache[market.ticker] = market
             self._market_categories[market.ticker] = category
