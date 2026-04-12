@@ -727,6 +727,13 @@ class ResolutionSniper:
                 exc_info=True,
             )
 
+        # Force portfolio sync after every order attempt so cash is
+        # accurate for subsequent snipes in the same scan cycle.
+        try:
+            await self._portfolio.sync_with_exchange(self._client)
+        except Exception:
+            logger.debug("sniper.post_order_sync_failed", exc_info=True)
+
         fills = [
             fill
             for fill in fills

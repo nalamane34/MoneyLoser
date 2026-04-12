@@ -1156,8 +1156,10 @@ class ExecutionEngine:
                 await self._maybe_reconcile_open_orders()
                 await self._cancel_stale_open_orders()
 
-                # Sync portfolio with exchange every 2 minutes for fresh cash balance
-                if (datetime.now(timezone.utc) - self._last_portfolio_sync).total_seconds() >= 120:
+                # Sync portfolio with exchange periodically for fresh cash balance.
+                # Use shorter interval (30s) when cash is low to catch fills faster.
+                sync_interval = 30 if self._risk._portfolio.cash < 10 else 120
+                if (datetime.now(timezone.utc) - self._last_portfolio_sync).total_seconds() >= sync_interval:
                     try:
                         await self._risk._portfolio.sync_with_exchange(self._rest)
                         self._last_portfolio_sync = datetime.now(timezone.utc)
