@@ -124,7 +124,7 @@ risk:
   max_position_per_market: 10
   max_position_per_category_pct: 0.05
   max_total_exposure_pct: 0.10
-  daily_loss_limit_pct: 0.01
+  daily_loss_limit_pct: 0.25
   max_drawdown_pct: 0.05
   min_contract_price: 0.20
   max_contract_price: 0.95
