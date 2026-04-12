@@ -1226,23 +1226,58 @@ class ResolutionSniper:
     # ------------------------------------------------------------------
 
     async def _auto_discover_mappings(self) -> None:
-        """Attempt to discover contract mappings from Kalshi market tickers.
+        """Discover contract mappings by scanning sports and weather markets.
 
-        Fetches open markets and matches tickers against known patterns
-        to create ContractMapping objects automatically.  Also includes
-        markets from current portfolio positions so the sniper watches
-        contracts we already hold.
+        Focuses on the categories that the sniper can actually resolve:
+        sports (live game outcomes) and weather (NOAA observations).
+        Uses series_ticker prefixes to target relevant markets instead
+        of scanning all 38k+ open markets.
         """
-        try:
-            # Fetch a broader set of markets — weather/sports are spread
-            # across thousands of tickers, so 100 is insufficient.
-            markets = await self._client.get_all_markets(status="open", limit=1000)
-        except Exception:
-            logger.warning(
-                "sniper.auto_discover_failed",
-                exc_info=True,
-            )
-            return
+        # Snipeable prefixes — sports match results and weather observations
+        _SPORT_PREFIXES = [
+            "KXNBA", "KXNHL", "KXMLB", "KXMLS", "KXUFC",
+            "KXEPL", "KXLALIGA", "KXBUNDESLIGA", "KXSERIEA", "KXLIGUE1",
+        ]
+        _WEATHER_PREFIXES = [
+            "KXHIGHT", "KXHIGHNY", "KXHIGHCHI", "KXHIGHLA",
+            "KXLOWT", "KXLOWNY", "KXLOWCHI", "KXLOWLA",
+            "KXTEMP", "KXRAIN",
+        ]
+
+        markets: list[Any] = []
+        for prefix in _SPORT_PREFIXES + _WEATHER_PREFIXES:
+            try:
+                batch = await self._client.get_all_markets(
+                    status="open",
+                    series_ticker=prefix,
+                    limit=200,
+                    max_pages=2,
+                )
+                markets.extend(batch)
+            except Exception:
+                logger.debug("sniper.prefix_scan_failed", prefix=prefix, exc_info=True)
+
+        # Also fetch by category if the API supports it
+        for category in ("sports", "weather"):
+            try:
+                batch = await self._client.get_all_markets(
+                    status="open",
+                    category=category,
+                    limit=200,
+                    max_pages=5,
+                )
+                markets.extend(batch)
+            except Exception:
+                logger.debug("sniper.category_scan_failed", category=category, exc_info=True)
+
+        # Deduplicate by ticker
+        seen: set[str] = set()
+        unique_markets = []
+        for m in markets:
+            if m.ticker not in seen:
+                seen.add(m.ticker)
+                unique_markets.append(m)
+        markets = unique_markets
 
         logger.info(
             "sniper.auto_discover_scan",
