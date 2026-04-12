@@ -127,9 +127,10 @@ class DataStore:
         Use :meth:`create_attached_views` to create local views that
         transparently redirect queries to attached tables.
 
-        Retries on lock conflicts since the writer process only holds
-        the lock briefly during flushes.
+        If the file is locked by another process, falls back to copying
+        the DB to a temporary file and attaching the copy.
         """
+        import shutil
         import time
 
         p = Path(db_path)
@@ -152,6 +153,26 @@ class DataStore:
                         wait=wait,
                     )
                     time.sleep(wait)
+                elif "lock" in str(exc).lower():
+                    # Final attempt: copy the DB file and attach the copy
+                    try:
+                        copy_path = p.with_suffix(".readonly_copy.duckdb")
+                        shutil.copy2(str(p), str(copy_path))
+                        self._conn.execute(f"ATTACH '{copy_path}' AS {name} (READ_ONLY)")
+                        logger.info(
+                            "datastore.attached_via_copy",
+                            name=name,
+                            original=str(p),
+                            copy=str(copy_path),
+                        )
+                        return
+                    except Exception as copy_exc:
+                        logger.warning(
+                            "datastore.attach_copy_failed",
+                            name=name,
+                            error=str(copy_exc),
+                        )
+                        raise exc
                 else:
                     raise
 
