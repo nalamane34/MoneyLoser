@@ -15,6 +15,7 @@ import structlog
 
 from moneygone.config import RiskConfig
 from moneygone.exchange.types import Fill, Settlement
+from moneygone.risk.capital_governor import CapitalGovernor
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
 from moneygone.risk.portfolio import PortfolioTracker
@@ -76,6 +77,20 @@ class RiskSummary:
     """True if drawdown circuit breaker is triggered."""
 
 
+@dataclass(frozen=True)
+class CapitalView:
+    """Live capital inputs shared across engine and closer strategies."""
+
+    bankroll: Decimal
+    current_equity: Decimal
+    available_cash: Decimal
+    total_exposure: Decimal
+    reserved_exposure: Decimal
+    equity_source: str
+    paused: bool
+    pause_reasons: dict[str, str]
+
+
 class RiskManager:
     """Orchestrates all risk checks and portfolio updates.
 
@@ -103,6 +118,7 @@ class RiskManager:
         drawdown_monitor: DrawdownMonitor,
         exposure_calculator: ExposureCalculator,
         categories: dict[str, str] | None = None,
+        capital_governor: CapitalGovernor | None = None,
     ) -> None:
         self._config = risk_config
         self._limits = risk_limits
@@ -110,6 +126,7 @@ class RiskManager:
         self._drawdown = drawdown_monitor
         self._exposure = exposure_calculator
         self._categories = categories or {}
+        self._capital = capital_governor
         self._daily_pnl = _ZERO
         self._last_realized_pnl = self._portfolio.realized_pnl
         self._session_date: date = datetime.now(timezone.utc).date()
@@ -134,6 +151,18 @@ class RiskManager:
         RiskCheckResult
             Approved (possibly with adjusted size) or rejected.
         """
+        if self.is_trading_paused():
+            pause_reasons = self.pause_reasons
+            pause_text = "; ".join(
+                f"{source}: {reason}" for source, reason in sorted(pause_reasons.items())
+            )
+            return RiskCheckResult(
+                approved=False,
+                adjusted_size=None,
+                rejection_reason=f"Trading paused -- {pause_text}",
+                limit_triggered="global_trading_pause",
+            )
+
         # 1. Circuit breaker check
         if self.check_circuit_breakers():
             return RiskCheckResult(
@@ -193,7 +222,7 @@ class RiskManager:
         self._portfolio.on_fill(fill)
 
         # Update drawdown tracking
-        equity = self._portfolio.get_equity()
+        equity = self.get_capital_view().current_equity
         self._drawdown.track(equity)
 
         self._sync_daily_pnl_from_portfolio()
@@ -209,7 +238,7 @@ class RiskManager:
         """Update all risk state after a market settlement is received."""
         self._portfolio.on_settlement(settlement)
 
-        equity = self._portfolio.get_equity()
+        equity = self.get_capital_view().current_equity
         self._drawdown.track(equity)
         self._sync_daily_pnl_from_portfolio()
 
@@ -271,12 +300,22 @@ class RiskManager:
             tail_exposure = self._exposure.compute_tail_exposure(
                 positions, market_prices
             )
+            available_cash = self.get_capital_view().available_cash
+            reserved_snapshot = (
+                self._capital.snapshot() if self._capital is not None else None
+            )
+            if reserved_snapshot is not None:
+                total_exposure += reserved_snapshot.total_reserved
+                tail_exposure += reserved_snapshot.tail_reserved
+                for category, dollars in reserved_snapshot.reserved_by_category.items():
+                    cat_exposure[category] = cat_exposure.get(category, _ZERO) + dollars
         else:
             portfolio_state = self._build_portfolio_state()
             equity = portfolio_state.current_equity
             total_exposure = portfolio_state.total_exposure
             cat_exposure = portfolio_state.category_exposure
             tail_exposure = portfolio_state.tail_exposure
+            available_cash = portfolio_state.available_cash
 
         exposure_pct = (
             float(total_exposure / equity) if equity > _ZERO else 0.0
@@ -287,7 +326,7 @@ class RiskManager:
 
         return RiskSummary(
             total_equity=equity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-            cash=self._portfolio.cash.quantize(
+            cash=available_cash.quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             ),
             total_exposure=total_exposure.quantize(
@@ -310,6 +349,93 @@ class RiskManager:
             ),
             circuit_breaker_active=self.check_circuit_breakers(),
         )
+
+    def get_capital_view(self) -> CapitalView:
+        """Return the current shared capital view for sizing and execution."""
+        portfolio_state = self._build_portfolio_state()
+        snapshot = (
+            self._capital.snapshot() if self._capital is not None else None
+        )
+        equity_snapshot = self._portfolio.get_effective_equity_snapshot()
+        return CapitalView(
+            bankroll=portfolio_state.bankroll,
+            current_equity=portfolio_state.current_equity,
+            available_cash=portfolio_state.available_cash,
+            total_exposure=portfolio_state.total_exposure,
+            reserved_exposure=portfolio_state.reserved_exposure,
+            equity_source=equity_snapshot.source,
+            paused=bool(snapshot and snapshot.paused),
+            pause_reasons=dict(snapshot.pause_reasons) if snapshot else {},
+        )
+
+    def reserve_trade_intent(
+        self,
+        key: str,
+        *,
+        owner: str,
+        ticker: str,
+        category: str,
+        contracts: int,
+        price: Decimal,
+    ) -> bool:
+        """Reserve capital for a strategy before an order is submitted."""
+        if self._capital is None:
+            return True
+        available_cash = self.get_capital_view().available_cash
+        return self._capital.reserve_intent(
+            key,
+            owner=owner,
+            ticker=ticker,
+            category=category or "unknown",
+            contracts=contracts,
+            price=price,
+            available_cash=available_cash,
+        )
+
+    def release_trade_intent(self, key: str) -> None:
+        """Release a previously reserved order intent."""
+        if self._capital is None:
+            return
+        self._capital.release(key)
+
+    def sync_open_order_reservations(
+        self,
+        orders: list,
+        *,
+        category_lookup: dict[str, str] | None = None,
+    ) -> None:
+        """Rebuild reserved capital from the currently tracked open orders."""
+        if self._capital is None:
+            return
+        merged_lookup = dict(self._categories)
+        if category_lookup:
+            merged_lookup.update(category_lookup)
+        self._capital.sync_open_orders(orders, category_lookup=merged_lookup)
+
+    def pause_trading(self, source: str, reason: str) -> None:
+        """Pause all new trading from all strategy paths."""
+        if self._capital is None:
+            return
+        self._capital.pause_trading(source, reason)
+
+    def resume_trading(self, source: str) -> None:
+        """Resume trading for a previously paused source."""
+        if self._capital is None:
+            return
+        self._capital.resume_trading(source)
+
+    def is_trading_paused(self) -> bool:
+        """Return True when any shared pause source is active."""
+        if self._capital is None:
+            return False
+        return self._capital.snapshot().paused
+
+    @property
+    def pause_reasons(self) -> dict[str, str]:
+        """Current shared trading pause reasons."""
+        if self._capital is None:
+            return {}
+        return self._capital.snapshot().pause_reasons
 
     # ------------------------------------------------------------------
     # Helpers
@@ -334,21 +460,45 @@ class RiskManager:
                 if no_avg_cost < _TAIL_LOW or no_avg_cost > _TAIL_HIGH:
                     tail_exposure += pos.no_cost_basis
 
-        equity = self._portfolio.get_equity()
+        reserved_snapshot = (
+            self._capital.snapshot() if self._capital is not None else None
+        )
+        category_exposure = self._portfolio.get_exposure_by_category(
+            self._categories
+        )
+        total_exposure = self._portfolio.get_total_exposure()
+        available_cash = self._portfolio.cash
+        if reserved_snapshot is not None:
+            for ticker, contracts in reserved_snapshot.reserved_contracts_by_ticker.items():
+                gross_positions[ticker] = gross_positions.get(ticker, 0) + contracts
+            for category, dollars in reserved_snapshot.reserved_by_category.items():
+                category_exposure[category] = (
+                    category_exposure.get(category, _ZERO) + dollars
+                )
+            total_exposure += reserved_snapshot.total_reserved
+            tail_exposure += reserved_snapshot.tail_reserved
+            available_cash = max(_ZERO, available_cash - reserved_snapshot.total_reserved)
+
+        equity_snapshot = self._portfolio.get_effective_equity_snapshot()
+        equity = equity_snapshot.equity
 
         return PortfolioState(
             positions=positions,
             gross_positions=gross_positions,
             position_costs=position_costs,
-            category_exposure=self._portfolio.get_exposure_by_category(
-                self._categories
-            ),
-            total_exposure=self._portfolio.get_total_exposure(),
+            category_exposure=category_exposure,
+            total_exposure=total_exposure,
             bankroll=equity,
             daily_pnl=self._daily_pnl,
             peak_equity=self._drawdown.peak_equity,
             current_equity=equity,
             tail_exposure=tail_exposure,
+            available_cash=available_cash,
+            reserved_exposure=(
+                reserved_snapshot.total_reserved
+                if reserved_snapshot is not None
+                else _ZERO
+            ),
         )
 
     def _get_category_tickers(self) -> dict[str, list[str]]:

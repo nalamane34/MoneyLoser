@@ -8,6 +8,7 @@ method to reconcile with the exchange's authoritative state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import structlog
@@ -24,6 +25,18 @@ logger = structlog.get_logger(__name__)
 
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
+
+
+@dataclass(frozen=True)
+class EquitySnapshot:
+    """Conservative equity estimate used for live capital decisions."""
+
+    equity: Decimal
+    source: str
+    exchange_total: Decimal | None = None
+    marked_equity: Decimal | None = None
+    proxy_equity: Decimal = _ZERO
+    mark_coverage: float = 0.0
 
 
 @dataclass
@@ -66,6 +79,10 @@ class PortfolioTracker:
         self._positions: dict[str, LocalPosition] = {}
         self._cash: Decimal = initial_cash
         self._realized_pnl: Decimal = _ZERO
+        self._last_exchange_total: Decimal | None = None
+        self._last_exchange_sync_time: datetime | None = None
+        self._realized_pnl_at_exchange_sync: Decimal = _ZERO
+        self._mark_prices: dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -259,6 +276,96 @@ class PortfolioTracker:
             unrealized += yes_value + no_value
         return self._cash + unrealized
 
+    def update_market_price(self, ticker: str, yes_price: Decimal) -> None:
+        """Update the latest YES-side mark for a market."""
+        if yes_price < _ZERO or yes_price > _ONE:
+            return
+        self._mark_prices[ticker] = yes_price
+
+    def update_market_prices(self, market_prices: dict[str, Decimal]) -> None:
+        """Bulk update mark prices for multiple markets."""
+        for ticker, yes_price in market_prices.items():
+            self.update_market_price(ticker, yes_price)
+
+    def get_effective_equity_snapshot(self) -> EquitySnapshot:
+        """Return the most conservative live equity estimate available."""
+        proxy_equity = self.get_equity()
+        marked_equity, mark_coverage = self._get_marked_equity_if_complete()
+        exchange_total = self._get_adjusted_exchange_total()
+
+        if exchange_total is not None and marked_equity is not None:
+            if marked_equity <= exchange_total:
+                return EquitySnapshot(
+                    equity=marked_equity,
+                    source="mark_to_market",
+                    exchange_total=exchange_total,
+                    marked_equity=marked_equity,
+                    proxy_equity=proxy_equity,
+                    mark_coverage=mark_coverage,
+                )
+            return EquitySnapshot(
+                equity=exchange_total,
+                source="exchange_total",
+                exchange_total=exchange_total,
+                marked_equity=marked_equity,
+                proxy_equity=proxy_equity,
+                mark_coverage=mark_coverage,
+            )
+
+        if exchange_total is not None:
+            return EquitySnapshot(
+                equity=exchange_total,
+                source="exchange_total",
+                exchange_total=exchange_total,
+                marked_equity=None,
+                proxy_equity=proxy_equity,
+                mark_coverage=mark_coverage,
+            )
+
+        if marked_equity is not None:
+            return EquitySnapshot(
+                equity=marked_equity,
+                source="mark_to_market",
+                exchange_total=None,
+                marked_equity=marked_equity,
+                proxy_equity=proxy_equity,
+                mark_coverage=mark_coverage,
+            )
+
+        return EquitySnapshot(
+            equity=proxy_equity,
+            source="cost_basis_proxy",
+            exchange_total=None,
+            marked_equity=None,
+            proxy_equity=proxy_equity,
+            mark_coverage=mark_coverage,
+        )
+
+    def _get_marked_equity_if_complete(self) -> tuple[Decimal | None, float]:
+        active_tickers = [
+            ticker
+            for ticker, pos in self._positions.items()
+            if not pos.is_flat
+        ]
+        if not active_tickers:
+            return (self._cash, 1.0)
+
+        marked_tickers = [
+            ticker for ticker in active_tickers if ticker in self._mark_prices
+        ]
+        coverage = len(marked_tickers) / len(active_tickers)
+        if len(marked_tickers) != len(active_tickers):
+            return (None, coverage)
+        return (self.get_marked_equity(self._mark_prices), coverage)
+
+    def _get_adjusted_exchange_total(self) -> Decimal | None:
+        if self._last_exchange_total is None:
+            return None
+        adjusted = self._last_exchange_total + (
+            self._realized_pnl - self._realized_pnl_at_exchange_sync
+        )
+        return max(adjusted, self._cash)
+
     async def sync_with_exchange(self, rest_client: object) -> None:
         """Reconcile local state with exchange positions.
 
@@ -329,6 +436,12 @@ class PortfolioTracker:
                     exchange=str(exchange_cash),
                 )
                 self._cash = exchange_cash
+
+            exchange_total = getattr(balance, "total", None)  # type: ignore[attr-defined]
+            if exchange_total is not None:
+                self._last_exchange_total = exchange_total
+                self._last_exchange_sync_time = datetime.now(timezone.utc)
+                self._realized_pnl_at_exchange_sync = self._realized_pnl
 
             logger.info("portfolio_synced", n_positions=len(self._positions))
 

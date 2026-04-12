@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from moneygone.exchange.rest_client import KalshiRestClient
     from moneygone.execution.fill_tracker import FillTracker
     from moneygone.execution.order_manager import OrderManager
+    from moneygone.risk.manager import RiskManager
     from moneygone.signals.fees import KalshiFeeCalculator
 
 logger = structlog.get_logger(__name__)
@@ -224,6 +225,7 @@ class ResolutionSniper:
         config: SnipeConfig | None = None,
         fill_tracker: FillTracker | None = None,
         portfolio: PortfolioTracker | None = None,
+        risk_manager: RiskManager | None = None,
     ) -> None:
         self._client = rest_client
         self._order_manager = order_manager
@@ -231,6 +233,7 @@ class ResolutionSniper:
         self._config = config or SnipeConfig()
         self._fill_tracker = fill_tracker
         self._portfolio = portfolio
+        self._risk = risk_manager
         self._mappings: dict[str, ContractMapping] = {
             m.ticker: m for m in (contract_mappings or [])
         }
@@ -666,6 +669,28 @@ class ResolutionSniper:
             expected_profit=str(opportunity.expected_profit),
         )
 
+        reservation_key = (
+            f"sniper:{opportunity.ticker}:{opportunity.detected_at.isoformat()}:"
+            f"{side.value}"
+        )
+        if self._risk is not None:
+            reserved = self._risk.reserve_trade_intent(
+                reservation_key,
+                owner="sniper",
+                ticker=opportunity.ticker,
+                category=self._category_for_ticker(opportunity.ticker),
+                contracts=contracts,
+                price=price,
+            )
+            if not reserved:
+                logger.warning(
+                    "sniper.capital_reservation_rejected",
+                    ticker=opportunity.ticker,
+                    contracts=contracts,
+                    price=str(price),
+                )
+                return None
+
         try:
             order = await self._order_manager.submit_order(request)
         except Exception:
@@ -675,6 +700,20 @@ class ResolutionSniper:
                 exc_info=True,
             )
             return None
+        finally:
+            if self._risk is not None:
+                self._risk.release_trade_intent(reservation_key)
+
+        if self._risk is not None:
+            try:
+                self._risk.sync_open_order_reservations(
+                    self._order_manager.get_open_orders(),
+                    category_lookup={
+                        opportunity.ticker: self._category_for_ticker(opportunity.ticker)
+                    },
+                )
+            except Exception:
+                logger.warning("sniper.capital_sync_failed", ticker=opportunity.ticker, exc_info=True)
 
         # Attempt to get the fill for this order.
         fill: Fill | None = None
@@ -1047,6 +1086,20 @@ class ResolutionSniper:
 
     def _should_execute(self, opp: SnipeOpportunity) -> bool:
         """Determine whether an opportunity should be executed."""
+        if self._risk is not None and self._risk.check_circuit_breakers():
+            logger.warning(
+                "sniper.circuit_breaker_active",
+                ticker=opp.ticker,
+            )
+            return False
+        if self._risk is not None and self._risk.is_trading_paused():
+            logger.warning(
+                "sniper.global_pause_active",
+                ticker=opp.ticker,
+                reasons=self._risk.pause_reasons,
+            )
+            return False
+
         if not opp.outcome_known:
             return False
 
@@ -1112,7 +1165,10 @@ class ResolutionSniper:
         if price_f <= 0:
             return 0
 
-        cash = float(self._portfolio.cash) if self._portfolio is not None else 0.0
+        if self._risk is not None:
+            cash = float(self._risk.get_capital_view().available_cash)
+        else:
+            cash = float(self._portfolio.cash) if self._portfolio is not None else 0.0
         # Keep 10% reserve so we don't drain the account completely
         usable_cash = cash * 0.9
         if usable_cash <= 0:
@@ -1158,6 +1214,12 @@ class ResolutionSniper:
             )
         except Exception:
             logger.warning("sniper.portfolio_sync_failed", exc_info=True)
+
+    def _category_for_ticker(self, ticker: str) -> str:
+        mapping = self._mappings.get(ticker)
+        if mapping is None:
+            return "unknown"
+        return mapping.category
 
     # ------------------------------------------------------------------
     # Auto-discovery

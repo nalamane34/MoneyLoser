@@ -1495,22 +1495,15 @@ class LiveEventEdge:
                 rejection_reason="Edge not actionable after orderbook check",
             )
 
-        # Get portfolio state for sizing
-        try:
-            balance = await self._client.get_balance()
-            bankroll = balance.total
-        except Exception:
-            log.warning("live_edge.balance_error", exc_info=True)
-            return None
-
-        risk_summary = self._risk.get_risk_summary()
+        capital_view = self._risk.get_capital_view()
+        bankroll = capital_view.bankroll
 
         # Size the position
         size_result = self._sizer.size(
             edge_result=edge_result,
             bankroll=bankroll,
             model_confidence=signal.confidence,
-            existing_exposure=risk_summary.total_exposure,
+            existing_exposure=capital_view.total_exposure,
             regime_adjustment=1.0,  # live events always trade in any regime
         )
 
@@ -1589,6 +1582,14 @@ class LiveEventEdge:
         if not decision.should_trade or decision.contracts <= 0:
             return
 
+        if self._risk.is_trading_paused():
+            log.warning(
+                "live_edge.global_pause_active",
+                ticker=signal.ticker,
+                reasons=self._risk.pause_reasons,
+            )
+            return
+
         # Mark the ticker to avoid duplicate trades
         self._traded_tickers.add(signal.ticker)
 
@@ -1627,6 +1628,29 @@ class LiveEventEdge:
             edge=round(signal.edge, 4),
             reasoning=signal.reasoning,
         )
+
+        reservation_key = (
+            f"live_edge:{signal.ticker}:{signal.detected_at.isoformat()}:"
+            f"{decision.side}"
+        )
+        reserved = self._risk.reserve_trade_intent(
+            reservation_key,
+            owner="live_edge",
+            ticker=signal.ticker,
+            category=signal.category,
+            contracts=decision.contracts,
+            price=decision.price,
+        )
+        if not reserved:
+            log.warning(
+                "live_edge.capital_reservation_rejected",
+                ticker=signal.ticker,
+                category=signal.category,
+                contracts=decision.contracts,
+                price=str(decision.price),
+            )
+            self._traded_tickers.discard(signal.ticker)
+            return
 
         try:
             order = await self._orders.submit_order(request)
@@ -1681,6 +1705,16 @@ class LiveEventEdge:
             )
             # Remove from traded set so we can retry
             self._traded_tickers.discard(signal.ticker)
+        finally:
+            self._risk.release_trade_intent(reservation_key)
+
+        try:
+            self._risk.sync_open_order_reservations(
+                self._orders.get_open_orders(),
+                category_lookup={signal.ticker: signal.category},
+            )
+        except Exception:
+            log.warning("live_edge.capital_sync_failed", ticker=signal.ticker, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

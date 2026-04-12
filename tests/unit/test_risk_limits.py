@@ -26,11 +26,13 @@ def _make_portfolio(
     daily_pnl: str = "0",
     peak_equity: str = "10000",
     current_equity: str = "10000",
+    available_cash: str | None = None,
     positions: dict[str, int] | None = None,
     gross_positions: dict[str, int] | None = None,
     category_exposure: dict[str, str] | None = None,
     total_exposure: str = "0",
     tail_exposure: str = "0",
+    reserved_exposure: str = "0",
 ) -> PortfolioState:
     return PortfolioState(
         positions=positions or {},
@@ -45,6 +47,8 @@ def _make_portfolio(
         peak_equity=Decimal(peak_equity),
         current_equity=Decimal(current_equity),
         tail_exposure=Decimal(tail_exposure),
+        available_cash=Decimal(available_cash or bankroll),
+        reserved_exposure=Decimal(reserved_exposure),
     )
 
 
@@ -110,6 +114,23 @@ class TestRiskLimits:
 
         assert not result.approved
         assert result.limit_triggered == "daily_loss_limit"
+
+    def test_available_cash_rejects_overcommitted_trade(
+        self, risk_config: RiskConfig
+    ) -> None:
+        limits = RiskLimits(risk_config)
+        trade = _make_trade(contracts=10, price="0.50")
+        portfolio = _make_portfolio(
+            bankroll="100",
+            available_cash="3",
+            reserved_exposure="20",
+        )
+
+        result = limits.check(trade, portfolio)
+
+        assert result.approved
+        assert result.adjusted_size == 6
+        assert result.limit_triggered == "available_cash"
 
     def test_rejected_tail_contract(self, risk_config: RiskConfig) -> None:
         """Contracts priced below min_contract_price should be rejected."""

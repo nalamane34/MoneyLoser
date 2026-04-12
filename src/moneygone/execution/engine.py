@@ -250,10 +250,12 @@ class ExecutionEngine:
             )
 
         await self._maybe_reconcile_open_orders(force=True)
+        self._sync_reserved_capital()
         await self._cancel_stale_open_orders()
 
         self._ws.set_on_event(self.on_event)
         await self._refresh_market_universe(force=True)
+        self._sync_reserved_capital()
         self._initialize_shared_market_data_sync()
 
         # Connect WebSocket and subscribe to essential channels only.
@@ -378,6 +380,7 @@ class ExecutionEngine:
 
         # Update order manager
         self._orders.on_fill(fill)
+        self._sync_reserved_capital()
 
         # Update risk state (portfolio, drawdown, etc.)
         self._risk.post_trade_update(fill)
@@ -643,6 +646,16 @@ class ExecutionEngine:
         cat_str = category.value
         candidate_ctx = self._candidate_context_fields(ticker, cycle_id=cycle_id)
 
+        if self._risk.is_trading_paused():
+            self._log_candidate(
+                ticker=ticker,
+                category=cat_str,
+                status="rejected",
+                reject_reason="global_trading_pause",
+                **candidate_ctx,
+            )
+            return None
+
         self._refresh_market_cache_from_shared_store(ticker, now)
 
         if any(order.ticker == ticker for order in self._orders.get_open_orders()):
@@ -688,6 +701,8 @@ class ExecutionEngine:
                     **candidate_ctx,
                 )
                 return None
+        if orderbook.mid_price is not None:
+            self._record_market_mark(ticker, orderbook.mid_price)
 
         # Compute spread from orderbook
         market_obj = self._market_cache.get(ticker)
@@ -878,8 +893,9 @@ class ExecutionEngine:
             return None
 
         # 6. Size the position
-        bankroll = self._risk._portfolio.get_equity()
-        existing_exposure = self._risk._portfolio.get_total_exposure()  # type: ignore[attr-defined]
+        capital_view = self._risk.get_capital_view()
+        bankroll = capital_view.bankroll
+        existing_exposure = capital_view.total_exposure
 
         size = self._sizer.size(
             edge_result=edge,
@@ -1027,6 +1043,14 @@ class ExecutionEngine:
                 )
                 return
 
+        if self._risk.is_trading_paused():
+            logger.warning(
+                "engine.order_blocked_global_pause",
+                ticker=decision.ticker,
+                pause_reasons=self._risk.pause_reasons,
+            )
+            return
+
         orderbook = self._ws.get_orderbook(decision.ticker)
         if orderbook is None:
             orderbook = self._get_orderbook_from_shared_store(
@@ -1044,9 +1068,32 @@ class ExecutionEngine:
                 ticker=decision.ticker,
             )
             return
+        if orderbook.mid_price is not None:
+            self._record_market_mark(decision.ticker, orderbook.mid_price)
 
         # Record submission for fill-rate tracking
         self._fills.record_submission()
+        reservation_key = (
+            f"engine:{decision.ticker}:{decision.timestamp.isoformat()}:"
+            f"{decision.edge_result.side}:{decision.edge_result.action}"
+        )
+        reserved = self._risk.reserve_trade_intent(
+            reservation_key,
+            owner="engine",
+            ticker=decision.ticker,
+            category=decision.category or "unknown",
+            contracts=decision.size_result.contracts,
+            price=decision.edge_result.target_price,
+        )
+        if not reserved:
+            logger.warning(
+                "engine.capital_reservation_rejected",
+                ticker=decision.ticker,
+                category=decision.category,
+                contracts=decision.size_result.contracts,
+                price=str(decision.edge_result.target_price),
+            )
+            return
 
         try:
             order = await self._strategy.execute(
@@ -1065,7 +1112,14 @@ class ExecutionEngine:
                 subaccount=getattr(self._rest, "_subaccount", 0),
                 error=str(exc),
             )
+            self._risk.release_trade_intent(reservation_key)
             return
+        except Exception:
+            self._risk.release_trade_intent(reservation_key)
+            raise
+        finally:
+            self._sync_reserved_capital()
+            self._risk.release_trade_intent(reservation_key)
 
         if order is not None:
             self._decision_context[order.order_id] = decision
@@ -1427,6 +1481,7 @@ class ExecutionEngine:
                 cancelled += 1
                 if confirmed_closed:
                     cancelled_tickers.append(order.ticker)
+                self._sync_reserved_capital()
             except Exception:
                 logger.warning(
                     "engine.cancel_stale_order_failed",
@@ -1801,6 +1856,7 @@ class ExecutionEngine:
 
         try:
             await self._orders.reconcile()
+            self._sync_reserved_capital()
             self._last_order_reconcile = now
             logger.info(
                 "engine.orders_reconciled",
@@ -2007,6 +2063,7 @@ class ExecutionEngine:
             )
             if market is not None:
                 self._market_cache[market.ticker] = market
+                self._record_market_mark(market.ticker, market.last_price)
 
             if latest_time is None or ingested_at > latest_time:
                 latest_time = ingested_at
@@ -2046,6 +2103,8 @@ class ExecutionEngine:
             )
             if snapshot is not None:
                 self._shared_orderbook_cache[snapshot.ticker] = snapshot
+                if snapshot.mid_price is not None:
+                    self._record_market_mark(snapshot.ticker, snapshot.mid_price)
 
             if latest_time is None or ingested_at > latest_time:
                 latest_time = ingested_at
@@ -2078,6 +2137,7 @@ class ExecutionEngine:
         market = self._merge_market_update(ticker, row, as_of)
         if market is not None:
             self._market_cache[ticker] = market
+            self._record_market_mark(ticker, market.last_price)
 
     def _get_orderbook_from_shared_store(
         self,
@@ -2110,7 +2170,41 @@ class ExecutionEngine:
             return None
         if (as_of - snapshot.timestamp).total_seconds() > 5.0:
             return None
+        if snapshot.mid_price is not None:
+            self._record_market_mark(ticker, snapshot.mid_price)
         return snapshot
+
+    def _record_market_mark(self, ticker: str, yes_price: Decimal | None) -> None:
+        if yes_price is None:
+            return
+        risk = getattr(self, "_risk", None)
+        portfolio = getattr(risk, "_portfolio", None)
+        if portfolio is None or not hasattr(portfolio, "update_market_price"):
+            return
+        positions = getattr(portfolio, "positions", {})
+        open_orders_getter = getattr(getattr(self, "_orders", None), "get_open_orders", None)
+        open_orders = open_orders_getter() if callable(open_orders_getter) else []
+        if (
+            ticker not in positions
+            and not any(order.ticker == ticker for order in open_orders)
+        ):
+            return
+        try:
+            portfolio.update_market_price(ticker, yes_price)
+        except Exception:
+            logger.debug("engine.market_mark_update_failed", ticker=ticker, exc_info=True)
+
+    def _sync_reserved_capital(self) -> None:
+        try:
+            self._risk.sync_open_order_reservations(
+                self._orders.get_open_orders(),
+                category_lookup={
+                    ticker: category.value
+                    for ticker, category in self._market_categories.items()
+                },
+            )
+        except Exception:
+            logger.debug("engine.reserved_capital_sync_failed", exc_info=True)
 
     def _build_orderbook_from_shared_row(
         self,

@@ -86,6 +86,12 @@ class PortfolioState:
     tail_exposure: Decimal = _ZERO
     """Existing tail-contract exposure in dollars."""
 
+    available_cash: Decimal = _ZERO
+    """Cash that remains unreserved and available for new orders."""
+
+    reserved_exposure: Decimal = _ZERO
+    """Capital currently reserved for pending or resting open orders."""
+
 
 # ---------------------------------------------------------------------------
 # Risk limits engine
@@ -121,6 +127,7 @@ class RiskLimits:
         """
         checks = [
             self._check_contract_price,
+            self._check_available_cash,
             self._check_daily_loss,
             self._check_drawdown,
             self._check_position_limit,
@@ -234,6 +241,42 @@ class RiskLimits:
                 limit_triggered="daily_loss_limit",
             )
         return _APPROVED
+
+    def _check_available_cash(
+        self,
+        proposed: ProposedTrade,
+        portfolio: PortfolioState,
+    ) -> RiskCheckResult:
+        """Ensure new orders fit inside currently available cash."""
+        trade_cost = Decimal(proposed.contracts) * proposed.price
+        if portfolio.available_cash <= _ZERO:
+            return RiskCheckResult(
+                approved=False,
+                adjusted_size=None,
+                rejection_reason="No available cash after reserved capital",
+                limit_triggered="available_cash",
+            )
+        if trade_cost <= portfolio.available_cash:
+            return _APPROVED
+
+        if proposed.price > _ZERO:
+            allowed = int(portfolio.available_cash / proposed.price)
+            if allowed > 0:
+                return RiskCheckResult(
+                    approved=True,
+                    adjusted_size=allowed,
+                    rejection_reason=None,
+                    limit_triggered="available_cash",
+                )
+        return RiskCheckResult(
+            approved=False,
+            adjusted_size=None,
+            rejection_reason=(
+                f"Trade cost {trade_cost} exceeds available cash "
+                f"{portfolio.available_cash}"
+            ),
+            limit_triggered="available_cash",
+        )
 
     def _check_drawdown(
         self,

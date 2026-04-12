@@ -9,6 +9,7 @@ from moneygone.config import RiskConfig
 from moneygone.monitoring.pnl import PnLTracker
 from moneygone.models.base import ModelPrediction
 from moneygone.exchange.types import Action, Fill, MarketResult, Settlement, Side
+from moneygone.risk.capital_governor import CapitalGovernor
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
 from moneygone.risk.manager import RiskManager
@@ -79,6 +80,7 @@ def _manager(
     risk_config: RiskConfig,
     *,
     initial_cash: str = "10",
+    capital_governor: CapitalGovernor | None = None,
 ) -> RiskManager:
     portfolio = PortfolioTracker(initial_cash=Decimal(initial_cash))
     return RiskManager(
@@ -88,6 +90,7 @@ def _manager(
         drawdown_monitor=DrawdownMonitor(),
         exposure_calculator=ExposureCalculator(),
         categories={},
+        capital_governor=capital_governor,
     )
 
 
@@ -371,3 +374,97 @@ def test_daily_pnl_uses_realized_delta_for_loss_checks(
 
     assert not result.approved
     assert result.limit_triggered == "daily_loss_limit"
+
+
+def test_effective_equity_prefers_conservative_exchange_total_after_sync() -> None:
+    portfolio = PortfolioTracker(initial_cash=Decimal("50"))
+    portfolio.on_fill(
+        _fill(
+            trade_id="buy-yes",
+            side=Side.YES,
+            action=Action.BUY,
+            count=10,
+            price="0.40",
+        )
+    )
+    portfolio.update_market_price("TEST-TICKER", Decimal("0.90"))
+    portfolio._last_exchange_total = Decimal("52.00")  # type: ignore[attr-defined]
+    portfolio._realized_pnl_at_exchange_sync = portfolio.realized_pnl  # type: ignore[attr-defined]
+
+    snapshot = portfolio.get_effective_equity_snapshot()
+
+    assert snapshot.equity == Decimal("52.00")
+    assert snapshot.source == "exchange_total"
+
+
+def test_risk_manager_includes_reserved_capital_in_available_cash(
+    risk_config: RiskConfig,
+) -> None:
+    governor = CapitalGovernor()
+    tuned_config = risk_config.model_copy(
+        update={
+            "max_position_per_market": 500,
+            "max_position_per_category_pct": 1.0,
+            "max_total_exposure_pct": 1.0,
+        }
+    )
+    manager = _manager(
+        tuned_config,
+        initial_cash="100",
+        capital_governor=governor,
+    )
+
+    reserved = manager.reserve_trade_intent(
+        "intent-1",
+        owner="engine",
+        ticker="TEST-TICKER",
+        category="weather",
+        contracts=10,
+        price=Decimal("0.50"),
+    )
+
+    assert reserved is True
+    view = manager.get_capital_view()
+    assert view.available_cash == Decimal("95.00")
+    assert view.reserved_exposure == Decimal("5.00")
+
+    result = manager.pre_trade_check(
+        ProposedTrade(
+            ticker="OTHER-TICKER",
+            category="weather",
+            side="yes",
+            action="buy",
+            contracts=200,
+            price=Decimal("0.50"),
+        )
+    )
+
+    assert result.approved
+    assert result.adjusted_size == 190
+    assert result.limit_triggered == "available_cash"
+
+
+def test_global_pause_blocks_pre_trade_checks(
+    risk_config: RiskConfig,
+) -> None:
+    governor = CapitalGovernor()
+    manager = _manager(
+        risk_config,
+        initial_cash="100",
+        capital_governor=governor,
+    )
+    manager.pause_trading("closer_kill_switch", "loss streak")
+
+    result = manager.pre_trade_check(
+        ProposedTrade(
+            ticker="TEST-TICKER",
+            category="sports",
+            side="yes",
+            action="buy",
+            contracts=1,
+            price=Decimal("0.50"),
+        )
+    )
+
+    assert not result.approved
+    assert result.limit_triggered == "global_trading_pause"

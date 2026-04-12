@@ -23,6 +23,22 @@ class _FakePortfolio:
         self.sync_calls += 1
 
 
+class _FakeRiskManager:
+    def __init__(self, *, available_cash: Decimal, paused: bool = False) -> None:
+        self.available_cash = available_cash
+        self.paused = paused
+        self.pause_reasons = {"test": "paused"} if paused else {}
+
+    def check_circuit_breakers(self) -> bool:
+        return False
+
+    def is_trading_paused(self) -> bool:
+        return self.paused
+
+    def get_capital_view(self):
+        return SimpleNamespace(available_cash=self.available_cash)
+
+
 def _opportunity(*, ticker: str = "KXTEST-YES", price: str = "0.80") -> SnipeOpportunity:
     return SnipeOpportunity(
         ticker=ticker,
@@ -75,3 +91,29 @@ async def test_maybe_sync_portfolio_refreshes_before_execution() -> None:
 
     assert portfolio.sync_calls == 1
     assert sniper._last_portfolio_sync is not None
+
+
+def test_sniper_uses_shared_available_cash_when_present() -> None:
+    sniper = ResolutionSniper(
+        rest_client=SimpleNamespace(),
+        order_manager=SimpleNamespace(),
+        fee_calculator=SimpleNamespace(),
+        portfolio=_FakePortfolio(cash=Decimal("100.00")),
+        risk_manager=_FakeRiskManager(available_cash=Decimal("4.00")),
+        config=SnipeConfig(max_contracts_per_snipe=20),
+    )
+
+    size = sniper._estimate_safe_size(_opportunity(price="0.80"))
+
+    assert size == 4
+
+
+def test_sniper_respects_global_pause() -> None:
+    sniper = ResolutionSniper(
+        rest_client=SimpleNamespace(),
+        order_manager=SimpleNamespace(),
+        fee_calculator=SimpleNamespace(),
+        risk_manager=_FakeRiskManager(available_cash=Decimal("10.00"), paused=True),
+    )
+
+    assert sniper._should_execute(_opportunity()) is False

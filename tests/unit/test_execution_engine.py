@@ -830,6 +830,7 @@ class _FakeOrderbook:
     def __init__(self):
         self.yes_bids = [{"price": Decimal("0.55"), "quantity": 10}]
         self.no_bids = [{"price": Decimal("0.45"), "quantity": 10}]
+        self.mid_price = Decimal("0.55")
 
 
 class _FakeStrategy:
@@ -859,7 +860,35 @@ class _FakeWSForGuard:
         return _FakeOrderbook()
 
 
-def _engine_for_guard_test(*, demo_mode: bool, category_providers=None) -> ExecutionEngine:
+class _GuardRisk:
+    def __init__(self, *, paused: bool = False) -> None:
+        self.paused = paused
+        self.pause_reasons = {"kill_switch": "paused"} if paused else {}
+        self._portfolio = SimpleNamespace(
+            positions={},
+            update_market_price=lambda *_args, **_kwargs: None,
+        )
+        self.synced_orders: list[list[Order]] = []
+
+    def is_trading_paused(self) -> bool:
+        return self.paused
+
+    def reserve_trade_intent(self, *_args, **_kwargs) -> bool:
+        return True
+
+    def release_trade_intent(self, *_args, **_kwargs) -> None:
+        return None
+
+    def sync_open_order_reservations(self, orders, *, category_lookup=None) -> None:
+        self.synced_orders.append(list(orders))
+
+
+def _engine_for_guard_test(
+    *,
+    demo_mode: bool,
+    category_providers=None,
+    paused: bool = False,
+) -> ExecutionEngine:
     """Create a minimal engine for testing execute_decision guards."""
     engine = object.__new__(ExecutionEngine)
     engine._demo_mode = demo_mode
@@ -873,6 +902,7 @@ def _engine_for_guard_test(*, demo_mode: bool, category_providers=None) -> Execu
     engine._fills = SimpleNamespace(record_submission=lambda: None)
     engine._strategy = _FakeStrategy()
     engine._orders = _FakeOrders([])
+    engine._risk = _GuardRisk(paused=paused)
     return engine
 
 
@@ -969,6 +999,16 @@ async def test_execute_decision_handles_order_error_without_raising() -> None:
 
     assert engine._strategy.executed is True
     assert engine._decision_context == {}
+
+
+@pytest.mark.asyncio
+async def test_execute_decision_respects_global_pause() -> None:
+    engine = _engine_for_guard_test(demo_mode=False, paused=True)
+    decision = _make_decision(model_name="sharp_sportsbook")
+
+    await engine.execute_decision(decision)
+
+    assert engine._strategy.executed is False
 
 
 def test_market_baseline_model_has_demo_only_flag() -> None:

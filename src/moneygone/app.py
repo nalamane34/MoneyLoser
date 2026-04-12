@@ -89,6 +89,7 @@ from moneygone.monitoring.regime_detector import RegimeDetector
 from moneygone.models.market_baseline import MarketBaselineModel
 from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.models.weather_ensemble import WeatherEnsembleModel
+from moneygone.risk.capital_governor import CapitalGovernor
 from moneygone.risk.manager import RiskManager
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
@@ -461,6 +462,7 @@ def build_app(config: AppConfig) -> Application:
     fill_tracker = FillTracker(store=store)
     order_manager = OrderManager(rest_client)
     portfolio_tracker = PortfolioTracker()
+    capital_governor = CapitalGovernor()
     drawdown_monitor = DrawdownMonitor()
     exposure_calculator = ExposureCalculator()
     risk_limits = RiskLimits(config.risk)
@@ -470,6 +472,7 @@ def build_app(config: AppConfig) -> Application:
         portfolio=portfolio_tracker,
         drawdown_monitor=drawdown_monitor,
         exposure_calculator=exposure_calculator,
+        capital_governor=capital_governor,
     )
     kelly_sizer = KellySizer(
         kelly_fraction=config.risk.kelly_fraction,
@@ -504,6 +507,7 @@ def build_app(config: AppConfig) -> Application:
             config=SnipeConfig(),
             fill_tracker=fill_tracker,
             portfolio=portfolio_tracker,
+            risk_manager=risk_manager,
         )
 
         live_event_edge = LiveEventEdge(

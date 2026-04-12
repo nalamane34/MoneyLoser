@@ -104,6 +104,7 @@ from moneygone.models.sharp_sportsbook import SharpSportsbookModel
 from moneygone.models.weather_ensemble import WeatherEnsembleModel
 from moneygone.risk.drawdown import DrawdownMonitor
 from moneygone.risk.exposure import ExposureCalculator
+from moneygone.risk.capital_governor import CapitalGovernor
 from moneygone.risk.manager import RiskManager
 from moneygone.risk.portfolio import PortfolioTracker
 from moneygone.signals.edge import EdgeCalculator
@@ -287,6 +288,7 @@ async def main() -> None:
     order_manager = OrderManager(rest_client)
     fill_tracker = FillTracker(store=store)
     portfolio_tracker = PortfolioTracker()
+    capital_governor = CapitalGovernor()
     drawdown_monitor = DrawdownMonitor()
     exposure_calculator = ExposureCalculator()
     risk_limits = RiskLimits(config.risk)
@@ -296,6 +298,7 @@ async def main() -> None:
         portfolio=portfolio_tracker,
         drawdown_monitor=drawdown_monitor,
         exposure_calculator=exposure_calculator,
+        capital_governor=capital_governor,
     )
 
     # Sportsbook data is loaded into execution.duckdb from parquet (see above).
@@ -557,10 +560,22 @@ async def main() -> None:
             )
         )
 
-        # Monkey-patch kill switch check into strategies.
-        # The kill switch ONLY affects closer strategies — the main
-        # ExecutionEngine continues trading normally even when the
-        # kill switch is triggered.
+        def _sync_global_pause_from_kill_switch() -> None:
+            if kill_switch is None:
+                return
+            if kill_switch.is_active:
+                risk_manager.resume_trading("closer_kill_switch")
+                return
+            paused_until = kill_switch.paused_until
+            pause_suffix = (
+                f" until {paused_until.isoformat()}"
+                if paused_until is not None
+                else ""
+            )
+            risk_manager.pause_trading(
+                "closer_kill_switch",
+                f"Closer loss-streak kill switch active{pause_suffix}",
+            )
 
         # Resolution Sniper
         sniper_cfg = closer_cfg.get("sniper", {})
@@ -570,6 +585,7 @@ async def main() -> None:
             fee_calculator=fee_calculator,
             fill_tracker=fill_tracker,
             portfolio=portfolio_tracker,
+            risk_manager=risk_manager,
             config=SnipeConfig(
                 min_confidence=sniper_cfg.get("min_confidence", 0.95),
                 max_entry_price=sniper_cfg.get("max_entry_price", 0.95),
@@ -585,12 +601,13 @@ async def main() -> None:
         _original_should_execute = resolution_sniper._should_execute
 
         def _guarded_should_execute(opp):  # type: ignore
+            _sync_global_pause_from_kill_switch()
             if not kill_switch.is_active:
                 log.warning(
                     "sniper.kill_switch_active",
                     ticker=opp.ticker,
                     paused_until=str(kill_switch.paused_until),
-                    msg="Closer strategies paused — main engine unaffected",
+                    msg="Global trading pause active from closer kill switch",
                 )
                 return False
             return _original_should_execute(opp)
@@ -646,12 +663,13 @@ async def main() -> None:
         _original_evaluate = live_event_edge.evaluate_signal
 
         async def _guarded_evaluate(signal):  # type: ignore
+            _sync_global_pause_from_kill_switch()
             if not kill_switch.is_active:
                 log.warning(
                     "live_edge.kill_switch_active",
                     ticker=signal.ticker,
                     paused_until=str(kill_switch.paused_until),
-                    msg="Closer strategies paused — main engine unaffected",
+                    msg="Global trading pause active from closer kill switch",
                 )
                 return None
             # Apply tiered confidence based on market price
@@ -673,7 +691,7 @@ async def main() -> None:
             "execution.kill_switch_configured",
             max_consecutive_losses=ks_cfg.get("max_consecutive_losses", 4),
             cooldown_hours=ks_cfg.get("cooldown_hours", 12.0),
-            note="Kill switch ONLY affects closer strategies — main engine unaffected",
+            note="Kill switch pauses all new trading across engine and closer strategies",
         )
     else:
         log.info("execution.closer_strategies_disabled")
@@ -747,6 +765,8 @@ async def main() -> None:
         kill_switch_processed: set[str] = set()
         while not shutdown.is_set():
             try:
+                if kill_switch is not None:
+                    _sync_global_pause_from_kill_switch()
                 synced = await _sync_new_settlements(
                     rest_client=rest_client,
                     store=store,
