@@ -56,6 +56,15 @@ execution:
   max_order_staleness_seconds: 30
   evaluation_interval_seconds: 5.0
   max_model_market_disagreement: 0.08
+  max_watched_markets: 800
+  max_markets_per_cycle: 200
+  max_core_markets_per_category: 150
+  max_fallback_markets_per_category: 60
+  max_core_market_horizon_hours: 120.0
+  max_fallback_market_horizon_hours: 48.0
+  min_market_volume: 25
+  min_market_open_interest: 25
+  max_market_spread: 0.20
 
 risk:
   kelly_fraction: 0.25

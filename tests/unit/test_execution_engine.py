@@ -18,7 +18,18 @@ from moneygone.sizing.kelly import SizeResult
 from moneygone.sizing.risk_limits import RiskCheckResult
 
 
-def _market(ticker: str, *, event_ticker: str, yes_sub_title: str) -> Market:
+def _market(
+    ticker: str,
+    *,
+    event_ticker: str,
+    yes_sub_title: str,
+    volume: int = 100,
+    open_interest: int = 10,
+    close_time: datetime | None = None,
+    category: str = "sports",
+    yes_bid: Decimal = Decimal("0.53"),
+    yes_ask: Decimal = Decimal("0.55"),
+) -> Market:
     return Market(
         ticker=ticker,
         event_ticker=event_ticker,
@@ -28,14 +39,14 @@ def _market(ticker: str, *, event_ticker: str, yes_sub_title: str) -> Market:
         yes_sub_title=yes_sub_title,
         no_sub_title="",
         status=MarketStatus.OPEN,
-        yes_bid=Decimal("0.53"),
-        yes_ask=Decimal("0.55"),
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
         last_price=Decimal("0.54"),
-        volume=100,
-        open_interest=10,
-        close_time=datetime.now(timezone.utc),
+        volume=volume,
+        open_interest=open_interest,
+        close_time=close_time or datetime.now(timezone.utc),
         result=MarketResult.NOT_SETTLED,
-        category="sports",
+        category=category,
     )
 
 
@@ -415,6 +426,160 @@ def test_poll_shared_market_data_once_updates_hot_caches() -> None:
     assert engine._market_cache["KXTEST"].last_price == Decimal("0.52")
     assert engine._shared_orderbook_cache["KXTEST"].seq == 12
 
+
+@pytest.mark.asyncio
+async def test_refresh_market_universe_bounds_watchlist_and_prioritizes_near_term_markets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    weather_markets = [
+        _market(
+            f"KXWEATHER-{idx}",
+            event_ticker=f"EVT-W-{idx}",
+            yes_sub_title=f"Weather {idx}",
+            volume=200 - idx,
+            open_interest=150 - idx,
+            close_time=now + timedelta(hours=12 + idx),
+            category="weather",
+        )
+        for idx in range(4)
+    ]
+    unknown_markets = [
+        _market(
+            f"KXUNKNOWN-{idx}",
+            event_ticker=f"EVT-U-{idx}",
+            yes_sub_title=f"Unknown {idx}",
+            volume=120 - idx,
+            open_interest=90 - idx,
+            close_time=now + timedelta(hours=8 + idx),
+            category="unknown",
+        )
+        for idx in range(3)
+    ]
+    far_future = _market(
+        "KXFAR-1",
+        event_ticker="EVT-FAR",
+        yes_sub_title="Far future",
+        volume=500,
+        open_interest=500,
+        close_time=now + timedelta(hours=200),
+        category="unknown",
+    )
+    illiquid = _market(
+        "KXILLIQ-1",
+        event_ticker="EVT-ILLIQ",
+        yes_sub_title="Illiquid",
+        volume=1,
+        open_interest=1,
+        close_time=now + timedelta(hours=6),
+        category="weather",
+    )
+    all_markets = weather_markets + unknown_markets + [far_future, illiquid]
+
+    engine = object.__new__(ExecutionEngine)
+    engine._config = SimpleNamespace(
+        max_watched_markets=4,
+        max_core_markets_per_category=2,
+        max_fallback_markets_per_category=1,
+        max_core_market_horizon_hours=120.0,
+        max_fallback_market_horizon_hours=48.0,
+        min_market_volume=25,
+        min_market_open_interest=25,
+        max_market_spread=0.20,
+    )
+    engine._last_universe_refresh = None
+    engine._discovery_cache_path = None
+    engine._rest = SimpleNamespace(
+        get_all_markets=lambda **_kwargs: asyncio.sleep(0, result=all_markets),
+    )
+    engine._sportsbook_parquet_path = None
+    engine._store = None
+    engine._sports = None
+    engine._orders = SimpleNamespace(get_open_orders=lambda: [])
+    engine._risk = SimpleNamespace(_portfolio=SimpleNamespace(positions={}))
+    engine._watched = []
+    engine._market_cache = {}
+    engine._market_categories = {}
+    engine._watch_rotation_offset = 0
+    engine._category_providers = {
+        MarketCategory.WEATHER: CategoryProvider(
+            category=MarketCategory.WEATHER,
+            model=SimpleNamespace(),
+            pipeline=SimpleNamespace(),
+        ),
+        MarketCategory.UNKNOWN: CategoryProvider(
+            category=MarketCategory.UNKNOWN,
+            model=SimpleNamespace(),
+            pipeline=SimpleNamespace(),
+        ),
+    }
+
+    def _fake_classify(market: Market) -> MarketCategory:
+        return MarketCategory.WEATHER if market.category == "weather" else MarketCategory.UNKNOWN
+
+    monkeypatch.setattr("moneygone.execution.engine.classify_market", _fake_classify)
+
+    await engine._refresh_market_universe(force=True)
+
+    assert len(engine._watched) == 3
+    assert "KXWEATHER-0" in engine._watched
+    assert "KXWEATHER-1" in engine._watched
+    assert "KXUNKNOWN-0" in engine._watched
+    assert "KXFAR-1" not in engine._watched
+    assert "KXILLIQ-1" not in engine._watched
+
+
+def test_build_cycle_ticker_batch_respects_budget_and_keeps_priority_tickers() -> None:
+    now = datetime.now(timezone.utc)
+    engine = object.__new__(ExecutionEngine)
+    engine._running = True
+    engine._config = SimpleNamespace(max_markets_per_cycle=2)
+    engine._stale_rechecks_inflight = set()
+    engine._last_eval = {}
+    engine._watch_rotation_offset = 0
+    engine._watched = ["KXPOS", "KXOPEN", "KXOTHER1", "KXOTHER2"]
+    engine._market_cache = {
+        "KXPOS": _market("KXPOS", event_ticker="EVT-POS", yes_sub_title="Pos", close_time=now + timedelta(hours=1)),
+        "KXOPEN": _market("KXOPEN", event_ticker="EVT-OPEN", yes_sub_title="Open", close_time=now + timedelta(hours=2)),
+        "KXOTHER1": _market("KXOTHER1", event_ticker="EVT-OTHER1", yes_sub_title="Other1", close_time=now + timedelta(hours=3)),
+        "KXOTHER2": _market("KXOTHER2", event_ticker="EVT-OTHER2", yes_sub_title="Other2", close_time=now + timedelta(hours=4)),
+    }
+    engine._market_categories = {
+        "KXPOS": MarketCategory.UNKNOWN,
+        "KXOPEN": MarketCategory.UNKNOWN,
+        "KXOTHER1": MarketCategory.WEATHER,
+        "KXOTHER2": MarketCategory.UNKNOWN,
+    }
+    engine._orders = SimpleNamespace(
+        get_open_orders=lambda: [
+            Order(
+                order_id="order-1",
+                ticker="KXOPEN",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=1,
+                remaining_count=1,
+                price=Decimal("0.55"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now,
+            )
+        ]
+    )
+    engine._risk = SimpleNamespace(
+        _portfolio=SimpleNamespace(
+            positions={
+                "KXPOS": LocalPosition(ticker="KXPOS", yes_count=1),
+            }
+        )
+    )
+
+    selected, eligible_total, skipped = engine._build_cycle_ticker_batch(now, 15.0)
+
+    assert eligible_total == 4
+    assert skipped == 2
+    assert selected == ["KXPOS", "KXOPEN"]
 
 @pytest.mark.asyncio
 async def test_reconcile_runs_on_startup() -> None:

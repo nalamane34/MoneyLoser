@@ -71,6 +71,21 @@ _REST_ORDERBOOK_FAILURE_THRESHOLD = 3
 _REST_ORDERBOOK_FALLBACK_LIMIT = 40
 _REST_ORDERBOOK_FALLBACK_WINDOW_SECONDS = 5.0
 _REST_ORDERBOOK_CIRCUIT_COOLDOWN_SECONDS = 15.0
+_SCAN_CATEGORY_PRIORITY = {
+    MarketCategory.SPORTS: 0,
+    MarketCategory.WEATHER: 1,
+    MarketCategory.CRYPTO: 2,
+    MarketCategory.ECONOMICS: 3,
+    MarketCategory.FINANCIALS: 4,
+    MarketCategory.POLITICS: 5,
+    MarketCategory.COMPANIES: 6,
+    MarketCategory.ENTERTAINMENT: 7,
+    MarketCategory.UNKNOWN: 8,
+}
+_CORE_SCAN_CATEGORIES = {
+    MarketCategory.WEATHER,
+    MarketCategory.CRYPTO,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +220,7 @@ class ExecutionEngine:
         self._rest_orderbook_circuit_reason: str | None = None
         self._rest_orderbook_window_started: datetime = datetime.now(timezone.utc)
         self._rest_orderbook_window_count = 0
+        self._watch_rotation_offset = 0
 
     def set_shared_market_data_tables(
         self,
@@ -638,7 +654,156 @@ class ExecutionEngine:
             "cluster_id": cluster_id,
             "time_to_expiry_h": time_to_expiry_h,
             "open_order_count": len(self._orders.get_open_orders()),
+            }
+
+    def _execution_setting(self, name: str, default: int | float) -> int | float:
+        """Read an execution config field with a safe fallback for older tests."""
+        return getattr(self._config, name, default)
+
+    @staticmethod
+    def _hours_to_close(market: Market, now: datetime) -> float:
+        return max(0.0, (market.close_time - now).total_seconds() / 3600.0)
+
+    @staticmethod
+    def _market_spread(market: Market) -> float:
+        if market.yes_bid <= 0 or market.yes_ask <= 0:
+            return 1.0
+        return float(max(_ZERO, market.yes_ask - market.yes_bid))
+
+    def _market_priority_key(
+        self,
+        market: Market,
+        category: MarketCategory,
+        now: datetime,
+    ) -> tuple[float, float, int, int, int, str]:
+        """Sort markets so near-term, liquid, tighter core markets go first."""
+        hours_to_close = self._hours_to_close(market, now)
+        spread = self._market_spread(market)
+        category_rank = _SCAN_CATEGORY_PRIORITY.get(category, 99)
+        return (
+            float(category_rank),
+            min(hours_to_close, 1_000_000.0),
+            int(spread * 10_000),
+            -int(market.open_interest),
+            -int(market.volume),
+            market.ticker,
+        )
+
+    def _should_watch_market(
+        self,
+        market: Market,
+        category: MarketCategory,
+        now: datetime,
+    ) -> bool:
+        if market.yes_bid <= 0 or market.yes_ask <= 0:
+            return False
+        if market.status is not MarketStatus.OPEN:
+            return False
+
+        spread = self._market_spread(market)
+        max_spread = float(self._execution_setting("max_market_spread", 0.20))
+        if spread <= 0.0 or spread > max_spread:
+            return False
+
+        min_volume = int(self._execution_setting("min_market_volume", 25))
+        min_open_interest = int(self._execution_setting("min_market_open_interest", 25))
+        if market.volume < min_volume and market.open_interest < min_open_interest:
+            return False
+
+        hours_to_close = self._hours_to_close(market, now)
+        max_horizon = float(
+            self._execution_setting(
+                "max_core_market_horizon_hours"
+                if category in _CORE_SCAN_CATEGORIES
+                else "max_fallback_market_horizon_hours",
+                120.0 if category in _CORE_SCAN_CATEGORIES else 48.0,
+            )
+        )
+        if hours_to_close > max_horizon:
+            return False
+
+        return True
+
+    def _build_cycle_ticker_batch(
+        self,
+        now: datetime,
+        interval: float,
+    ) -> tuple[list[str], int, int]:
+        """Select a bounded set of markets for the current evaluation cycle."""
+        eligible_tickers: list[str] = []
+        for ticker in self._watched:
+            if not self._running:
+                break
+            if ticker in self._stale_rechecks_inflight:
+                continue
+            last = self._last_eval.get(ticker)
+            if last is not None and (now - last).total_seconds() < interval:
+                continue
+            eligible_tickers.append(ticker)
+
+        eligible_total = len(eligible_tickers)
+        if eligible_total == 0:
+            return [], 0, 0
+
+        max_markets_per_cycle = int(
+            self._execution_setting("max_markets_per_cycle", eligible_total),
+        )
+        if max_markets_per_cycle <= 0 or eligible_total <= max_markets_per_cycle:
+            for ticker in eligible_tickers:
+                self._last_eval[ticker] = now
+            return eligible_tickers, eligible_total, 0
+
+        open_order_tickers = {order.ticker for order in self._orders.get_open_orders()}
+        position_tickers = {
+            ticker
+            for ticker, position in self._risk._portfolio.positions.items()
+            if getattr(position, "yes_count", 0)
+            or getattr(position, "no_count", 0)
+            or getattr(position, "net_count", 0)
         }
+
+        priority_tickers: list[str] = []
+        remaining_tickers: list[str] = []
+        seen: set[str] = set()
+        for ticker in eligible_tickers:
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            if ticker in open_order_tickers or ticker in position_tickers:
+                priority_tickers.append(ticker)
+            else:
+                remaining_tickers.append(ticker)
+
+        priority_tickers.sort(
+            key=lambda ticker: self._market_priority_key(
+                self._market_cache.get(ticker),
+                self._market_categories.get(ticker, MarketCategory.UNKNOWN),
+                now,
+            ) if self._market_cache.get(ticker) is not None else (999.0, 999999.0, 999999, 0, 0, ticker),
+        )
+        remaining_tickers.sort(
+            key=lambda ticker: self._market_priority_key(
+                self._market_cache.get(ticker),
+                self._market_categories.get(ticker, MarketCategory.UNKNOWN),
+                now,
+            ) if self._market_cache.get(ticker) is not None else (999.0, 999999.0, 999999, 0, 0, ticker),
+        )
+
+        selected_tickers = list(priority_tickers)
+        if remaining_tickers and len(selected_tickers) < max_markets_per_cycle:
+            rotation = self._watch_rotation_offset % len(remaining_tickers)
+            rotated = remaining_tickers[rotation:] + remaining_tickers[:rotation]
+            take_count = max_markets_per_cycle - len(selected_tickers)
+            selected_tickers.extend(rotated[:take_count])
+            self._watch_rotation_offset = (rotation + take_count) % len(remaining_tickers)
+        else:
+            self._watch_rotation_offset = 0
+
+        for ticker in selected_tickers:
+            self._last_eval[ticker] = now
+
+        skipped_due_to_budget = max(0, eligible_total - len(selected_tickers))
+        return selected_tickers, eligible_total, skipped_due_to_budget
 
     async def evaluate_market(
         self,
@@ -1179,21 +1344,10 @@ class ExecutionEngine:
                 cycle_start = datetime.now(timezone.utc)
                 self._active_cycle_id = cycle_start.isoformat()
 
-                # Build list of tickers eligible for evaluation this cycle
-                eligible_tickers: list[str] = []
                 now = datetime.now(timezone.utc)
-                for ticker in self._watched:
-                    if not self._running:
-                        break
-                    if ticker in self._stale_rechecks_inflight:
-                        continue
-                    last = self._last_eval.get(ticker)
-                    if last is not None and (now - last).total_seconds() < interval:
-                        continue
-                    self._last_eval[ticker] = now
-                    eligible_tickers.append(ticker)
-
-                cycle_evaluated = len(eligible_tickers)
+                eligible_tickers, cycle_evaluated, skipped_due_to_budget = (
+                    self._build_cycle_ticker_batch(now, interval)
+                )
 
                 # Evaluate markets concurrently with bounded parallelism
                 sem = asyncio.Semaphore(20)
@@ -1233,6 +1387,7 @@ class ExecutionEngine:
                         selected=cycle_selected,
                         rejected=cycle_evaluated - cycle_selected,
                         watched_total=len(self._watched),
+                        skipped_due_to_budget=skipped_due_to_budget,
                         elapsed_s=round(elapsed_s, 1),
                     )
                 self._active_cycle_id = None
@@ -1435,13 +1590,21 @@ class ExecutionEngine:
                         new_tickers.append(market.ticker)
             category_counts["sports"] = len(matched)
 
-        # Phase 2: Other categories — use pre-classified data
-        # Only watch markets that are liquid, have a category provider,
-        # and close within a reasonable timeframe.  This keeps the watched
-        # set under ~2000 markets so eval cycles complete in minutes, not
-        # hours.
+        # Phase 2: Other categories — rebuild a bounded, prioritized universe.
+        # The main engine still supports all enabled categories, but it only
+        # watches markets that are liquid, near-term, and worth evaluating in
+        # a low-latency loop.
         skipped = 0
-        max_expiry_hours = 720  # 30 days — skip far-future markets
+        skipped_budget = 0
+        max_watched_markets = int(self._execution_setting("max_watched_markets", 800))
+        max_core_per_category = int(
+            self._execution_setting("max_core_markets_per_category", 150),
+        )
+        max_fallback_per_category = int(
+            self._execution_setting("max_fallback_markets_per_category", 60),
+        )
+        candidate_buckets: dict[MarketCategory, list[Market]] = {}
+
         for market, category in classified:
             if market.ticker in self._market_cache:
                 continue  # Already matched as sports
@@ -1449,23 +1612,39 @@ class ExecutionEngine:
             if category not in self._category_providers:
                 continue
 
-            # Skip illiquid/empty markets — no point evaluating them
-            if market.volume < 10 or market.yes_bid <= 0 or market.yes_ask <= 0:
+            if not self._should_watch_market(market, category, now):
                 skipped += 1
                 continue
 
-            # Skip far-future markets that won't resolve soon
-            if market.close_time is not None:
-                hours_to_close = (market.close_time - now).total_seconds() / 3600
-                if hours_to_close > max_expiry_hours:
-                    skipped += 1
-                    continue
+            candidate_buckets.setdefault(category, []).append(market)
 
+        selected_other_markets: list[tuple[MarketCategory, Market]] = []
+        for category, bucket in candidate_buckets.items():
+            bucket.sort(key=lambda market: self._market_priority_key(market, category, now))
+            per_category_cap = (
+                max_core_per_category
+                if category in _CORE_SCAN_CATEGORIES
+                else max_fallback_per_category
+            )
+            trimmed_bucket = bucket[:per_category_cap]
+            skipped_budget += max(0, len(bucket) - len(trimmed_bucket))
+            selected_other_markets.extend((category, market) for market in trimmed_bucket)
+
+        selected_other_markets.sort(
+            key=lambda item: self._market_priority_key(item[1], item[0], now),
+        )
+
+        remaining_capacity = max(0, max_watched_markets - len(self._watched))
+        trimmed_other_markets = selected_other_markets[:remaining_capacity]
+        skipped_budget += max(0, len(selected_other_markets) - len(trimmed_other_markets))
+
+        for category, market in trimmed_other_markets:
             self._market_cache[market.ticker] = market
             self._market_categories[market.ticker] = category
             if market.ticker not in self._watched:
                 self._watched.append(market.ticker)
-                new_tickers.append(market.ticker)
+                if market.ticker not in prev_watched:
+                    new_tickers.append(market.ticker)
             category_counts[category.value] = category_counts.get(category.value, 0) + 1
 
         # NOTE: We do NOT subscribe to WS orderbook/ticker/trades for all
@@ -1478,6 +1657,7 @@ class ExecutionEngine:
             watched=len(self._watched),
             new=len(new_tickers),
             skipped_illiquid=skipped,
+            skipped_budget=skipped_budget,
             categories=category_counts,
             cache_used=cache_used,
         )

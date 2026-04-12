@@ -100,7 +100,7 @@ sportsbook:
     - "h2h"
   fetch_interval_minutes: 30
   lookahead_hours: 48
-  min_requests_remaining: 250
+  min_requests_remaining: 0
 
 execution:
   min_edge_threshold: 0.03
@@ -109,6 +109,15 @@ execution:
   max_order_staleness_seconds: 30
   evaluation_interval_seconds: 15.0
   max_model_market_disagreement: 0.06
+  max_watched_markets: 500
+  max_markets_per_cycle: 180
+  max_core_markets_per_category: 120
+  max_fallback_markets_per_category: 40
+  max_core_market_horizon_hours: 120.0
+  max_fallback_market_horizon_hours: 48.0
+  min_market_volume: 25
+  min_market_open_interest: 25
+  max_market_spread: 0.20
 
 risk:
   kelly_fraction: 0.05

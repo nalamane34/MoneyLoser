@@ -102,6 +102,15 @@ class ExecutionConfig(BaseModel):
     max_order_staleness_seconds: int = 30
     evaluation_interval_seconds: float = 5.0
     max_model_market_disagreement: float = 0.08
+    max_watched_markets: int = 800
+    max_markets_per_cycle: int = 200
+    max_core_markets_per_category: int = 150
+    max_fallback_markets_per_category: int = 60
+    max_core_market_horizon_hours: float = 120.0
+    max_fallback_market_horizon_hours: float = 48.0
+    min_market_volume: int = 25
+    min_market_open_interest: int = 25
+    max_market_spread: float = 0.20
 
 
 class RiskConfig(BaseModel):
