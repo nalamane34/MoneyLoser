@@ -1314,10 +1314,25 @@ class ResolutionSniper:
         Uses series_ticker prefixes to target relevant markets instead
         of scanning all 38k+ open markets.
         """
-        # Snipeable prefixes — sports match results and weather observations
+        # Snipeable prefixes — game-level sports tickers that have dated
+        # formats (KXNHLGAME-26APR12...) rather than season futures (KXNHL-26-).
         _SPORT_PREFIXES = [
-            "KXNBA", "KXNHL", "KXMLB", "KXMLS", "KXUFC",
-            "KXEPL", "KXLALIGA", "KXBUNDESLIGA", "KXSERIEA", "KXLIGUE1",
+            # NBA game-level
+            "KXNBAMATCHUP", "KXNBA2HWINNER", "KXNBATOTAL", "KXNBASPREAD",
+            "KXNBATEAMTOTAL",
+            # NHL game-level
+            "KXNHLGAME", "KXNHLTOTAL", "KXNHLSPREAD",
+            # MLB game-level
+            "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
+            # Soccer game-level
+            "KXEPLGAME", "KXEPLTOTAL", "KXEPLSPREAD",
+            "KXLALIGAGAME", "KXLALIGASPREAD", "KXLALIGATOTAL",
+            "KXBUNDESLIGAGAME", "KXBUNDESLIGA2GAME",
+            "KXSERIEAGAME", "KXSERIEATOTAL", "KXSERIEASPREAD",
+            "KXLIGUE1GAME", "KXLIGUE11H",
+            "KXMLSGAME", "KXMLSSPREAD",
+            # UFC/MMA
+            "KXUFCGAME", "KXUFCFIGHT", "KXFIGHTMENTION",
         ]
         _WEATHER_PREFIXES = [
             "KXHIGHT", "KXHIGHNY", "KXHIGHCHI", "KXHIGHLA",
@@ -1366,6 +1381,7 @@ class ResolutionSniper:
         )
 
         discovered = 0
+        skipped_not_near_term = 0
         for market in markets:
             if market.ticker in self._mappings:
                 continue
@@ -1373,9 +1389,17 @@ class ResolutionSniper:
             mapping = self._infer_mapping_from_ticker(market)
             if mapping is not None:
                 if mapping.category == "sports" and not self._is_near_term_sports_ticker(mapping.ticker):
+                    skipped_not_near_term += 1
                     continue
                 self._mappings[mapping.ticker] = mapping
                 discovered += 1
+
+        if skipped_not_near_term:
+            logger.info(
+                "sniper.near_term_filter",
+                skipped=skipped_not_near_term,
+                passed=discovered,
+            )
 
         logger.info(
             "sniper.auto_discover_result",
