@@ -56,6 +56,7 @@ class _FakeOrders:
     async def cancel_order(self, order_id: str) -> None:
         self.cancelled_order_ids.append(order_id)
         self._orders = [order for order in self._orders if order.order_id != order_id]
+        return True
 
     @property
     def open_order_count(self) -> int:
@@ -68,6 +69,40 @@ class _FakeSports:
 
     async def get_snapshot(self, market: Market) -> dict[str, int | str] | None:
         return self._snapshots.get(market.ticker)
+
+
+class _SharedStore:
+    def __init__(self, market_row=None, orderbook_row=None) -> None:
+        self.market_row = market_row
+        self.orderbook_row = orderbook_row
+        self.market_calls: list[tuple[str, str]] = []
+        self.orderbook_calls: list[tuple[str, str]] = []
+        self.market_rows_since_calls: list[tuple[str, int]] = []
+        self.orderbook_rows_since_calls: list[tuple[str, int]] = []
+
+    def get_market_state_at(self, ticker, as_of, *, table):
+        self.market_calls.append((ticker, table))
+        return self.market_row
+
+    def get_orderbook_at(self, ticker, as_of, *, table):
+        self.orderbook_calls.append((ticker, table))
+        return self.orderbook_row
+
+    def get_market_state_rows_since(self, since, *, table, limit):
+        self.market_rows_since_calls.append((table, limit))
+        if self.market_row is None:
+            return []
+        row = dict(self.market_row)
+        row.setdefault("ingested_at", since)
+        return [row]
+
+    def get_orderbook_rows_since(self, since, *, table, limit):
+        self.orderbook_rows_since_calls.append((table, limit))
+        if self.orderbook_row is None:
+            return []
+        row = dict(self.orderbook_row)
+        row.setdefault("ingested_at", since)
+        return [row]
 
 
 def _engine_with_context(
@@ -277,6 +312,109 @@ async def test_duplicate_event_cluster_resting_order_is_blocked_for_non_binary_m
     }
 
 
+def test_refresh_market_cache_from_shared_store_updates_market_cache() -> None:
+    now = datetime(2026, 4, 11, 4, 0, tzinfo=timezone.utc)
+    engine = object.__new__(ExecutionEngine)
+    engine._store = _SharedStore(
+        market_row={
+            "ticker": "KXTEST",
+            "event_ticker": "EVT-TEST",
+            "series_ticker": "KXSERIES",
+            "title": "Shared market",
+            "status": "open",
+            "yes_bid": 0.44,
+            "yes_ask": 0.46,
+            "last_price": 0.45,
+            "volume": 123,
+            "open_interest": 50,
+            "close_time": now.isoformat(),
+            "category": "sports",
+        }
+    )
+    engine._shared_market_state_table = "market_data.market_states"
+    engine._shared_orderbook_table = None
+    engine._market_cache = {}
+
+    engine._refresh_market_cache_from_shared_store("KXTEST", now)
+
+    market = engine._market_cache["KXTEST"]
+    assert market.title == "Shared market"
+    assert market.yes_bid == Decimal("0.44")
+    assert market.status == MarketStatus.OPEN
+
+
+def test_get_orderbook_from_shared_store_returns_sorted_snapshot() -> None:
+    now = datetime(2026, 4, 11, 4, 5, tzinfo=timezone.utc)
+    engine = object.__new__(ExecutionEngine)
+    engine._store = _SharedStore(
+        orderbook_row={
+            "yes_levels": [
+                {"price": 0.48, "contracts": 25},
+                {"price": 0.44, "contracts": 10},
+            ],
+            "no_levels": [
+                {"price": 0.40, "contracts": 12},
+                {"price": 0.43, "contracts": 5},
+            ],
+            "seq": 9,
+            "snapshot_time": now.isoformat(),
+        }
+    )
+    engine._shared_market_state_table = None
+    engine._shared_orderbook_table = "market_data.orderbook_snapshots"
+
+    orderbook = engine._get_orderbook_from_shared_store("KXTEST", now)
+
+    assert orderbook is not None
+    assert orderbook.yes_bids[0].price == Decimal("0.44")
+    assert orderbook.yes_bids[-1].price == Decimal("0.48")
+    assert orderbook.no_bids[-1].price == Decimal("0.43")
+
+
+def test_poll_shared_market_data_once_updates_hot_caches() -> None:
+    now = datetime(2026, 4, 11, 4, 10, tzinfo=timezone.utc)
+    store = _SharedStore(
+        market_row={
+            "ticker": "KXTEST",
+            "event_ticker": "EVT-TEST",
+            "series_ticker": "KXSERIES",
+            "title": "Shared live market",
+            "status": "open",
+            "yes_bid": 0.51,
+            "yes_ask": 0.53,
+            "last_price": 0.52,
+            "volume": 90,
+            "open_interest": 22,
+            "close_time": now.isoformat(),
+            "snapshot_time": now.isoformat(),
+            "ingested_at": now,
+        },
+        orderbook_row={
+            "ticker": "KXTEST",
+            "yes_levels": [{"price": 0.51, "contracts": 15}],
+            "no_levels": [{"price": 0.47, "contracts": 11}],
+            "seq": 12,
+            "snapshot_time": now.isoformat(),
+            "ingested_at": now,
+        },
+    )
+    engine = object.__new__(ExecutionEngine)
+    engine._store = store
+    engine._market_cache = {}
+    engine._shared_orderbook_cache = {}
+    engine._shared_market_state_table = "market_data.market_states"
+    engine._shared_orderbook_table = "market_data.orderbook_snapshots"
+    engine._shared_market_cursor_time = now - timedelta(seconds=1)
+    engine._shared_market_cursor_keys = set()
+    engine._shared_orderbook_cursor_time = now - timedelta(seconds=1)
+    engine._shared_orderbook_cursor_keys = set()
+
+    engine._poll_shared_market_data_once()
+
+    assert engine._market_cache["KXTEST"].last_price == Decimal("0.52")
+    assert engine._shared_orderbook_cache["KXTEST"].seq == 12
+
+
 @pytest.mark.asyncio
 async def test_reconcile_runs_on_startup() -> None:
     orders = _FakeOrders([])
@@ -294,6 +432,8 @@ async def test_reconcile_runs_on_startup() -> None:
     engine._last_order_reconcile = None
     engine._sportsbook_parquet_path = None
     engine._store = None
+    engine._shared_market_state_table = None
+    engine._shared_orderbook_table = None
     engine._sports = None
     engine._category_providers = {}
     engine._rest = SimpleNamespace()
@@ -305,6 +445,8 @@ async def test_reconcile_runs_on_startup() -> None:
     engine._edge_calc = SimpleNamespace()
     engine._sizer = SimpleNamespace()
     engine._orders = orders
+    engine._prediction_rows = []
+    engine._feature_rows = []
     engine._risk = SimpleNamespace(
         _portfolio=SimpleNamespace(
             cash=Decimal("10"),
@@ -458,6 +600,54 @@ async def test_cancel_stale_open_orders_rechecks_ticker_immediately() -> None:
     assert calls[0][1] == "KXMLBGAME-PHI"
     assert str(calls[0][2]).startswith("stale-recheck:")
     assert calls[1] == ("execute", "decision")
+
+
+@pytest.mark.asyncio
+async def test_cancel_stale_open_orders_does_not_recheck_until_cancel_is_confirmed() -> None:
+    class _PendingCancelOrders(_FakeOrders):
+        async def cancel_order(self, order_id: str) -> bool:
+            self.cancelled_order_ids.append(order_id)
+            return False
+
+    now = datetime.now(timezone.utc)
+    orders = _PendingCancelOrders(
+        [
+            Order(
+                order_id="stale-order",
+                ticker="KXMLBGAME-PHI",
+                side=Side.YES,
+                action=Action.BUY,
+                status=OrderStatus.RESTING,
+                count=2,
+                remaining_count=2,
+                price=Decimal("0.54"),
+                taker_fees=Decimal("0"),
+                maker_fees=Decimal("0"),
+                created_time=now - timedelta(seconds=45),
+            ),
+        ]
+    )
+    engine = object.__new__(ExecutionEngine)
+    engine._config = SimpleNamespace(max_order_staleness_seconds=30)
+    engine._orders = orders
+
+    calls: list[tuple[str, str, str | None] | tuple[str, str]] = []
+
+    async def _evaluate_market(ticker: str, *, cycle_id: str | None = None):
+        calls.append(("evaluate", ticker, cycle_id))
+        return "decision"
+
+    async def _execute_decision(decision) -> None:
+        calls.append(("execute", decision))
+
+    engine.evaluate_market = _evaluate_market
+    engine.execute_decision = _execute_decision
+
+    cancelled = await engine._cancel_stale_open_orders()
+
+    assert cancelled == 1
+    assert orders.cancelled_order_ids == ["stale-order"]
+    assert calls == []
 
 
 @pytest.mark.asyncio

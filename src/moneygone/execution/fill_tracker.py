@@ -174,6 +174,13 @@ class FillTracker:
                         "count": fill.count,
                         "price": float(fill.contract_price),
                         "is_taker": fill.is_taker,
+                        "fee_paid": float(fill.fee_cost),
+                        "category": category,
+                        "model_name": prediction.model_name,
+                        "predicted_prob": prediction.probability,
+                        "predicted_confidence": prediction.confidence,
+                        "raw_edge": edge.raw_edge,
+                        "fee_adjusted_edge": edge.fee_adjusted_edge,
                         "fill_time": fill.created_time.isoformat(),
                     }
                 ])
@@ -267,8 +274,15 @@ class FillTracker:
                         "side": fill.side.value,
                         "action": fill.action.value,
                         "count": fill.count,
-                        "price": float(fill.price),
+                        "price": float(fill.contract_price),
                         "is_taker": fill.is_taker,
+                        "fee_paid": float(fill.fee_cost),
+                        "category": category,
+                        "predicted_confidence": confidence,
+                        "fee_adjusted_edge": expected_profit,
+                        "strategy": strategy,
+                        "signal_source": signal_source,
+                        "expected_profit": expected_profit,
                         "fill_time": fill.created_time.isoformat(),
                     }
                 ])

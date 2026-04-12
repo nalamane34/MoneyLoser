@@ -95,6 +95,16 @@ class DataStore:
             ("sportsbook_game_lines", "draw_price", "DOUBLE"),
             ("sports_outcomes", "pinnacle_draw_price", "DOUBLE"),
             ("sports_outcomes", "consensus_draw_price", "DOUBLE"),
+            ("fills_log", "fee_paid", "DOUBLE"),
+            ("fills_log", "category", "VARCHAR"),
+            ("fills_log", "model_name", "VARCHAR"),
+            ("fills_log", "predicted_prob", "DOUBLE"),
+            ("fills_log", "predicted_confidence", "DOUBLE"),
+            ("fills_log", "raw_edge", "DOUBLE"),
+            ("fills_log", "fee_adjusted_edge", "DOUBLE"),
+            ("fills_log", "strategy", "VARCHAR"),
+            ("fills_log", "signal_source", "VARCHAR"),
+            ("fills_log", "expected_profit", "DOUBLE"),
         ]
         for table, column, col_type in migrations:
             try:
@@ -176,6 +186,9 @@ class DataStore:
     def load_parquet_into_table(self, table: str, path: Path | str) -> int:
         """Replace a table's contents with data from a parquet file.
 
+        The replacement happens inside a transaction so a failed parquet
+        load cannot leave the destination table empty.
+
         Returns the number of rows loaded.
         """
         p = Path(path)
@@ -198,13 +211,20 @@ class DataStore:
             )
 
         quoted_columns = ", ".join(_quote_ident(col) for col in common_columns)
-        self._conn.execute(f"DELETE FROM {table}")
-        self._conn.execute(
-            f"INSERT INTO {_quote_ident(table)} ({quoted_columns}) "
-            f"SELECT {quoted_columns} FROM read_parquet('{p}')"
-        )
-        result = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-        count = result[0] if result else 0
+        self._conn.execute("BEGIN TRANSACTION")
+        try:
+            self._conn.execute(f"DELETE FROM {table}")
+            self._conn.execute(
+                f"INSERT INTO {_quote_ident(table)} ({quoted_columns}) "
+                f"SELECT {quoted_columns} FROM read_parquet('{p}')"
+            )
+            result = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            count = result[0] if result else 0
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
         logger.debug("datastore.loaded_parquet", table=table, path=str(p), rows=count)
         return count
 
@@ -459,11 +479,55 @@ class DataStore:
     def insert_fills(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
+        has_fee_paid = self.has_column("fills_log", "fee_paid")
+        has_category = self.has_column("fills_log", "category")
+        has_model_name = self.has_column("fills_log", "model_name")
+        has_predicted_prob = self.has_column("fills_log", "predicted_prob")
+        has_predicted_confidence = self.has_column("fills_log", "predicted_confidence")
+        has_raw_edge = self.has_column("fills_log", "raw_edge")
+        has_fee_adjusted_edge = self.has_column("fills_log", "fee_adjusted_edge")
+        has_strategy = self.has_column("fills_log", "strategy")
+        has_signal_source = self.has_column("fills_log", "signal_source")
+        has_expected_profit = self.has_column("fills_log", "expected_profit")
+
+        columns = [
+            "trade_id",
+            "ticker",
+            "side",
+            "action",
+            "count",
+            "price",
+            "is_taker",
+        ]
+        if has_fee_paid:
+            columns.append("fee_paid")
+        if has_category:
+            columns.append("category")
+        if has_model_name:
+            columns.append("model_name")
+        if has_predicted_prob:
+            columns.append("predicted_prob")
+        if has_predicted_confidence:
+            columns.append("predicted_confidence")
+        if has_raw_edge:
+            columns.append("raw_edge")
+        if has_fee_adjusted_edge:
+            columns.append("fee_adjusted_edge")
+        if has_strategy:
+            columns.append("strategy")
+        if has_signal_source:
+            columns.append("signal_source")
+        if has_expected_profit:
+            columns.append("expected_profit")
+        columns.append("fill_time")
+
+        quoted_columns = ", ".join(columns)
+        placeholders = ", ".join(["?"] * len(columns))
         self._conn.executemany(
-            """
+            f"""
             INSERT INTO fills_log
-                (trade_id, ticker, side, action, count, price, is_taker, fill_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ({quoted_columns})
+            VALUES ({placeholders})
             """,
             [
                 (
@@ -474,12 +538,150 @@ class DataStore:
                     r["count"],
                     r["price"],
                     r["is_taker"],
-                    r["fill_time"],
                 )
+                + ((r.get("fee_paid"),) if has_fee_paid else ())
+                + ((r.get("category"),) if has_category else ())
+                + ((r.get("model_name"),) if has_model_name else ())
+                + ((r.get("predicted_prob"),) if has_predicted_prob else ())
+                + ((r.get("predicted_confidence"),) if has_predicted_confidence else ())
+                + ((r.get("raw_edge"),) if has_raw_edge else ())
+                + ((r.get("fee_adjusted_edge"),) if has_fee_adjusted_edge else ())
+                + ((r.get("strategy"),) if has_strategy else ())
+                + ((r.get("signal_source"),) if has_signal_source else ())
+                + ((r.get("expected_profit"),) if has_expected_profit else ())
+                + (r["fill_time"],)
                 for r in rows
             ],
         )
         logger.debug("datastore.inserted", table="fills_log", count=len(rows))
+
+    def _table_has_column(self, table_ref: str, column: str) -> bool:
+        """Return whether an arbitrary table reference currently has *column*."""
+        try:
+            rows = self._conn.execute(
+                f"DESCRIBE SELECT * FROM {table_ref} LIMIT 0"
+            ).fetchall()
+        except Exception:
+            return False
+        columns = {str(row[0]) for row in rows}
+        return column in columns
+
+    def get_market_state_at(
+        self,
+        ticker: str,
+        as_of: datetime,
+        *,
+        table: str = "market_states",
+    ) -> dict[str, Any] | None:
+        """Return the latest market-state row for *ticker* before *as_of*."""
+        has_snapshot_time = self.has_column("market_states", "snapshot_time") if table == "market_states" else self._table_has_column(table, "snapshot_time")
+        time_expr = (
+            "COALESCE(snapshot_time, ingested_at)"
+            if has_snapshot_time
+            else "ingested_at"
+        )
+        result = self._conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE ticker = ? AND {time_expr} <= ?
+            ORDER BY {time_expr} DESC, ingested_at DESC
+            LIMIT 1
+            """,
+            [ticker, _strip_tz(as_of)],
+        ).fetchone()
+        if result is None:
+            return None
+        columns = [desc[0] for desc in self._conn.description]
+        return dict(zip(columns, result))
+
+    def get_orderbook_at(
+        self,
+        ticker: str,
+        as_of: datetime,
+        *,
+        table: str = "orderbook_snapshots",
+    ) -> dict[str, Any] | None:
+        """Return the latest orderbook snapshot for *ticker* before *as_of*."""
+        result = self._conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE ticker = ? AND COALESCE(snapshot_time, ingested_at) <= ?
+            ORDER BY COALESCE(snapshot_time, ingested_at) DESC, ingested_at DESC
+            LIMIT 1
+            """,
+            [ticker, _strip_tz(as_of)],
+        ).fetchone()
+        if result is None:
+            return None
+        columns = [desc[0] for desc in self._conn.description]
+        row = dict(zip(columns, result))
+        row["yes_levels"] = json.loads(row["yes_levels"])
+        row["no_levels"] = json.loads(row["no_levels"])
+        return row
+
+    def get_market_state_rows_since(
+        self,
+        since: datetime,
+        *,
+        table: str = "market_states",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Return market-state rows ingested at or after *since*."""
+        has_snapshot_time = (
+            self.has_column("market_states", "snapshot_time")
+            if table == "market_states"
+            else self._table_has_column(table, "snapshot_time")
+        )
+        time_expr = (
+            "COALESCE(snapshot_time, ingested_at)"
+            if has_snapshot_time
+            else "ingested_at"
+        )
+        results = self._conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE ingested_at >= ?
+            ORDER BY ingested_at ASC, {time_expr} ASC, ticker ASC
+            LIMIT ?
+            """,
+            [_strip_tz(since), limit],
+        ).fetchall()
+        if not results:
+            return []
+        columns = [desc[0] for desc in self._conn.description]
+        return [dict(zip(columns, row)) for row in results]
+
+    def get_orderbook_rows_since(
+        self,
+        since: datetime,
+        *,
+        table: str = "orderbook_snapshots",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Return orderbook rows ingested at or after *since*."""
+        results = self._conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE ingested_at >= ?
+            ORDER BY ingested_at ASC, COALESCE(snapshot_time, ingested_at) ASC, ticker ASC
+            LIMIT ?
+            """,
+            [_strip_tz(since), limit],
+        ).fetchall()
+        if not results:
+            return []
+        columns = [desc[0] for desc in self._conn.description]
+        parsed_rows: list[dict[str, Any]] = []
+        for result in results:
+            row = dict(zip(columns, result))
+            row["yes_levels"] = json.loads(row["yes_levels"])
+            row["no_levels"] = json.loads(row["no_levels"])
+            parsed_rows.append(row)
+        return parsed_rows
 
     def insert_settlements(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -507,52 +709,6 @@ class DataStore:
     # Point-in-time query methods
     # ------------------------------------------------------------------
 
-    def get_market_state_at(
-        self, ticker: str, as_of: datetime
-    ) -> dict[str, Any] | None:
-        """Return the latest market-state row for *ticker* ingested before *as_of*."""
-        time_expr = (
-            "COALESCE(snapshot_time, ingested_at)"
-            if self.has_column("market_states", "snapshot_time")
-            else "ingested_at"
-        )
-        result = self._conn.execute(
-            f"""
-            SELECT *
-            FROM market_states
-            WHERE ticker = ? AND {time_expr} <= ?
-            ORDER BY {time_expr} DESC, ingested_at DESC
-            LIMIT 1
-            """,
-            [ticker, _strip_tz(as_of)],
-        ).fetchone()
-        if result is None:
-            return None
-        columns = [desc[0] for desc in self._conn.description]
-        return dict(zip(columns, result))
-
-    def get_orderbook_at(
-        self, ticker: str, as_of: datetime
-    ) -> dict[str, Any] | None:
-        """Return the latest orderbook snapshot for *ticker* before *as_of*."""
-        result = self._conn.execute(
-            """
-            SELECT *
-            FROM orderbook_snapshots
-            WHERE ticker = ? AND COALESCE(snapshot_time, ingested_at) <= ?
-            ORDER BY COALESCE(snapshot_time, ingested_at) DESC, ingested_at DESC
-            LIMIT 1
-            """,
-            [ticker, _strip_tz(as_of)],
-        ).fetchone()
-        if result is None:
-            return None
-        columns = [desc[0] for desc in self._conn.description]
-        row = dict(zip(columns, result))
-        # Deserialize JSON levels back to Python objects.
-        row["yes_levels"] = json.loads(row["yes_levels"])
-        row["no_levels"] = json.loads(row["no_levels"])
-        return row
 
     def get_forecasts_at(
         self,

@@ -37,6 +37,8 @@ from moneygone.utils.logging import setup_logging
 
 log = structlog.get_logger("worker.market_data")
 REPO_ROOT = Path(__file__).resolve().parent.parent
+RECORDER_FLUSH_INTERVAL_SECONDS = 1.0
+RECORDER_ORDERBOOK_INTERVAL_SECONDS = 2.0
 
 
 async def _ws_event_handler(
@@ -215,8 +217,17 @@ async def main() -> None:
     store.initialize_schema(MARKET_DATA_TABLES)
 
     rest_client = KalshiRestClient(config.exchange)
-    recorder = MarketDataRecorder(store)
+    recorder = MarketDataRecorder(
+        store,
+        flush_interval_seconds=RECORDER_FLUSH_INTERVAL_SECONDS,
+        orderbook_snapshot_interval=RECORDER_ORDERBOOK_INTERVAL_SECONDS,
+    )
     await recorder.start()
+    log.info(
+        "market_data.recorder_configured",
+        flush_interval_seconds=RECORDER_FLUSH_INTERVAL_SECONDS,
+        orderbook_snapshot_interval=RECORDER_ORDERBOOK_INTERVAL_SECONDS,
+    )
 
     # Shared market discovery — fetches all markets once and caches to JSON
     cache_path = data_dir / "discovered_markets.json"

@@ -154,6 +154,44 @@ class PnLTracker:
             edge=round(edge.fee_adjusted_edge, 4),
         )
 
+    def record_trade_snapshot(
+        self,
+        *,
+        trade_id: str,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: float,
+        fee_paid: float,
+        is_taker: bool,
+        fill_time: datetime,
+        predicted_prob: float,
+        predicted_confidence: float,
+        raw_edge: float,
+        fee_adjusted_edge: float,
+        category: str = "",
+    ) -> None:
+        """Record a persisted trade row without rebuilding full model objects."""
+        self._trades.append(
+            _TradeRecord(
+                trade_id=trade_id,
+                ticker=ticker,
+                side=side,
+                action=action,
+                count=count,
+                price=price,
+                fee_paid=fee_paid,
+                is_taker=is_taker,
+                fill_time=fill_time,
+                predicted_prob=predicted_prob,
+                predicted_confidence=predicted_confidence,
+                raw_edge=raw_edge,
+                fee_adjusted_edge=fee_adjusted_edge,
+                category=category,
+            )
+        )
+
     def record_settlement(self, settlement: Settlement) -> None:
         """Record a market settlement so PnL can be finalized.
 

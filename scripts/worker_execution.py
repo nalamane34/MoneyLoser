@@ -124,6 +124,63 @@ log = structlog.get_logger("worker.execution")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _settlement_key(settlement) -> str:
+    settled_time = settlement.settled_time
+    settled_token = settled_time.isoformat() if settled_time is not None else ""
+    return f"{settlement.ticker}|{settlement.market_result.value}|{settled_token}"
+
+
+def _attach_collector_views(store: DataStore, collector_db: Path) -> bool:
+    """Attach collector DB and create read-only views if available."""
+    store.attach_readonly("collector", collector_db)
+    store.create_attached_views(
+        {
+            "collector": [
+                "forecast_ensembles",
+                "funding_rates",
+                "open_interest",
+            ],
+        }
+    )
+    return True
+
+
+def _attach_market_data_tables(store: DataStore, market_data_db: Path) -> tuple[str, str]:
+    """Attach market-data DB and return shared table references."""
+    store.attach_readonly("market_data", market_data_db)
+    return ("market_data.market_states", "market_data.orderbook_snapshots")
+
+
+async def _sync_new_settlements(
+    *,
+    rest_client: KalshiRestClient,
+    store: DataStore,
+    risk_manager: RiskManager,
+    seen_keys: set[str],
+    limit: int = 200,
+) -> int:
+    """Persist and apply previously unseen settlement records."""
+    new_count = 0
+    settlements = await rest_client.get_settlements(limit=limit, paginate=True)
+    for settlement in settlements:
+        key = _settlement_key(settlement)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        store.insert_settlements([
+            {
+                "ticker": settlement.ticker,
+                "market_result": settlement.market_result.value,
+                "revenue": float(settlement.revenue),
+                "payout": float(settlement.revenue),
+                "settled_time": settlement.settled_time.isoformat(),
+            }
+        ])
+        risk_manager.post_settlement_update(settlement)
+        new_count += 1
+    return new_count
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Execution engine worker")
     parser.add_argument("--config", default="config/default.yaml")
@@ -155,22 +212,33 @@ async def main() -> None:
     collector_db = data_dir / "collector.duckdb"
     collector_attached = False
     try:
-        store.attach_readonly("collector", collector_db)
-        store.create_attached_views(
-            {
-                "collector": [
-                    "forecast_ensembles",
-                    "funding_rates",
-                    "open_interest",
-                ],
-            }
-        )
-        collector_attached = True
+        collector_attached = _attach_collector_views(store, collector_db)
         log.info("execution.collector_attached")
     except Exception:
         log.warning(
             "execution.collector_attach_failed",
             msg="collector DB locked — weather/crypto views unavailable, sports-only mode",
+        )
+
+    market_data_db = data_dir / "market_data.duckdb"
+    market_data_attached = False
+    shared_market_state_table: str | None = None
+    shared_orderbook_table: str | None = None
+    try:
+        shared_market_state_table, shared_orderbook_table = _attach_market_data_tables(
+            store,
+            market_data_db,
+        )
+        market_data_attached = True
+        log.info(
+            "execution.market_data_attached",
+            market_state_table=shared_market_state_table,
+            orderbook_table=shared_orderbook_table,
+        )
+    except Exception:
+        log.warning(
+            "execution.market_data_attach_failed",
+            msg="market_data DB locked — shared market snapshots unavailable until retry succeeds",
         )
 
     # Cross-DB reads: DuckDB doesn't support cross-process concurrent access.
@@ -457,6 +525,8 @@ async def main() -> None:
         category_providers=category_providers,
         discovery_cache_path=discovery_cache_path,
         sportsbook_parquet_path=sportsbook_parquet,
+        shared_market_state_table=shared_market_state_table,
+        shared_orderbook_table=shared_orderbook_table,
         demo_mode=config.exchange.demo_mode,
     )
 
@@ -669,18 +739,36 @@ async def main() -> None:
 
     # Settlement checker for kill switch — polls settlements and marks wins/losses
     async def _settlement_checker_loop() -> None:
-        """Periodically check settlements and update kill switch."""
-        if kill_switch is None:
-            return
-        seen_settlements: set[str] = set()
-        # Collect tickers from both closer strategies
+        """Periodically sync settlements for risk/accounting and kill switch."""
+        seen_settlements = {
+            f"{row['ticker']}|{row['market_result']}|{row['settled_time'].isoformat() if hasattr(row['settled_time'], 'isoformat') else row['settled_time']}"
+            for row in store.get_settlements()
+        }
+        kill_switch_processed: set[str] = set()
         while not shutdown.is_set():
             try:
-                settlements = await rest_client.get_settlements(limit=50)
+                synced = await _sync_new_settlements(
+                    rest_client=rest_client,
+                    store=store,
+                    risk_manager=risk_manager,
+                    seen_keys=seen_settlements,
+                    limit=200,
+                )
+                if synced:
+                    log.info("execution.settlements_synced", count=synced)
+
+                if kill_switch is None:
+                    await asyncio.sleep(60)
+                    continue
+
+                settlements = await rest_client.get_settlements(limit=200, paginate=True)
                 for s in settlements:
-                    if s.ticker in seen_settlements:
+                    settlement_key = _settlement_key(s)
+                    if settlement_key not in seen_settlements:
                         continue
-                    seen_settlements.add(s.ticker)
+                    if settlement_key in kill_switch_processed:
+                        continue
+                    kill_switch_processed.add(settlement_key)
 
                     # Check if this settlement is from a closer strategy trade
                     is_closer_trade = False
@@ -723,6 +811,51 @@ async def main() -> None:
 
             await asyncio.sleep(60)  # Check every 60 seconds
 
+    async def _collector_attach_retry_loop() -> None:
+        """Retry collector attachment until weather/crypto historical views are available."""
+        nonlocal collector_attached
+        while not shutdown.is_set():
+            if collector_attached:
+                await asyncio.sleep(60)
+                continue
+            try:
+                collector_attached = _attach_collector_views(store, collector_db)
+                if collector_attached:
+                    log.info("execution.collector_attached_retry_success")
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.debug("execution.collector_attach_retry_failed", exc_info=True)
+            await asyncio.sleep(60)
+
+    async def _market_data_attach_retry_loop() -> None:
+        """Retry market-data attachment until shared snapshots are available."""
+        nonlocal market_data_attached, shared_market_state_table, shared_orderbook_table
+        while not shutdown.is_set():
+            if market_data_attached:
+                await asyncio.sleep(60)
+                continue
+            try:
+                (
+                    shared_market_state_table,
+                    shared_orderbook_table,
+                ) = _attach_market_data_tables(store, market_data_db)
+                market_data_attached = True
+                engine.set_shared_market_data_tables(
+                    market_state_table=shared_market_state_table,
+                    orderbook_table=shared_orderbook_table,
+                )
+                log.info(
+                    "execution.market_data_attached_retry_success",
+                    market_state_table=shared_market_state_table,
+                    orderbook_table=shared_orderbook_table,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.debug("execution.market_data_attach_retry_failed", exc_info=True)
+            await asyncio.sleep(60)
+
     # ---- Periodic P&L reconciliation ----
     async def _reconciliation_loop() -> None:
         """Compare local P&L against exchange balance every 5 minutes."""
@@ -743,6 +876,8 @@ async def main() -> None:
     settlement_task: asyncio.Task | None = None
     health_task: asyncio.Task | None = None
     reconciliation_task: asyncio.Task | None = None
+    collector_attach_task: asyncio.Task | None = None
+    market_data_attach_task: asyncio.Task | None = None
 
     try:
         await engine.start()
@@ -755,13 +890,25 @@ async def main() -> None:
             await live_event_edge.start()
             log.info("execution.live_edge_started")
 
-        # Start settlement checker for kill switch
-        if kill_switch is not None:
-            settlement_task = asyncio.create_task(
-                _settlement_checker_loop(),
-                name="settlement_checker",
+        settlement_task = asyncio.create_task(
+            _settlement_checker_loop(),
+            name="settlement_checker",
+        )
+        log.info("execution.settlement_checker_started")
+
+        if not collector_attached:
+            collector_attach_task = asyncio.create_task(
+                _collector_attach_retry_loop(),
+                name="collector_attach_retry",
             )
-            log.info("execution.settlement_checker_started")
+            log.info("execution.collector_attach_retry_started", path=str(collector_db))
+
+        if not market_data_attached:
+            market_data_attach_task = asyncio.create_task(
+                _market_data_attach_retry_loop(),
+                name="market_data_attach_retry",
+            )
+            log.info("execution.market_data_attach_retry_started", path=str(market_data_db))
 
         # Start health status writer
         health_task = asyncio.create_task(
@@ -811,6 +958,20 @@ async def main() -> None:
             reconciliation_task.cancel()
             try:
                 await reconciliation_task
+            except asyncio.CancelledError:
+                pass
+
+        if collector_attach_task is not None:
+            collector_attach_task.cancel()
+            try:
+                await collector_attach_task
+            except asyncio.CancelledError:
+                pass
+
+        if market_data_attach_task is not None:
+            market_data_attach_task.cancel()
+            try:
+                await market_data_attach_task
             except asyncio.CancelledError:
                 pass
 

@@ -248,8 +248,8 @@ class OrderbookSnapshot:
         )
         return cls(
             ticker=ticker,
-            yes_bids=yes_bids,
-            no_bids=no_bids,
+            yes_bids=tuple(sorted(yes_bids, key=lambda level: level.price)),
+            no_bids=tuple(sorted(no_bids, key=lambda level: level.price)),
             seq=seq,
             timestamp=timestamp or now_utc(),
         )

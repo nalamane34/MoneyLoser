@@ -483,14 +483,20 @@ class KalshiRestClient:
     def _parse_orderbook(data: dict[str, Any], ticker: str) -> OrderbookSnapshot:
         # Kalshi API returns orderbook levels under yes_dollars/no_dollars
         # (inside orderbook_fp), falling back to legacy yes/no keys.
-        yes_levels = tuple(
-            OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
-            for lvl in (data.get("yes_dollars", data.get("yes")) or [])
-        )
-        no_levels = tuple(
-            OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
-            for lvl in (data.get("no_dollars", data.get("no")) or [])
-        )
+        yes_levels = tuple(sorted(
+            (
+                OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
+                for lvl in (data.get("yes_dollars", data.get("yes")) or [])
+            ),
+            key=lambda level: level.price,
+        ))
+        no_levels = tuple(sorted(
+            (
+                OrderbookLevel(price=_dec(lvl[0]), contracts=_dec(lvl[1]))
+                for lvl in (data.get("no_dollars", data.get("no")) or [])
+            ),
+            key=lambda level: level.price,
+        ))
         return OrderbookSnapshot(
             ticker=ticker,
             yes_bids=yes_levels,
@@ -680,12 +686,25 @@ class KalshiRestClient:
 
         Filters: ``ticker``, ``cursor``, ``limit``.
         """
-        data = await self._request(
-            "GET",
-            "/portfolio/settlements",
-            params=self._with_subaccount_param(filters),
-        )
-        return [self._parse_settlement(s) for s in data.get("settlements", [])]
+        paginate = bool(filters.pop("paginate", False))
+        cursor = str(filters.pop("cursor", "") or "")
+        settlements: list[Settlement] = []
+
+        while True:
+            params = dict(filters)
+            if cursor:
+                params["cursor"] = cursor
+            data = await self._request(
+                "GET",
+                "/portfolio/settlements",
+                params=self._with_subaccount_param(params),
+            )
+            settlements.extend(self._parse_settlement(s) for s in data.get("settlements", []))
+            cursor = str(data.get("cursor", "") or "")
+            if not paginate or not cursor:
+                break
+
+        return settlements
 
     # ------------------------------------------------------------------
     # Orders

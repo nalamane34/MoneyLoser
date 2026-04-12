@@ -134,6 +134,20 @@ class _ReconcileClient:
         return list(self.orders)
 
 
+class _CancelClient:
+    def __init__(self, refreshed_order: Order | None = None) -> None:
+        self.cancelled: list[str] = []
+        self.refreshed_order = refreshed_order
+
+    async def cancel_order(self, order_id: str) -> None:
+        self.cancelled.append(order_id)
+
+    async def get_order(self, order_id: str) -> Order:
+        if self.refreshed_order is None:
+            raise RuntimeError("refresh unavailable")
+        return self.refreshed_order
+
+
 class TestOrderManagerReconcile:
     def test_reconcile_fetches_paginated_active_orders_not_just_resting(self) -> None:
         client = _ReconcileClient(
@@ -156,3 +170,39 @@ class TestOrderManagerReconcile:
             "pending-order",
         }
         assert client.calls == [{"limit": 1000, "paginate": True}]
+
+
+class TestOrderManagerCancelLifecycle:
+    def test_cancel_order_keeps_order_tracked_when_confirmation_is_ambiguous(self) -> None:
+        order = _make_order(order_id="order-1")
+        client = _CancelClient(
+            refreshed_order=_make_order(order_id="order-1", status=OrderStatus.PENDING)
+        )
+        manager = _make_manager(order)
+        manager._client = client  # type: ignore[attr-defined]
+
+        import asyncio
+
+        confirmed = asyncio.run(manager.cancel_order("order-1"))
+
+        assert confirmed is False
+        assert client.cancelled == ["order-1"]
+        assert "order-1" in manager._open_orders  # type: ignore[attr-defined]
+        assert "order-1" in manager._pending_cancel_order_ids  # type: ignore[attr-defined]
+
+    def test_cancel_order_forgets_order_after_confirmed_exchange_closure(self) -> None:
+        order = _make_order(order_id="order-1")
+        client = _CancelClient(
+            refreshed_order=_make_order(order_id="order-1", status=OrderStatus.CANCELED)
+        )
+        manager = _make_manager(order)
+        manager._client = client  # type: ignore[attr-defined]
+
+        import asyncio
+
+        confirmed = asyncio.run(manager.cancel_order("order-1"))
+
+        assert confirmed is True
+        assert client.cancelled == ["order-1"]
+        assert "order-1" not in manager._open_orders  # type: ignore[attr-defined]
+        assert "order-1" not in manager._pending_cancel_order_ids  # type: ignore[attr-defined]

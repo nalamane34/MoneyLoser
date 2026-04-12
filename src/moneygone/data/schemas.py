@@ -216,6 +216,16 @@ CREATE TABLE IF NOT EXISTS fills_log (
     count       INTEGER NOT NULL,
     price       DOUBLE NOT NULL,
     is_taker    BOOLEAN NOT NULL,
+    fee_paid    DOUBLE,
+    category    VARCHAR,
+    model_name  VARCHAR,
+    predicted_prob DOUBLE,
+    predicted_confidence DOUBLE,
+    raw_edge    DOUBLE,
+    fee_adjusted_edge DOUBLE,
+    strategy    VARCHAR,
+    signal_source VARCHAR,
+    expected_profit DOUBLE,
     fill_time   TIMESTAMP NOT NULL,
     ingested_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );

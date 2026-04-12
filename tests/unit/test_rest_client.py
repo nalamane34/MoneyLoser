@@ -348,6 +348,69 @@ def test_get_orders_can_follow_cursor_pagination() -> None:
     ]
 
 
+def test_get_settlements_can_follow_cursor_pagination() -> None:
+    client = KalshiRestClient.__new__(KalshiRestClient)
+    client._subaccount = 4  # type: ignore[attr-defined]
+    calls: list[dict[str, object]] = []
+
+    async def _fake_request(method: str, path: str, params=None):
+        assert method == "GET"
+        assert path == "/portfolio/settlements"
+        calls.append(dict(params or {}))
+        if not params or not params.get("cursor"):
+            return {
+                "settlements": [
+                    {
+                        "ticker": "KXTEST-1",
+                        "market_result": "yes",
+                        "revenue": 100,
+                        "settled_time": "2026-04-09T18:00:00Z",
+                    }
+                ],
+                "cursor": "next-page",
+            }
+        return {
+            "settlements": [
+                {
+                    "ticker": "KXTEST-2",
+                    "market_result": "no",
+                    "revenue": 0,
+                    "settled_time": "2026-04-09T18:01:00Z",
+                }
+            ],
+            "cursor": None,
+        }
+
+    client._request = _fake_request  # type: ignore[attr-defined]
+
+    import asyncio
+
+    settlements = asyncio.run(
+        KalshiRestClient.get_settlements(client, limit=100, paginate=True)
+    )
+
+    assert [settlement.ticker for settlement in settlements] == ["KXTEST-1", "KXTEST-2"]
+    assert calls == [
+        {"limit": 100, "subaccount": 4},
+        {"limit": 100, "cursor": "next-page", "subaccount": 4},
+    ]
+
+
+def test_parse_orderbook_sorts_levels_ascending() -> None:
+    orderbook = KalshiRestClient._parse_orderbook(
+        {
+            "yes_dollars": [["0.70", "2"], ["0.10", "1"], ["0.55", "3"]],
+            "no_dollars": [["0.60", "1"], ["0.25", "5"]],
+            "seq": 9,
+            "timestamp": "2026-04-11T01:00:00Z",
+        },
+        "KXTEST-BOOK",
+    )
+
+    assert [str(level.price) for level in orderbook.yes_bids] == ["0.10", "0.55", "0.70"]
+    assert [str(level.price) for level in orderbook.no_bids] == ["0.25", "0.60"]
+
+
 def test_request_signs_path_without_query_parameters() -> None:
     client = KalshiRestClient.__new__(KalshiRestClient)
 

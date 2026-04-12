@@ -112,15 +112,59 @@ class OrderManager:
     # Cancellation
     # ------------------------------------------------------------------
 
-    async def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order by exchange order ID.
 
-        Removes the order from local tracking after successful cancellation.
+        Returns ``True`` when cancellation is authoritatively closed from the
+        local order manager's perspective. If exchange confirmation is still
+        ambiguous, the order remains tracked in a pending-cancel state so the
+        engine does not immediately re-enter the same thesis.
         """
         logger.info("order_manager.cancelling", order_id=order_id)
+        tracked_locally = order_id in self._open_orders
+        if tracked_locally:
+            self._pending_cancel_order_ids.add(order_id)
         await self._client.cancel_order(order_id)
-        self._forget_order(order_id)
-        logger.info("order_manager.cancelled", order_id=order_id)
+        if not tracked_locally:
+            logger.info("order_manager.cancelled", order_id=order_id, confirmed_closed=True)
+            return True
+
+        confirmed_closed = False
+        try:
+            refreshed = await self._client.get_order(order_id)
+        except OrderError as exc:
+            if exc.status_code == 404:
+                self._forget_order(order_id)
+                confirmed_closed = True
+            else:
+                logger.debug(
+                    "order_manager.cancel_confirmation_failed",
+                    order_id=order_id,
+                    exc_info=True,
+                )
+        except Exception:
+            logger.debug(
+                "order_manager.cancel_confirmation_failed",
+                order_id=order_id,
+                exc_info=True,
+            )
+        else:
+            if refreshed.status in (OrderStatus.CANCELED, OrderStatus.EXECUTED):
+                self._forget_order(order_id)
+                confirmed_closed = True
+            else:
+                self._open_orders[order_id] = refreshed
+                if refreshed.client_order_id:
+                    self._client_order_ids[refreshed.client_order_id] = order_id
+                    self._order_client_order_ids[order_id] = refreshed.client_order_id
+
+        logger.info(
+            "order_manager.cancelled",
+            order_id=order_id,
+            confirmed_closed=confirmed_closed,
+            pending_cancel=order_id in self._pending_cancel_order_ids,
+        )
+        return confirmed_closed
 
     async def cancel_all(self, ticker: str | None = None) -> int:
         """Cancel all open orders, optionally filtered by ticker.

@@ -458,6 +458,7 @@ def build_app(config: AppConfig) -> Application:
     log.info("build_app.monitoring_ready")
 
     # 9. Execution components
+    fill_tracker = FillTracker(store=store)
     order_manager = OrderManager(rest_client)
     portfolio_tracker = PortfolioTracker()
     drawdown_monitor = DrawdownMonitor()
@@ -554,7 +555,6 @@ def build_app(config: AppConfig) -> Application:
             store=store,
         )
         ws_client = KalshiWebSocket(config.exchange)
-        fill_tracker = FillTracker(store=store)
         sports_provider = StoreBackedSportsSnapshotProvider(
             store,
             leagues=config.sportsbook.leagues,

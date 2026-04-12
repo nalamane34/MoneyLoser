@@ -145,6 +145,8 @@ class ExecutionEngine:
         category_providers: dict[MarketCategory, CategoryProvider] | None = None,
         discovery_cache_path: Path | None = None,
         sportsbook_parquet_path: Path | None = None,
+        shared_market_state_table: str | None = None,
+        shared_orderbook_table: str | None = None,
         demo_mode: bool = False,
     ) -> None:
         self._rest = rest_client
@@ -166,12 +168,16 @@ class ExecutionEngine:
         self._category_providers = category_providers or {}
         self._discovery_cache_path = discovery_cache_path
         self._sportsbook_parquet_path = sportsbook_parquet_path
+        self._shared_market_state_table = shared_market_state_table
+        self._shared_orderbook_table = shared_orderbook_table
         self._last_parquet_mtime: float = 0.0
 
         self._running = False
         self._eval_task: asyncio.Task[None] | None = None
         self._stale_order_task: asyncio.Task[None] | None = None
+        self._shared_market_data_task: asyncio.Task[None] | None = None
         self._market_cache: dict[str, Market] = {}
+        self._shared_orderbook_cache: dict[str, OrderbookSnapshot] = {}
         self._market_categories: dict[str, MarketCategory] = {}
         self._last_eval: dict[str, datetime] = {}
         self._stale_rechecks_inflight: set[str] = set()
@@ -184,6 +190,22 @@ class ExecutionEngine:
         self._last_portfolio_sync: datetime = datetime.now(timezone.utc)
         self._seen_fill_ids: set[str] = set()
         self._recent_fill_ids: deque[str] = deque()
+        self._prediction_rows: list[dict[str, Any]] = []
+        self._feature_rows: list[dict[str, Any]] = []
+        self._shared_market_cursor_time: datetime | None = None
+        self._shared_market_cursor_keys: set[str] = set()
+        self._shared_orderbook_cursor_time: datetime | None = None
+        self._shared_orderbook_cursor_keys: set[str] = set()
+
+    def set_shared_market_data_tables(
+        self,
+        *,
+        market_state_table: str | None,
+        orderbook_table: str | None,
+    ) -> None:
+        """Enable shared read-only market-data tables after startup."""
+        self._shared_market_state_table = market_state_table
+        self._shared_orderbook_table = orderbook_table
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -232,6 +254,7 @@ class ExecutionEngine:
 
         self._ws.set_on_event(self.on_event)
         await self._refresh_market_universe(force=True)
+        self._initialize_shared_market_data_sync()
 
         # Connect WebSocket and subscribe to essential channels only.
         # Subscribing to orderbook/ticker/trades for 10K+ tickers hangs
@@ -242,6 +265,10 @@ class ExecutionEngine:
         await self._ws.subscribe_positions()
 
         # Launch periodic maintenance/evaluation loops
+        if self._shared_market_state_table is not None or self._shared_orderbook_table is not None:
+            self._shared_market_data_task = asyncio.create_task(
+                self._shared_market_data_loop()
+            )
         self._stale_order_task = asyncio.create_task(self._stale_order_loop())
         self._eval_task = asyncio.create_task(self._periodic_evaluation_loop())
 
@@ -273,12 +300,23 @@ class ExecutionEngine:
                 pass
             self._stale_order_task = None
 
+        shared_market_task = getattr(self, "_shared_market_data_task", None)
+        if shared_market_task is not None:
+            shared_market_task.cancel()
+            try:
+                await shared_market_task
+            except asyncio.CancelledError:
+                pass
+            self._shared_market_data_task = None
+
         # Cancel all open orders
         try:
             cancelled = await self._orders.cancel_all()
             logger.info("engine.orders_cancelled", count=cancelled)
         except Exception:
             logger.warning("engine.cancel_all_failed", exc_info=True)
+
+        self._flush_observability_buffers()
 
         # Disconnect WebSocket
         await self._ws.disconnect()
@@ -605,6 +643,8 @@ class ExecutionEngine:
         cat_str = category.value
         candidate_ctx = self._candidate_context_fields(ticker, cycle_id=cycle_id)
 
+        self._refresh_market_cache_from_shared_store(ticker, now)
+
         if any(order.ticker == ticker for order in self._orders.get_open_orders()):
             self._log_candidate(
                 ticker=ticker,
@@ -617,6 +657,8 @@ class ExecutionEngine:
 
         # 1. Get current orderbook (try WS first, fall back to REST)
         orderbook = self._ws.get_orderbook(ticker)
+        if orderbook is None:
+            orderbook = self._get_orderbook_from_shared_store(ticker, now)
         if orderbook is None:
             try:
                 orderbook = await self._rest.get_orderbook(ticker)
@@ -726,6 +768,8 @@ class ExecutionEngine:
                 )
                 return None
             prediction = self._model.predict_proba(features)
+
+        self._queue_prediction_row(ticker, prediction)
 
         # Common fields for all subsequent log entries
         market_prob_est: float | None = None
@@ -952,6 +996,8 @@ class ExecutionEngine:
             **candidate_ctx,
         )
 
+        self._queue_feature_rows(ticker, now, features)
+
         return decision
 
     async def execute_decision(self, decision: TradeDecision) -> None:
@@ -982,6 +1028,11 @@ class ExecutionEngine:
                 return
 
         orderbook = self._ws.get_orderbook(decision.ticker)
+        if orderbook is None:
+            orderbook = self._get_orderbook_from_shared_store(
+                decision.ticker,
+                datetime.now(timezone.utc),
+            )
         if orderbook is None:
             try:
                 orderbook = await self._rest.get_orderbook(decision.ticker)
@@ -1111,6 +1162,7 @@ class ExecutionEngine:
 
                 # Per-cycle summary for stress test analysis
                 if cycle_evaluated > 0:
+                    self._flush_observability_buffers()
                     elapsed_s = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                     logger.info(
                         "engine.cycle_summary",
@@ -1140,6 +1192,18 @@ class ExecutionEngine:
                 return
             except Exception:
                 logger.exception("engine.stale_order_loop_error")
+                await asyncio.sleep(1.0)
+
+    async def _shared_market_data_loop(self) -> None:
+        """Continuously tail shared market-data tables into local hot caches."""
+        while self._running:
+            try:
+                await asyncio.sleep(1.0)
+                self._poll_shared_market_data_once()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("engine.shared_market_data_loop_error")
                 await asyncio.sleep(1.0)
 
     async def _recheck_ticker_after_stale_cancel(self, ticker: str) -> None:
@@ -1359,9 +1423,10 @@ class ExecutionEngine:
         cancelled_tickers: list[str] = []
         for order, age_seconds in stale_orders:
             try:
-                await self._orders.cancel_order(order.order_id)
+                confirmed_closed = await self._orders.cancel_order(order.order_id)
                 cancelled += 1
-                cancelled_tickers.append(order.ticker)
+                if confirmed_closed:
+                    cancelled_tickers.append(order.ticker)
             except Exception:
                 logger.warning(
                     "engine.cancel_stale_order_failed",
@@ -1562,6 +1627,11 @@ class ExecutionEngine:
         )
 
     async def _get_market(self, ticker: str) -> Market | None:
+        market = self._market_cache.get(ticker)
+        if market is not None:
+            return market
+
+        self._refresh_market_cache_from_shared_store(ticker, datetime.now(timezone.utc))
         market = self._market_cache.get(ticker)
         if market is not None:
             return market
@@ -1798,6 +1868,286 @@ class ExecutionEngine:
         ]
         for client_order_id in stale_client_order_ids:
             self._decision_context_by_client_order_id.pop(client_order_id, None)
+
+    def _queue_prediction_row(
+        self,
+        ticker: str,
+        prediction: ModelPrediction,
+    ) -> None:
+        if self._store is None:
+            return
+        self._prediction_rows.append(
+            {
+                "ticker": ticker,
+                "model_name": prediction.model_name,
+                "model_version": prediction.model_version,
+                "probability": prediction.probability,
+                "raw_probability": prediction.raw_probability,
+                "confidence": prediction.confidence,
+                "prediction_time": prediction.prediction_time.isoformat(),
+            }
+        )
+
+    def _queue_feature_rows(
+        self,
+        ticker: str,
+        observation_time: datetime,
+        features: dict[str, float],
+    ) -> None:
+        if self._store is None or not features:
+            return
+        self._feature_rows.extend(
+            {
+                "ticker": ticker,
+                "observation_time": observation_time.isoformat(),
+                "feature_name": name,
+                "feature_value": value,
+            }
+            for name, value in features.items()
+        )
+
+    def _flush_observability_buffers(self) -> None:
+        if self._store is None:
+            self._prediction_rows.clear()
+            self._feature_rows.clear()
+            return
+
+        if self._prediction_rows:
+            try:
+                self._store.insert_predictions(self._prediction_rows)
+            except Exception:
+                logger.warning("engine.prediction_persist_failed", exc_info=True)
+            finally:
+                self._prediction_rows.clear()
+
+        if self._feature_rows:
+            try:
+                self._store.insert_features(self._feature_rows)
+            except Exception:
+                logger.warning("engine.feature_persist_failed", exc_info=True)
+            finally:
+                self._feature_rows.clear()
+
+    def _initialize_shared_market_data_sync(self) -> None:
+        """Seed cursors so shared-market polling tails only new rows."""
+        if self._store is None:
+            return
+        if (
+            getattr(self, "_shared_market_state_table", None) is not None
+            and getattr(self, "_shared_market_cursor_time", None) is None
+        ):
+            self._shared_market_cursor_time = datetime.now(timezone.utc) - timedelta(seconds=2)
+            self._shared_market_cursor_keys.clear()
+        if (
+            getattr(self, "_shared_orderbook_table", None) is not None
+            and getattr(self, "_shared_orderbook_cursor_time", None) is None
+        ):
+            self._shared_orderbook_cursor_time = datetime.now(timezone.utc) - timedelta(seconds=2)
+            self._shared_orderbook_cursor_keys.clear()
+
+    def _poll_shared_market_data_once(self) -> None:
+        """Poll attached market-data tables once and update local caches."""
+        if self._store is None:
+            return
+
+        if (
+            self._shared_market_state_table is not None
+            and self._shared_market_cursor_time is not None
+        ):
+            try:
+                rows = self._store.get_market_state_rows_since(
+                    self._shared_market_cursor_time,
+                    table=self._shared_market_state_table,
+                    limit=5000,
+                )
+                self._ingest_shared_market_rows(rows)
+            except Exception:
+                logger.debug("engine.shared_market_state_poll_failed", exc_info=True)
+
+        if (
+            self._shared_orderbook_table is not None
+            and self._shared_orderbook_cursor_time is not None
+        ):
+            try:
+                rows = self._store.get_orderbook_rows_since(
+                    self._shared_orderbook_cursor_time,
+                    table=self._shared_orderbook_table,
+                    limit=5000,
+                )
+                self._ingest_shared_orderbook_rows(rows)
+            except Exception:
+                logger.debug("engine.shared_orderbook_poll_failed", exc_info=True)
+
+    def _ingest_shared_market_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Apply new shared market-state rows to the local cache."""
+        latest_time = self._shared_market_cursor_time
+        latest_keys = set(self._shared_market_cursor_keys)
+        cursor_time = self._shared_market_cursor_time
+        cursor_keys = self._shared_market_cursor_keys
+
+        for row in rows:
+            ingested_at = self._parse_timestamp(row.get("ingested_at"))
+            if ingested_at is None:
+                continue
+            row_key = (
+                f"{row.get('ticker', '')}|"
+                f"{row.get('snapshot_time', '')}|"
+                f"{row.get('last_price', '')}"
+            )
+            if cursor_time is not None:
+                if ingested_at < cursor_time:
+                    continue
+                if ingested_at == cursor_time and row_key in cursor_keys:
+                    continue
+
+            market = self._merge_market_update(
+                str(row.get("ticker", "")),
+                row,
+                self._parse_timestamp(row.get("snapshot_time"), fallback=ingested_at),
+            )
+            if market is not None:
+                self._market_cache[market.ticker] = market
+
+            if latest_time is None or ingested_at > latest_time:
+                latest_time = ingested_at
+                latest_keys = {row_key}
+            elif ingested_at == latest_time:
+                latest_keys.add(row_key)
+
+        if latest_time is not None:
+            self._shared_market_cursor_time = latest_time
+            self._shared_market_cursor_keys = latest_keys
+
+    def _ingest_shared_orderbook_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Apply new shared orderbook rows to the local hot cache."""
+        latest_time = self._shared_orderbook_cursor_time
+        latest_keys = set(self._shared_orderbook_cursor_keys)
+        cursor_time = self._shared_orderbook_cursor_time
+        cursor_keys = self._shared_orderbook_cursor_keys
+
+        for row in rows:
+            ingested_at = self._parse_timestamp(row.get("ingested_at"))
+            if ingested_at is None:
+                continue
+            row_key = (
+                f"{row.get('ticker', '')}|{row.get('seq', 0)}|"
+                f"{row.get('snapshot_time', '')}"
+            )
+            if cursor_time is not None:
+                if ingested_at < cursor_time:
+                    continue
+                if ingested_at == cursor_time and row_key in cursor_keys:
+                    continue
+
+            snapshot = self._build_orderbook_from_shared_row(
+                str(row.get("ticker", "")),
+                row,
+                fallback_time=ingested_at,
+            )
+            if snapshot is not None:
+                self._shared_orderbook_cache[snapshot.ticker] = snapshot
+
+            if latest_time is None or ingested_at > latest_time:
+                latest_time = ingested_at
+                latest_keys = {row_key}
+            elif ingested_at == latest_time:
+                latest_keys.add(row_key)
+
+        if latest_time is not None:
+            self._shared_orderbook_cursor_time = latest_time
+            self._shared_orderbook_cursor_keys = latest_keys
+
+    def _refresh_market_cache_from_shared_store(
+        self,
+        ticker: str,
+        as_of: datetime,
+    ) -> None:
+        if self._store is None or self._shared_market_state_table is None:
+            return
+        try:
+            row = self._store.get_market_state_at(
+                ticker,
+                as_of,
+                table=self._shared_market_state_table,
+            )
+        except Exception:
+            logger.debug("engine.shared_market_state_lookup_failed", ticker=ticker, exc_info=True)
+            return
+        if row is None:
+            return
+        market = self._merge_market_update(ticker, row, as_of)
+        if market is not None:
+            self._market_cache[ticker] = market
+
+    def _get_orderbook_from_shared_store(
+        self,
+        ticker: str,
+        as_of: datetime,
+    ) -> OrderbookSnapshot | None:
+        cached = getattr(self, "_shared_orderbook_cache", {}).get(ticker)
+        if cached is not None:
+            if (as_of - cached.timestamp).total_seconds() <= 5.0:
+                return cached
+        if self._store is None or getattr(self, "_shared_orderbook_table", None) is None:
+            return None
+        try:
+            row = self._store.get_orderbook_at(
+                ticker,
+                as_of,
+                table=self._shared_orderbook_table,
+            )
+        except Exception:
+            logger.debug("engine.shared_orderbook_lookup_failed", ticker=ticker, exc_info=True)
+            return None
+        if row is None:
+            return None
+        snapshot = self._build_orderbook_from_shared_row(
+            ticker,
+            row,
+            fallback_time=as_of,
+        )
+        if snapshot is None:
+            return None
+        if (as_of - snapshot.timestamp).total_seconds() > 5.0:
+            return None
+        return snapshot
+
+    def _build_orderbook_from_shared_row(
+        self,
+        ticker: str,
+        row: dict[str, Any],
+        *,
+        fallback_time: datetime,
+    ) -> OrderbookSnapshot | None:
+        snapshot_time = self._parse_timestamp(row.get("snapshot_time"), fallback=fallback_time)
+        if snapshot_time is None:
+            snapshot_time = fallback_time
+
+        def _parse_levels(raw_levels: Any) -> tuple[Any, ...]:
+            from moneygone.exchange.types import OrderbookLevel
+
+            levels = []
+            for level in raw_levels or []:
+                if isinstance(level, dict):
+                    price = level.get("price")
+                    contracts = level.get("contracts")
+                else:
+                    price, contracts = level
+                levels.append(
+                    OrderbookLevel(
+                        price=Decimal(str(price)),
+                        contracts=Decimal(str(contracts)),
+                    )
+                )
+            return tuple(sorted(levels, key=lambda lvl: lvl.price))
+
+        return OrderbookSnapshot(
+            ticker=ticker,
+            yes_bids=_parse_levels(row.get("yes_levels")),
+            no_bids=_parse_levels(row.get("no_levels")),
+            seq=int(row.get("seq", 0) or 0),
+            timestamp=snapshot_time,
+        )
 
     def _merge_market_update(
         self,
