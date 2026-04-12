@@ -529,6 +529,86 @@ async def test_refresh_market_universe_bounds_watchlist_and_prioritizes_near_ter
     assert "KXILLIQ-1" not in engine._watched
 
 
+@pytest.mark.asyncio
+async def test_refresh_market_universe_filters_and_caps_sports_matches() -> None:
+    now = datetime.now(timezone.utc)
+    sports_markets = [
+        _market(
+            "KXSPORTS-NEAR-1",
+            event_ticker="EVT-S-1",
+            yes_sub_title="Sports Near 1",
+            volume=200,
+            open_interest=150,
+            close_time=now + timedelta(hours=12),
+            category="sports",
+        ),
+        _market(
+            "KXSPORTS-NEAR-2",
+            event_ticker="EVT-S-2",
+            yes_sub_title="Sports Near 2",
+            volume=180,
+            open_interest=140,
+            close_time=now + timedelta(hours=18),
+            category="sports",
+        ),
+        _market(
+            "KXSPORTS-NEAR-3",
+            event_ticker="EVT-S-3",
+            yes_sub_title="Sports Near 3",
+            volume=160,
+            open_interest=130,
+            close_time=now + timedelta(hours=24),
+            category="sports",
+        ),
+        _market(
+            "KXSPORTS-FAR",
+            event_ticker="EVT-S-FAR",
+            yes_sub_title="Sports Far",
+            volume=400,
+            open_interest=300,
+            close_time=now + timedelta(hours=240),
+            category="sports",
+        ),
+    ]
+
+    class _FakeSports:
+        async def refresh(self, _markets: list[Market]) -> list[Market]:
+            return list(sports_markets)
+
+    engine = object.__new__(ExecutionEngine)
+    engine._config = SimpleNamespace(
+        max_watched_markets=10,
+        max_core_markets_per_category=2,
+        max_fallback_markets_per_category=1,
+        max_core_market_horizon_hours=120.0,
+        max_fallback_market_horizon_hours=48.0,
+        min_market_volume=25,
+        min_market_open_interest=25,
+        max_market_spread=0.20,
+    )
+    engine._last_universe_refresh = None
+    engine._discovery_cache_path = None
+    engine._rest = SimpleNamespace(
+        get_all_markets=lambda **_kwargs: asyncio.sleep(0, result=sports_markets),
+    )
+    engine._sportsbook_parquet_path = None
+    engine._store = None
+    engine._sports = _FakeSports()
+    engine._orders = SimpleNamespace(get_open_orders=lambda: [])
+    engine._risk = SimpleNamespace(_portfolio=SimpleNamespace(positions={}))
+    engine._watched = []
+    engine._market_cache = {}
+    engine._market_categories = {}
+    engine._watch_rotation_offset = 0
+    engine._category_providers = {}
+
+    await engine._refresh_market_universe(force=True)
+
+    assert engine._watched == ["KXSPORTS-NEAR-1", "KXSPORTS-NEAR-2"]
+    assert "KXSPORTS-FAR" not in engine._watched
+    assert "KXSPORTS-NEAR-3" not in engine._watched
+
+
 def test_build_cycle_ticker_batch_respects_budget_and_keeps_priority_tickers() -> None:
     now = datetime.now(timezone.utc)
     engine = object.__new__(ExecutionEngine)

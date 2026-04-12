@@ -83,6 +83,7 @@ _SCAN_CATEGORY_PRIORITY = {
     MarketCategory.UNKNOWN: 8,
 }
 _CORE_SCAN_CATEGORIES = {
+    MarketCategory.SPORTS,
     MarketCategory.WEATHER,
     MarketCategory.CRYPTO,
 }
@@ -1578,22 +1579,6 @@ class ExecutionEngine:
             if t not in self._watched:
                 self._watched.append(t)
 
-        # Phase 1: Sports markets via sports snapshot provider
-        if self._sports is not None:
-            matched = await self._sports.refresh(markets)
-            for market in matched:
-                self._market_cache[market.ticker] = market
-                self._market_categories[market.ticker] = MarketCategory.SPORTS
-                if market.ticker not in self._watched:
-                    self._watched.append(market.ticker)
-                    if market.ticker not in prev_watched:
-                        new_tickers.append(market.ticker)
-            category_counts["sports"] = len(matched)
-
-        # Phase 2: Other categories — rebuild a bounded, prioritized universe.
-        # The main engine still supports all enabled categories, but it only
-        # watches markets that are liquid, near-term, and worth evaluating in
-        # a low-latency loop.
         skipped = 0
         skipped_budget = 0
         max_watched_markets = int(self._execution_setting("max_watched_markets", 800))
@@ -1603,6 +1588,53 @@ class ExecutionEngine:
         max_fallback_per_category = int(
             self._execution_setting("max_fallback_markets_per_category", 60),
         )
+
+        # Phase 1: Sports markets via sports snapshot provider. Sports uses the
+        # specialized matcher, but still needs the same liquidity / horizon /
+        # per-category budget controls as the rest of the universe builder.
+        if self._sports is not None:
+            matched = await self._sports.refresh(markets)
+            matched.sort(
+                key=lambda market: self._market_priority_key(
+                    market,
+                    MarketCategory.SPORTS,
+                    now,
+                ),
+            )
+            keep_sports = [
+                market for market in matched
+                if market.ticker in keep_tickers
+            ]
+            eligible_sports: list[Market] = []
+            for market in matched:
+                if market.ticker in keep_tickers:
+                    continue
+                if not self._should_watch_market(market, MarketCategory.SPORTS, now):
+                    skipped += 1
+                    continue
+                eligible_sports.append(market)
+
+            remaining_sports_capacity = max(
+                0,
+                max_core_per_category - len(keep_sports),
+            )
+            trimmed_sports = eligible_sports[:remaining_sports_capacity]
+            skipped_budget += max(0, len(eligible_sports) - len(trimmed_sports))
+            selected_sports = keep_sports + trimmed_sports
+
+            for market in selected_sports:
+                self._market_cache[market.ticker] = market
+                self._market_categories[market.ticker] = MarketCategory.SPORTS
+                if market.ticker not in self._watched:
+                    self._watched.append(market.ticker)
+                    if market.ticker not in prev_watched:
+                        new_tickers.append(market.ticker)
+            category_counts["sports"] = len(selected_sports)
+
+        # Phase 2: Other categories — rebuild a bounded, prioritized universe.
+        # The main engine still supports all enabled categories, but it only
+        # watches markets that are liquid, near-term, and worth evaluating in
+        # a low-latency loop.
         candidate_buckets: dict[MarketCategory, list[Market]] = {}
 
         for market, category in classified:
