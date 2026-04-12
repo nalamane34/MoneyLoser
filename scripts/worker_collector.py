@@ -88,17 +88,18 @@ async def collect_once(
     data_dir: Path,
     *,
     odds_feed: OddsAPIFeed,
+    sgo_feed: SportsGameOddsFeed | None = None,
     stats_feed: PlayerStatsFeed,
     reference_time: datetime | None = None,
 ) -> None:
-    """Run a single sportsbook collection pass."""
+    """Run a single sportsbook collection pass.
+
+    Uses SportsGameOdds as primary feed when available, falling back to
+    The Odds API for leagues that SportsGameOdds doesn't cover (e.g.
+    soccer, UFC on the free tier).
+    """
     leagues = [league.lower() for league in config.sportsbook.leagues]
     reserve = config.sportsbook.min_requests_remaining
-
-    remaining = odds_feed.requests_remaining
-    if remaining is not None and remaining <= reserve:
-        log.warning("collector.quota_reserve", remaining=remaining, reserve=reserve)
-        return
 
     now = reference_time or datetime.now(timezone.utc)
 
@@ -120,11 +121,6 @@ async def collect_once(
             expanded_leagues.append(league)
 
     for league in expanded_leagues:
-        remaining = odds_feed.requests_remaining
-        if remaining is not None and remaining <= reserve:
-            log.warning("collector.stop_for_quota", league=league, remaining=remaining)
-            break
-
         # Skip ESPN schedule check for tennis tournaments and MMA — those
         # don't have standard ESPN schedule pages.
         is_special = league.startswith("tennis_") or league in ("ufc", "mma")
@@ -147,12 +143,34 @@ async def collect_once(
                 log.info("collector.skip_no_games", league=league)
                 continue
 
-        # For tennis tournament keys, the league IS the full API key already.
-        games = await odds_feed.get_upcoming_games(
-            league,
-            bookmakers=list(config.sportsbook.bookmakers),
-            markets=list(config.sportsbook.markets),
-        )
+        # Try SportsGameOdds first, fall back to Odds API if it fails or
+        # returns no data (e.g. league not on free tier).
+        games = []
+        used_feed = "odds_api"
+
+        if sgo_feed is not None and sgo_feed.has_api_key:
+            try:
+                games = await sgo_feed.get_upcoming_games(
+                    league,
+                    bookmakers=list(config.sportsbook.bookmakers),
+                    markets=list(config.sportsbook.markets),
+                )
+                if games:
+                    used_feed = "sportsgameodds"
+            except Exception:
+                log.debug("collector.sgo_failed", league=league, exc_info=True)
+
+        if not games and odds_feed.has_api_key:
+            remaining = odds_feed.requests_remaining
+            if remaining is not None and remaining <= reserve:
+                log.warning("collector.stop_for_quota", league=league, remaining=remaining)
+                continue
+            games = await odds_feed.get_upcoming_games(
+                league,
+                bookmakers=list(config.sportsbook.bookmakers),
+                markets=list(config.sportsbook.markets),
+            )
+            used_feed = "odds_api"
 
         # Map tennis tournament keys back to generic sport for storage.
         storage_league = league
@@ -161,7 +179,8 @@ async def collect_once(
         elif league.startswith("tennis_wta_"):
             storage_league = "tennis_wta"
 
-        rows = odds_feed.build_line_history_rows(storage_league, games, captured_at=now)
+        feed_obj = sgo_feed if used_feed == "sportsgameodds" and sgo_feed else odds_feed
+        rows = feed_obj.build_line_history_rows(storage_league, games, captured_at=now)
         store.insert_sportsbook_game_lines(rows)
         log.info(
             "collector.recorded",
@@ -169,7 +188,8 @@ async def collect_once(
             api_key=league,
             games=len(games),
             rows=len(rows),
-            remaining=odds_feed.requests_remaining,
+            feed=used_feed,
+            remaining=odds_feed.requests_remaining if used_feed == "odds_api" else None,
         )
 
     # Collect esports odds from OddsPapi (if key available).
@@ -227,27 +247,30 @@ async def collect_once(
 
 
 async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
-    """Main collection loop — fetches sportsbook lines on interval."""
+    """Main collection loop — fetches sportsbook lines on interval.
+
+    Uses SportsGameOdds as primary for leagues it supports (NBA, NHL, MLB),
+    and falls back to The Odds API for leagues SportsGameOdds blocks on the
+    free tier (EPL, La Liga, Bundesliga, Serie A, UFC, tennis).
+    """
     interval = max(1, config.sportsbook.fetch_interval_minutes) * 60
     leagues = [league.lower() for league in config.sportsbook.leagues]
 
-    # Select odds feed: prefer SportsGameOdds if key available, fall back to
-    # The Odds API.
+    # Initialize both feeds.
+    odds_api_feed = OddsAPIFeed()
     sgo_key = (
         config.sportsbook.sportsgameodds_api_key
         or os.environ.get("SPORTSGAMEODDS_API_KEY", "")
     )
-    odds_api_feed = OddsAPIFeed()
     sgo_feed = SportsGameOddsFeed(api_key=sgo_key) if sgo_key else None
 
-    if sgo_feed and sgo_feed.has_api_key and config.sportsbook.prefer_sportsgameodds:
-        odds_feed = sgo_feed
-        log.info("collector.using_sportsgameodds")
-    elif odds_api_feed.has_api_key:
-        odds_feed = odds_api_feed
-        log.info("collector.using_odds_api")
-    else:
-        odds_feed = None
+    has_sgo = sgo_feed is not None and sgo_feed.has_api_key
+    has_odds_api = odds_api_feed.has_api_key
+
+    if has_sgo:
+        log.info("collector.sportsgameodds_available")
+    if has_odds_api:
+        log.info("collector.odds_api_available")
 
     stats_feed = PlayerStatsFeed()
 
@@ -255,7 +278,7 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
         log.info("collector.disabled_no_leagues")
         return
 
-    if odds_feed is None or not odds_feed.has_api_key:
+    if not has_sgo and not has_odds_api:
         log.warning("collector.no_api_key")
         return
 
@@ -273,7 +296,8 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
                     config,
                     store,
                     data_dir,
-                    odds_feed=odds_feed,
+                    odds_feed=odds_api_feed,
+                    sgo_feed=sgo_feed,
                     stats_feed=stats_feed,
                 )
 
@@ -284,7 +308,9 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
 
             await asyncio.sleep(interval)
     finally:
-        await odds_feed.close()
+        await odds_api_feed.close()
+        if sgo_feed:
+            await sgo_feed.close()
         await stats_feed.close()
 
 
