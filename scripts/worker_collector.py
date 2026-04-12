@@ -162,9 +162,12 @@ async def collect_once(
 
         if not games and odds_feed.has_api_key:
             remaining = odds_feed.requests_remaining
-            if remaining is not None and remaining <= reserve:
+            if remaining is not None and remaining > 0 and remaining <= reserve:
                 log.warning("collector.stop_for_quota", league=league, remaining=remaining)
                 continue
+            # When remaining is 0 or None, still attempt the call — it may
+            # be stale from a previous key/session. The API will refresh the
+            # header on the response (or return 401 if truly exhausted).
             games = await odds_feed.get_upcoming_games(
                 league,
                 bookmakers=list(config.sportsbook.bookmakers),
