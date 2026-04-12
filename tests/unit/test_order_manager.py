@@ -171,6 +171,20 @@ class TestOrderManagerReconcile:
         }
         assert client.calls == [{"limit": 1000, "paginate": True}]
 
+    def test_reconcile_clears_pending_cancel_for_orders_still_active_on_exchange(self) -> None:
+        client = _ReconcileClient(
+            [_make_order(order_id="order-1", status=OrderStatus.RESTING)]
+        )
+        manager = _make_manager(_make_order(order_id="order-1"))
+        manager._client = client  # type: ignore[attr-defined]
+        manager._pending_cancel_order_ids.add("order-1")  # type: ignore[attr-defined]
+
+        import asyncio
+
+        asyncio.run(manager.reconcile())
+
+        assert "order-1" not in manager._pending_cancel_order_ids  # type: ignore[attr-defined]
+
 
 class TestOrderManagerCancelLifecycle:
     def test_cancel_order_keeps_order_tracked_when_confirmation_is_ambiguous(self) -> None:

@@ -67,6 +67,10 @@ class CategoryProvider:
     get_context_data: Any = None  # async callable(market) -> dict for FeatureContext
 
 _ZERO = Decimal("0")
+_REST_ORDERBOOK_FAILURE_THRESHOLD = 3
+_REST_ORDERBOOK_FALLBACK_LIMIT = 40
+_REST_ORDERBOOK_FALLBACK_WINDOW_SECONDS = 5.0
+_REST_ORDERBOOK_CIRCUIT_COOLDOWN_SECONDS = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +200,11 @@ class ExecutionEngine:
         self._shared_market_cursor_keys: set[str] = set()
         self._shared_orderbook_cursor_time: datetime | None = None
         self._shared_orderbook_cursor_keys: set[str] = set()
+        self._rest_orderbook_failure_streak = 0
+        self._rest_orderbook_circuit_open_until: datetime | None = None
+        self._rest_orderbook_circuit_reason: str | None = None
+        self._rest_orderbook_window_started: datetime = datetime.now(timezone.utc)
+        self._rest_orderbook_window_count = 0
 
     def set_shared_market_data_tables(
         self,
@@ -668,15 +677,8 @@ class ExecutionEngine:
             )
             return None
 
-        # 1. Get current orderbook (try WS first, fall back to REST)
-        orderbook = self._ws.get_orderbook(ticker)
-        if orderbook is None:
-            orderbook = self._get_orderbook_from_shared_store(ticker, now)
-        if orderbook is None:
-            try:
-                orderbook = await self._rest.get_orderbook(ticker)
-            except Exception:
-                pass
+        # 1. Get current orderbook (prefer live caches; REST is degraded-mode fallback)
+        orderbook = await self._get_orderbook_with_fallback(ticker, now)
         if orderbook is None:
             # Synthesize minimal orderbook from market state bid/ask
             market = self._market_cache.get(ticker)
@@ -1051,17 +1053,10 @@ class ExecutionEngine:
             )
             return
 
-        orderbook = self._ws.get_orderbook(decision.ticker)
-        if orderbook is None:
-            orderbook = self._get_orderbook_from_shared_store(
-                decision.ticker,
-                datetime.now(timezone.utc),
-            )
-        if orderbook is None:
-            try:
-                orderbook = await self._rest.get_orderbook(decision.ticker)
-            except Exception:
-                pass
+        orderbook = await self._get_orderbook_with_fallback(
+            decision.ticker,
+            datetime.now(timezone.utc),
+        )
         if orderbook is None:
             logger.warning(
                 "engine.execute_no_orderbook",
@@ -2000,6 +1995,155 @@ class ExecutionEngine:
         ):
             self._shared_orderbook_cursor_time = datetime.now(timezone.utc) - timedelta(seconds=2)
             self._shared_orderbook_cursor_keys.clear()
+
+    def _ensure_rest_orderbook_fallback_state(self) -> None:
+        """Initialize degraded REST fallback state for minimal test doubles."""
+        if not hasattr(self, "_rest_orderbook_failure_streak"):
+            self._rest_orderbook_failure_streak = 0
+        if not hasattr(self, "_rest_orderbook_circuit_open_until"):
+            self._rest_orderbook_circuit_open_until = None
+        if not hasattr(self, "_rest_orderbook_circuit_reason"):
+            self._rest_orderbook_circuit_reason = None
+        if not hasattr(self, "_rest_orderbook_window_started"):
+            self._rest_orderbook_window_started = datetime.now(timezone.utc)
+        if not hasattr(self, "_rest_orderbook_window_count"):
+            self._rest_orderbook_window_count = 0
+
+    def _rest_orderbook_setting(self, name: str, default: int | float) -> int | float:
+        config = getattr(self, "_config", None)
+        return getattr(config, name, default)
+
+    def _rest_orderbook_circuit_is_open(self, now: datetime) -> bool:
+        self._ensure_rest_orderbook_fallback_state()
+        open_until = self._rest_orderbook_circuit_open_until
+        if open_until is None:
+            return False
+        if now >= open_until:
+            self._rest_orderbook_circuit_open_until = None
+            self._rest_orderbook_circuit_reason = None
+            self._rest_orderbook_failure_streak = 0
+            return False
+        return True
+
+    def _reset_rest_orderbook_window_if_needed(self, now: datetime) -> None:
+        self._ensure_rest_orderbook_fallback_state()
+        window_seconds = float(
+            self._rest_orderbook_setting(
+                "rest_orderbook_fallback_window_seconds",
+                _REST_ORDERBOOK_FALLBACK_WINDOW_SECONDS,
+            )
+        )
+        if (now - self._rest_orderbook_window_started).total_seconds() >= window_seconds:
+            self._rest_orderbook_window_started = now
+            self._rest_orderbook_window_count = 0
+
+    def _open_rest_orderbook_circuit(
+        self,
+        now: datetime,
+        *,
+        reason: str,
+        cooldown_seconds: float,
+        ticker: str,
+    ) -> None:
+        self._ensure_rest_orderbook_fallback_state()
+        open_until = now + timedelta(seconds=max(1.0, cooldown_seconds))
+        should_log = (
+            self._rest_orderbook_circuit_open_until is None
+            or open_until > self._rest_orderbook_circuit_open_until
+            or reason != self._rest_orderbook_circuit_reason
+        )
+        self._rest_orderbook_circuit_open_until = open_until
+        self._rest_orderbook_circuit_reason = reason
+        if should_log:
+            logger.warning(
+                "engine.rest_orderbook_circuit_opened",
+                ticker=ticker,
+                reason=reason,
+                cooldown_seconds=round(cooldown_seconds, 2),
+                window_count=self._rest_orderbook_window_count,
+                failure_streak=self._rest_orderbook_failure_streak,
+            )
+
+    async def _get_rest_orderbook_with_circuit_breaker(
+        self,
+        ticker: str,
+        as_of: datetime,
+    ) -> OrderbookSnapshot | None:
+        self._ensure_rest_orderbook_fallback_state()
+        if self._rest_orderbook_circuit_is_open(as_of):
+            return None
+
+        self._reset_rest_orderbook_window_if_needed(as_of)
+        fallback_limit = int(
+            self._rest_orderbook_setting(
+                "rest_orderbook_fallback_limit",
+                _REST_ORDERBOOK_FALLBACK_LIMIT,
+            )
+        )
+        cooldown_seconds = float(
+            self._rest_orderbook_setting(
+                "rest_orderbook_circuit_cooldown_seconds",
+                _REST_ORDERBOOK_CIRCUIT_COOLDOWN_SECONDS,
+            )
+        )
+        failure_threshold = int(
+            self._rest_orderbook_setting(
+                "rest_orderbook_failure_threshold",
+                _REST_ORDERBOOK_FAILURE_THRESHOLD,
+            )
+        )
+
+        if self._rest_orderbook_window_count >= max(1, fallback_limit):
+            self._open_rest_orderbook_circuit(
+                as_of,
+                reason="fallback_rate_limit",
+                cooldown_seconds=cooldown_seconds,
+                ticker=ticker,
+            )
+            return None
+
+        self._rest_orderbook_window_count += 1
+        try:
+            orderbook = await self._rest.get_orderbook(ticker)
+        except Exception as exc:
+            self._rest_orderbook_failure_streak += 1
+            breaker_reason: str | None = None
+            if isinstance(exc, OrderError) and exc.status_code == 429:
+                breaker_reason = "rate_limited"
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None:
+                    try:
+                        cooldown_seconds = max(cooldown_seconds, float(retry_after))
+                    except (TypeError, ValueError):
+                        pass
+            elif self._rest_orderbook_failure_streak >= max(1, failure_threshold):
+                breaker_reason = "repeated_failures"
+
+            if breaker_reason is not None:
+                self._open_rest_orderbook_circuit(
+                    as_of,
+                    reason=breaker_reason,
+                    cooldown_seconds=cooldown_seconds,
+                    ticker=ticker,
+                )
+            logger.debug("engine.rest_orderbook_fetch_failed", ticker=ticker, exc_info=True)
+            return None
+
+        self._rest_orderbook_failure_streak = 0
+        return orderbook
+
+    async def _get_orderbook_with_fallback(
+        self,
+        ticker: str,
+        as_of: datetime,
+    ) -> OrderbookSnapshot | None:
+        orderbook = self._ws.get_orderbook(ticker)
+        if orderbook is not None:
+            return orderbook
+        orderbook = self._get_orderbook_from_shared_store(ticker, as_of)
+        if orderbook is not None:
+            return orderbook
+        return await self._get_rest_orderbook_with_circuit_breaker(ticker, as_of)
 
     def _poll_shared_market_data_once(self) -> None:
         """Poll attached market-data tables once and update local caches."""

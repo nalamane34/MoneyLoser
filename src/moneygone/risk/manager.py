@@ -187,6 +187,9 @@ class RiskManager:
                 category_tickers, proposed.category
             )
             if penalty < 1.0 and result.adjusted_size is not None:
+                # Intentionally apply the correlation haircut after the hard-limit
+                # pass. This can truncate twice, but it keeps the final size
+                # strictly conservative across both limit layers.
                 adjusted = int(result.adjusted_size * penalty)
                 if adjusted <= 0:
                     return RiskCheckResult(

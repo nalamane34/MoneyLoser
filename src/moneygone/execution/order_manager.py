@@ -407,6 +407,15 @@ class OrderManager:
             order for order in exchange_orders if order.status in active_statuses
         ]
         exchange_map = {o.order_id: o for o in exchange_orders}
+        pending_cleared = 0
+
+        # Reconciliation is the authoritative exchange view. If an order is
+        # still active here, any earlier local pending-cancel marker should be
+        # cleared so the engine does not treat a valid live order as limbo.
+        for order_id in list(self._pending_cancel_order_ids):
+            if order_id in exchange_map:
+                self._pending_cancel_order_ids.discard(order_id)
+                pending_cleared += 1
 
         # Find orders we track locally but the exchange doesn't know about
         stale = set(self._open_orders.keys()) - set(exchange_map.keys())
@@ -437,6 +446,7 @@ class OrderManager:
             open_orders=len(self._open_orders),
             stale_removed=len(stale),
             new_found=len(new),
+            pending_cleared=pending_cleared,
         )
 
     # ------------------------------------------------------------------

@@ -67,6 +67,38 @@ def test_sync_open_orders_rebuilds_reserved_capital() -> None:
     }
 
 
+def test_sync_open_orders_keeps_intents_and_open_orders_combined_per_ticker() -> None:
+    governor = CapitalGovernor()
+    governor.reserve_intent(
+        "intent-1",
+        owner="engine",
+        ticker="KXYES",
+        category="sports",
+        contracts=2,
+        price=Decimal("0.25"),
+        available_cash=Decimal("100"),
+    )
+
+    governor.sync_open_orders(
+        [
+            _order(
+                order_id="order-1",
+                ticker="KXYES",
+                side=Side.YES,
+                remaining_count=3,
+                price="0.40",
+            )
+        ],
+        category_lookup={"KXYES": "sports"},
+    )
+
+    snapshot = governor.snapshot()
+
+    assert snapshot.total_reserved == Decimal("1.70")
+    assert snapshot.reserved_by_category == {"sports": Decimal("1.70")}
+    assert snapshot.reserved_contracts_by_ticker == {"KXYES": 5}
+
+
 def test_pause_and_resume_updates_snapshot() -> None:
     governor = CapitalGovernor()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -713,6 +714,87 @@ async def test_on_event_market_positions_resyncs_portfolio() -> None:
     assert synced == ["sync"]
 
 
+@pytest.mark.asyncio
+async def test_position_resync_and_order_reconcile_can_run_together() -> None:
+    now = datetime.now(timezone.utc)
+    synced: list[str] = []
+
+    async def _sync_with_exchange(_rest) -> None:
+        await asyncio.sleep(0)
+        synced.append("portfolio")
+
+    class _ConcurrentOrders:
+        def __init__(self) -> None:
+            self.reconcile_calls = 0
+            self._orders = [
+                Order(
+                    order_id="order-1",
+                    ticker="KXTEST-1",
+                    side=Side.YES,
+                    action=Action.BUY,
+                    status=OrderStatus.RESTING,
+                    count=2,
+                    remaining_count=2,
+                    price=Decimal("0.55"),
+                    taker_fees=Decimal("0"),
+                    maker_fees=Decimal("0"),
+                    created_time=now,
+                )
+            ]
+
+        async def reconcile(self) -> None:
+            await asyncio.sleep(0)
+            self.reconcile_calls += 1
+
+        def get_open_orders(self) -> list[Order]:
+            return list(self._orders)
+
+        @property
+        def open_order_count(self) -> int:
+            return len(self._orders)
+
+    class _ConcurrentRisk:
+        def __init__(self) -> None:
+            self.synced_orders: list[list[Order]] = []
+            self._portfolio = SimpleNamespace(
+                sync_with_exchange=_sync_with_exchange,
+                positions={},
+                cash=Decimal("10"),
+                update_market_price=lambda *_args, **_kwargs: None,
+            )
+
+        def sync_open_order_reservations(self, orders, *, category_lookup=None) -> None:
+            self.synced_orders.append(list(orders))
+
+    orders = _ConcurrentOrders()
+    risk = _ConcurrentRisk()
+
+    engine = object.__new__(ExecutionEngine)
+    engine._orders = orders
+    engine._risk = risk
+    engine._rest = SimpleNamespace()
+    engine._last_portfolio_sync = now - timedelta(seconds=10)
+    engine._last_order_reconcile = None
+    engine._market_categories = {"KXTEST-1": MarketCategory.SPORTS}
+
+    await asyncio.gather(
+        engine._handle_position_event(
+            WSEvent(
+                channel="market_positions",
+                type="position",
+                data={"market_ticker": "KXTEST-1"},
+                seq=1,
+                timestamp=now,
+            )
+        ),
+        engine._maybe_reconcile_open_orders(force=True),
+    )
+
+    assert synced == ["portfolio"]
+    assert orders.reconcile_calls == 1
+    assert risk.synced_orders[-1][0].order_id == "order-1"
+
+
 def test_prune_settled_tickers_cleans_decision_context_by_ticker() -> None:
     engine = object.__new__(ExecutionEngine)
     now = datetime.now(timezone.utc)
@@ -858,6 +940,21 @@ class _FakeWSForGuard:
     """Returns a fake orderbook."""
     def get_orderbook(self, ticker):
         return _FakeOrderbook()
+
+
+class _NullWSForFallback:
+    def get_orderbook(self, ticker):
+        return None
+
+
+class _FailingRestOrderbookClient:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def get_orderbook(self, ticker):
+        self.calls += 1
+        raise self.exc
 
 
 class _GuardRisk:
@@ -1025,3 +1122,50 @@ def test_real_models_have_demo_only_false() -> None:
 
     model = SharpSportsbookModel()
     assert model.demo_only is False, "SharpSportsbookModel should have demo_only=False"
+
+
+@pytest.mark.asyncio
+async def test_rest_orderbook_circuit_opens_after_too_many_fallback_attempts() -> None:
+    engine = object.__new__(ExecutionEngine)
+    engine._ws = _NullWSForFallback()
+    engine._store = None
+    engine._shared_orderbook_table = None
+    engine._shared_orderbook_cache = {}
+    engine._config = SimpleNamespace(
+        rest_orderbook_fallback_limit=2,
+        rest_orderbook_fallback_window_seconds=60.0,
+        rest_orderbook_circuit_cooldown_seconds=60.0,
+    )
+    engine._rest = _FailingRestOrderbookClient(RuntimeError("rest down"))
+
+    now = datetime.now(timezone.utc)
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+
+    assert engine._rest.calls == 2
+    assert engine._rest_orderbook_circuit_open_until is not None
+    assert engine._rest_orderbook_circuit_reason == "fallback_rate_limit"
+
+
+@pytest.mark.asyncio
+async def test_rest_orderbook_circuit_opens_after_repeated_failures() -> None:
+    engine = object.__new__(ExecutionEngine)
+    engine._ws = _NullWSForFallback()
+    engine._store = None
+    engine._shared_orderbook_table = None
+    engine._shared_orderbook_cache = {}
+    engine._config = SimpleNamespace(
+        rest_orderbook_failure_threshold=2,
+        rest_orderbook_circuit_cooldown_seconds=60.0,
+    )
+    engine._rest = _FailingRestOrderbookClient(OrderError("boom", status_code=503))
+
+    now = datetime.now(timezone.utc)
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+    assert await engine._get_orderbook_with_fallback("KXTEST-1", now) is None
+
+    assert engine._rest.calls == 2
+    assert engine._rest_orderbook_circuit_open_until is not None
+    assert engine._rest_orderbook_circuit_reason == "repeated_failures"
