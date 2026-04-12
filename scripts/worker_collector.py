@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from moneygone.config import load_config
 from moneygone.data.schemas import COLLECTOR_TABLES
 from moneygone.data.sports.odds import OddsAPIFeed, TENNIS_TOURNAMENT_KEYS
 from moneygone.data.sports.esports_odds import EsportsOddsFeed
+from moneygone.data.sports.sportsgameodds import SportsGameOddsFeed
 from moneygone.data.sports.stats import PlayerStatsFeed
 from moneygone.data.store import DataStore
 from moneygone.utils.env import load_repo_env
@@ -228,14 +230,32 @@ async def collector_loop(config, store: DataStore, data_dir: Path) -> None:
     """Main collection loop — fetches sportsbook lines on interval."""
     interval = max(1, config.sportsbook.fetch_interval_minutes) * 60
     leagues = [league.lower() for league in config.sportsbook.leagues]
-    odds_feed = OddsAPIFeed()
+
+    # Select odds feed: prefer SportsGameOdds if key available, fall back to
+    # The Odds API.
+    sgo_key = (
+        config.sportsbook.sportsgameodds_api_key
+        or os.environ.get("SPORTSGAMEODDS_API_KEY", "")
+    )
+    odds_api_feed = OddsAPIFeed()
+    sgo_feed = SportsGameOddsFeed(api_key=sgo_key) if sgo_key else None
+
+    if sgo_feed and sgo_feed.has_api_key and config.sportsbook.prefer_sportsgameodds:
+        odds_feed = sgo_feed
+        log.info("collector.using_sportsgameodds")
+    elif odds_api_feed.has_api_key:
+        odds_feed = odds_api_feed
+        log.info("collector.using_odds_api")
+    else:
+        odds_feed = None
+
     stats_feed = PlayerStatsFeed()
 
     if not leagues:
         log.info("collector.disabled_no_leagues")
         return
 
-    if not odds_feed.has_api_key:
+    if odds_feed is None or not odds_feed.has_api_key:
         log.warning("collector.no_api_key")
         return
 

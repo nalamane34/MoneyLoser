@@ -83,6 +83,8 @@ class SportsbookConfig(BaseModel):
     fetch_interval_minutes: int = 240
     lookahead_hours: int = 18
     min_requests_remaining: int = 75
+    sportsgameodds_api_key: str = ""
+    prefer_sportsgameodds: bool = True  # Use SportsGameOdds when key available
 
 
 class ModelConfig(BaseModel):
