@@ -125,3 +125,19 @@ class DrawdownMonitor:
         self._current = _ZERO
         self._max_drawdown_seen = 0.0
         logger.info("drawdown_monitor_reset")
+
+    def reset_peak_to_current(self) -> None:
+        """Reset the peak to the current equity level.
+
+        Use after acknowledging losses to allow trading to resume
+        without the circuit breaker being permanently triggered.
+        """
+        old_peak = self._peak
+        self._peak = self._current
+        self._trough = self._current
+        self._max_drawdown_seen = 0.0
+        logger.info(
+            "drawdown_peak_reset",
+            old_peak=str(old_peak),
+            new_peak=str(self._current),
+        )

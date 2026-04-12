@@ -243,6 +243,13 @@ class ExecutionEngine:
                 cash=str(cash),
                 positions=len(self._risk._portfolio.positions),
             )
+            # Initialize drawdown tracker from current equity and reset
+            # peak so circuit breaker starts fresh, not from stale peaks
+            # of previous sessions.
+            equity = self._risk.get_capital_view().current_equity
+            self._risk._drawdown.track(equity)
+            self._risk._drawdown.reset_peak_to_current()
+
             if cash <= 0:
                 logger.critical(
                     "engine.ZERO_BANKROLL",
