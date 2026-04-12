@@ -1406,6 +1406,23 @@ class ExecutionEngine:
             except Exception:
                 logger.debug("engine.parquet_reload_failed", exc_info=True)
 
+        # Rebuild watched list from scratch each refresh.  Keep tickers
+        # with open orders or positions so we don't lose track of them.
+        keep_tickers: set[str] = set()
+        for order in self._orders.get_open_orders():
+            keep_tickers.add(order.ticker)
+        for pos_ticker in self._risk._portfolio.positions:
+            keep_tickers.add(pos_ticker)
+        prev_watched = set(self._watched)
+        self._watched.clear()
+        self._market_cache.clear()
+        self._market_categories.clear()
+
+        # Re-add tickers we must keep (open orders / positions)
+        for t in keep_tickers:
+            if t not in self._watched:
+                self._watched.append(t)
+
         # Phase 1: Sports markets via sports snapshot provider
         if self._sports is not None:
             matched = await self._sports.refresh(markets)
@@ -1414,7 +1431,8 @@ class ExecutionEngine:
                 self._market_categories[market.ticker] = MarketCategory.SPORTS
                 if market.ticker not in self._watched:
                     self._watched.append(market.ticker)
-                    new_tickers.append(market.ticker)
+                    if market.ticker not in prev_watched:
+                        new_tickers.append(market.ticker)
             category_counts["sports"] = len(matched)
 
         # Phase 2: Other categories — use pre-classified data
